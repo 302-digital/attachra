@@ -13,6 +13,8 @@ Attachra is not a mail server. It sits next to one (Postfix today) and
 handles a problem your MTA and your spam/AV stack don't: what happens to
 *outbound attachments*.
 
+![Demo: an outbound attachment is replaced with a personal download link, downloaded, then revoked](docs/assets/demo.gif)
+
 > **Status: v0.1.0 released.** The full pipeline — Postfix milter → MIME
 > parsing → policy engine → S3/filesystem storage → personal download link →
 > MIME rewrite → audit trail — works end to end and has been **tested in
