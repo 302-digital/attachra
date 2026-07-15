@@ -66,7 +66,7 @@ conflate them:
   internal error while processing a specific message (processor
   error, panic, storage failure, oversized message, etc.): `open`
   accepts the message unmodified, `closed` returns a 4xx tempfail so
-  Postfix retries later. See `docs/Attachra_Backlog.md` (US-2.2) and
+  Postfix retries later. See
   `docs/security/requirements-for-backlog.md` (SR-116-1).
 
 For a coherent policy, set both to the same philosophy, e.g.
