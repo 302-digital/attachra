@@ -113,22 +113,25 @@ attach the milter to.
 
 ### Option A: Debian package + systemd (recommended for a real host)
 
-1. **Build the package.** No Debian tooling is required to build it — only
-   to install it — since Attachra is a cross-compiled static binary
-   ([ADR-001](docs/Attachra_ADR.md#adr-001-language)):
+1. **Download the package.** Every tagged release publishes `.deb` packages
+   (linux/amd64 + linux/arm64) and a `SHA256SUMS` checksum file to the
+   [GitHub Releases](https://github.com/302-digital/attachra/releases) page.
+   On your Debian 13 mail server:
 
    ```sh
-   make build-deb
+   version=0.1.0   # match the release you want
+   curl -LO https://github.com/302-digital/attachra/releases/download/v${version}/attachra_${version}_amd64.deb
+   curl -LO https://github.com/302-digital/attachra/releases/download/v${version}/SHA256SUMS
+   sha256sum -c SHA256SUMS --ignore-missing
+   sudo apt install ./attachra_${version}_amd64.deb
    ```
 
-   This produces `dist/attachra_<version>_amd64.deb`. Copy it to your
-   Debian 13 mail server and install it:
+   Or build it yourself — no Debian tooling is required to build it, only
+   to install it, since Attachra is a cross-compiled static binary
+   ([ADR-001](docs/Attachra_ADR.md#adr-001-language)): `make build-deb`
+   produces the same `dist/attachra_<version>_amd64.deb`.
 
-   ```sh
-   sudo apt install ./attachra_<version>_amd64.deb
-   ```
-
-   This installs `/usr/bin/attachra` and `/usr/bin/attachractl`, config
+   Either way, this installs `/usr/bin/attachra` and `/usr/bin/attachractl`, config
    templates under `/etc/attachra/`, and a systemd unit that's enabled but
    **not started yet**.
 
@@ -186,6 +189,10 @@ git clone https://github.com/302-digital/attachra
 cd attachra/deploy/dev
 docker compose up --build
 ```
+
+The prebuilt image behind this compose file is also published on its own
+as `ghcr.io/302-digital/attachra` (tagged `vX.Y.Z` per release), if you'd
+rather pull it directly than build it locally.
 
 This brings up Postfix (SMTP relay on `localhost:2525`), MinIO
 (S3-compatible storage), and Attachra itself, wired together with a
