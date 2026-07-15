@@ -4,7 +4,7 @@
 # See docs/Attachra_ADR.md (ADR-001: single static binary) and
 # .claude/agents/atr-devops.md (minimal, non-root, reproducible image).
 
-FROM golang:1.26-alpine AS builder
+FROM golang:1.26-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS builder
 
 WORKDIR /src
 
@@ -20,7 +20,7 @@ ARG DATE=unknown
 
 # Serial package compilation and capped GC target: compiling
 # modernc.org/sqlite concurrently spikes memory and OOMKills the CI
-# runner (exit 137). Mirrors the tuning in .gitlab-ci.yml build-test.
+# runner (exit 137). Mirrors the internal CI build tuning.
 ENV GOFLAGS=-p=1 \
     GOMAXPROCS=2 \
     GOMEMLIMIT=1750MiB \
@@ -40,7 +40,7 @@ RUN CGO_ENABLED=0 go build \
 RUN mkdir -p /out/data
 
 # Final stage: distroless static base, no shell, non-root by default.
-FROM gcr.io/distroless/static-debian12:nonroot AS final
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:aef9602f8710ec12bde19d593fed1f76c708531bb7aba205110f1029786ead7b AS final
 
 WORKDIR /
 

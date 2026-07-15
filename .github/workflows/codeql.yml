@@ -1,0 +1,52 @@
+name: CodeQL
+
+# Static analysis (SAST) for the Go codebase via GitHub CodeQL. Complements
+# gitleaks (secrets) and govulncheck (known-CVE dependencies) in ci.yml.
+# Mirrors the official starter workflow from
+# https://github.com/actions/starter-workflows/blob/main/code-scanning/codeql.yml
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly, off-peak: Wednesday 04:47 UTC. Off-the-hour and a different
+    # day/time than scorecard.yml (Sunday 03:17 UTC) to avoid runner
+    # contention between the two scheduled scans.
+    - cron: "47 4 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.26"
+
+jobs:
+  analyze:
+    name: Analyze (Go)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
+        with:
+          languages: go
+          build-mode: autobuild
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
+        with:
+          category: "/language:go"
