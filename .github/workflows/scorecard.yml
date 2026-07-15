@@ -1,0 +1,54 @@
+name: Scorecard analysis
+
+# OpenSSF Scorecard evaluates the repository's supply-chain security
+# posture (branch protection, pinned dependencies, code review, etc.) and
+# publishes the result to the public Scorecard dataset and this repo's
+# code scanning dashboard. Mirrors the official example workflow from
+# https://github.com/ossf/scorecard/blob/main/.github/workflows/scorecard-analysis.yml
+on:
+  push:
+    # Only the default branch is supported by publish_results.
+    branches: [main]
+  schedule:
+    # Weekly, off-peak: Sunday 03:17 UTC. Off-the-hour to avoid the
+    # thundering herd of jobs scheduled at :00.
+    - cron: "17 3 * * 0"
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      # Needed to upload the SARIF results to code scanning.
+      security-events: write
+      # Needed to publish results to the public Scorecard dataset via
+      # GitHub OIDC (publish_results: true below).
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@99c09fe975337306107572b4fdf4db224cf8e2f2 # v2.4.3
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: SARIF file
+          path: results.sarif
+          retention-days: 5
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@24ea975727876cf496b1eb0c5b36e96e01600b51 # v4.37.0
+        with:
+          sarif_file: results.sarif
