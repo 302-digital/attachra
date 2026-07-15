@@ -130,9 +130,14 @@ func runSetupCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) i
 		return setupError
 	}
 
+	// Best-effort, advisory-only guess at the local mail stack (ATR-337):
+	// never fails the wizard, only adjusts a couple of defaults/hints
+	// below. See maildetect.go.
+	detected := detectMailEnv(defaultMailEnvDeps())
+
 	var answers setupAnswers
 	if *nonInteractive {
-		answers, err = collectNonInteractiveAnswers(raw, stderr)
+		answers, err = collectNonInteractiveAnswers(raw, detected.Env, stderr)
 	} else {
 		// Only a real, non-redirected terminal drives the interactive
 		// prompt flow. The type assertion to *os.File is deliberate:
@@ -148,14 +153,14 @@ func runSetupCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) i
 			fmt.Fprintln(stderr, "attachra: setup: stdin is not a terminal; re-run with --non-interactive and the appropriate flags (see attachra setup --help)") //nolint:errcheck // best-effort diagnostic on stderr
 			return setupError
 		}
-		answers, err = runSetupWizard(newPrompter(stdin, stdout), raw)
+		answers, err = runSetupWizard(newPrompter(stdin, stdout), raw, detected.Env)
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "attachra: setup: %v\n", err) //nolint:errcheck // best-effort diagnostic on stderr
 		return setupError
 	}
 
-	return applySetupAnswers(configDir, answers, stdout, stderr)
+	return applySetupAnswers(configDir, answers, detected.Env, stdout, stderr)
 }
 
 // setupManagedFiles lists every file applySetupAnswers may write,
@@ -200,7 +205,9 @@ func isTerminal(f *os.File) bool {
 // collectNonInteractiveAnswers validates raw and turns it into a
 // setupAnswers, applying the same defaults the interactive wizard
 // offers for any field whose flag was left empty. It never prompts.
-func collectNonInteractiveAnswers(raw setupFlags, stderr io.Writer) (setupAnswers, error) {
+// env is the detected local mail environment (ATR-337), consulted only
+// for the HTTP listen default (httpListenDefaultFor).
+func collectNonInteractiveAnswers(raw setupFlags, env mailEnv, stderr io.Writer) (setupAnswers, error) {
 	var missing []string
 	if raw.domains == "" {
 		missing = append(missing, "--domains")
@@ -248,7 +255,7 @@ func collectNonInteractiveAnswers(raw setupFlags, stderr io.Writer) (setupAnswer
 		return setupAnswers{}, fmt.Errorf("--failure-mode: invalid value %q (want open or closed)", raw.failureMode)
 	}
 
-	httpListen := firstNonEmpty(raw.httpListen, "127.0.0.1:18080")
+	httpListen := firstNonEmpty(raw.httpListen, httpListenDefaultFor(env))
 	milterListen := firstNonEmpty(raw.milterListen, "inet:127.0.0.1:6785")
 	fsBaseDir := firstNonEmpty(raw.fsBaseDir, "/var/lib/attachra/files")
 
@@ -286,8 +293,10 @@ func collectNonInteractiveAnswers(raw setupFlags, stderr io.Writer) (setupAnswer
 // HTTP/milter listen addresses, failure mode, dry-run. Any non-empty
 // field in presets pre-fills the corresponding prompt's default (a
 // value supplied via flag is still confirmed/overridable at the
-// prompt, never silently applied without the operator seeing it).
-func runSetupWizard(p *prompter, presets setupFlags) (setupAnswers, error) {
+// prompt, never silently applied without the operator seeing it). env
+// is the detected local mail environment (ATR-337), consulted only for
+// the HTTP listen prompt's default (httpListenDefaultFor).
+func runSetupWizard(p *prompter, presets setupFlags, env mailEnv) (setupAnswers, error) {
 	fmt.Fprintln(p.out, "Attachra setup wizard") //nolint:errcheck // best-effort wizard prompt output
 	fmt.Fprintln(p.out, "=====================") //nolint:errcheck // best-effort wizard prompt output
 	fmt.Fprintln(p.out)                          //nolint:errcheck // best-effort wizard prompt output
@@ -355,7 +364,7 @@ func runSetupWizard(p *prompter, presets setupFlags) (setupAnswers, error) {
 	}
 
 	fmt.Fprintln(p.out) //nolint:errcheck // best-effort wizard prompt output
-	httpListen, err := p.askListen("HTTP listen address for the download server", firstNonEmpty(presets.httpListen, "127.0.0.1:18080"), probeHTTPListen)
+	httpListen, err := p.askListen("HTTP listen address for the download server", firstNonEmpty(presets.httpListen, httpListenDefaultFor(env)), probeHTTPListen)
 	if err != nil {
 		return setupAnswers{}, err
 	}
@@ -487,8 +496,10 @@ func validateEnvSecretValue(v string) error {
 // overwrote an existing file (e.g. a --force re-run) — a failed
 // `attachra setup` never leaves a half-written config directory behind
 // NOR destroys a previously valid one (ATR-320: "never leave a
-// half-created state behind").
-func applySetupAnswers(configDir string, a setupAnswers, stdout, stderr io.Writer) int {
+// half-created state behind"). env is the detected local mail
+// environment (ATR-337), forwarded to printSetupNextSteps to tailor its
+// final guidance.
+func applySetupAnswers(configDir string, a setupAnswers, env mailEnv, stdout, stderr io.Writer) int {
 	if err := validateEnvSecretValue(a.S3AccessKey); err != nil {
 		fmt.Fprintf(stderr, "attachra: setup: s3 access key: %v\n", err) //nolint:errcheck // best-effort diagnostic on stderr
 		return setupError
@@ -583,15 +594,17 @@ func applySetupAnswers(configDir string, a setupAnswers, stdout, stderr io.Write
 	}
 
 	commitAll()
-	printSetupNextSteps(stdout, configDir, attachraPath, policyPath, a)
+	printSetupNextSteps(stdout, configDir, attachraPath, policyPath, a, env)
 	return setupOK
 }
 
 // printSetupNextSteps prints the operator's remaining manual steps
 // after a successful `attachra setup`: none of these are things setup
 // can safely do on its own (they touch Postfix/nginx config outside
-// attachra's own files, or require root/systemd).
-func printSetupNextSteps(stdout io.Writer, configDir, attachraPath, policyPath string, a setupAnswers) {
+// attachra's own files, or require root/systemd). env is the detected
+// local mail environment (ATR-337): it never changes what setup writes
+// to disk, only which of these printed hints/doc references apply.
+func printSetupNextSteps(stdout io.Writer, configDir, attachraPath, policyPath string, a setupAnswers, env mailEnv) {
 	fmt.Fprintln(stdout)                               //nolint:errcheck // best-effort diagnostic on stdout
 	fmt.Fprintln(stdout, "Setup complete. Generated:") //nolint:errcheck // best-effort diagnostic on stdout
 	fmt.Fprintf(stdout, "  %s\n", attachraPath)        //nolint:errcheck // best-effort diagnostic on stdout
@@ -613,25 +626,65 @@ func printSetupNextSteps(stdout io.Writer, configDir, attachraPath, policyPath s
 	} else {
 		fmt.Fprintf(stdout, "  2. attachra --config %s   (or copy these files into /etc/attachra to use the packaged systemd unit)\n", attachraPath) //nolint:errcheck // best-effort diagnostic on stdout
 	}
-	fmt.Fprintln(stdout, "  3. Wire Attachra into the Postfix milter chain, AFTER any existing filter")             //nolint:errcheck // best-effort diagnostic on stdout
-	fmt.Fprintln(stdout, "     (e.g. rspamd) — its verdict should be settled before Attachra spends effort")        //nolint:errcheck // best-effort diagnostic on stdout
-	fmt.Fprintln(stdout, "     uploading attachments and rewriting the message:")                                   //nolint:errcheck // best-effort diagnostic on stdout
-	fmt.Fprintln(stdout, "       postconf -h smtpd_milters non_smtpd_milters   # see what's already configured")    //nolint:errcheck // best-effort diagnostic on stdout
-	fmt.Fprintf(stdout, "       sudo postconf -e 'smtpd_milters = <existing>, %s'\n", a.MilterListen)               //nolint:errcheck // best-effort diagnostic on stdout
-	fmt.Fprintf(stdout, "       sudo postconf -e 'non_smtpd_milters = <existing>, %s'\n", a.MilterListen)           //nolint:errcheck // best-effort diagnostic on stdout
-	fmt.Fprintln(stdout, "       sudo systemctl reload postfix")                                                    //nolint:errcheck // best-effort diagnostic on stdout
-	fmt.Fprintln(stdout, "  4. Publish the package/download page (ONLY the /p/ path, never /api/v1 or")             //nolint:errcheck // best-effort diagnostic on stdout
-	fmt.Fprintln(stdout, "     /metrics) through a reverse proxy — see")                                            //nolint:errcheck // best-effort diagnostic on stdout
-	fmt.Fprintln(stdout, "     /usr/share/attachra/examples/nginx-grommunio.conf. If that proxy is")                //nolint:errcheck // best-effort diagnostic on stdout
-	fmt.Fprintln(stdout, "     co-located on this host, also set http.trusted_proxies in attachra.yaml")            //nolint:errcheck // best-effort diagnostic on stdout
-	fmt.Fprintln(stdout, "     (ATR-311), or audit/rate-limiting will see the proxy's address instead of")          //nolint:errcheck // best-effort diagnostic on stdout
-	fmt.Fprintln(stdout, "     the real client.")                                                                   //nolint:errcheck // best-effort diagnostic on stdout
+	fmt.Fprintln(stdout, "  3. Wire Attachra into the Postfix milter chain, AFTER any existing filter")          //nolint:errcheck // best-effort diagnostic on stdout
+	fmt.Fprintln(stdout, "     (e.g. rspamd) — its verdict should be settled before Attachra spends effort")     //nolint:errcheck // best-effort diagnostic on stdout
+	fmt.Fprintln(stdout, "     uploading attachments and rewriting the message:")                                //nolint:errcheck // best-effort diagnostic on stdout
+	fmt.Fprintln(stdout, "       postconf -h smtpd_milters non_smtpd_milters   # see what's already configured") //nolint:errcheck // best-effort diagnostic on stdout
+	smtpdMilters, nonSMTPdMilters, foundMilters := existingMilters()
+	if !foundMilters {
+		smtpdMilters, nonSMTPdMilters = "<existing>", "<existing>"
+	}
+	fmt.Fprintf(stdout, "       sudo postconf -e 'smtpd_milters = %s'\n", milterChain(smtpdMilters, a.MilterListen))        //nolint:errcheck // best-effort diagnostic on stdout
+	fmt.Fprintf(stdout, "       sudo postconf -e 'non_smtpd_milters = %s'\n", milterChain(nonSMTPdMilters, a.MilterListen)) //nolint:errcheck // best-effort diagnostic on stdout
+	fmt.Fprintln(stdout, "       sudo systemctl reload postfix")                                                            //nolint:errcheck // best-effort diagnostic on stdout
+	if env == mailEnvMailcow {
+		fmt.Fprintln(stdout, "     WARNING: this .deb targets a host Postfix install. mailcow-dockerized runs its own") //nolint:errcheck // best-effort diagnostic on stdout
+		fmt.Fprintln(stdout, "     Postfix inside a container (postfix-mailcow), which the command above does not")     //nolint:errcheck // best-effort diagnostic on stdout
+		fmt.Fprintln(stdout, "     touch — see docs/integrations/postfix.md for wiring Attachra into a containerized")  //nolint:errcheck // best-effort diagnostic on stdout
+		fmt.Fprintln(stdout, "     Postfix instead.")                                                                   //nolint:errcheck // best-effort diagnostic on stdout
+	}
+	fmt.Fprintln(stdout, "  4. Publish the package/download page (ONLY the /p/ path, never /api/v1 or") //nolint:errcheck // best-effort diagnostic on stdout
+	fmt.Fprintln(stdout, "     /metrics) through a reverse proxy")                                      //nolint:errcheck // best-effort diagnostic on stdout
+	if env == mailEnvGrommunio {
+		fmt.Fprintln(stdout, "     — see /usr/share/attachra/examples/nginx-grommunio.conf and") //nolint:errcheck // best-effort diagnostic on stdout
+		fmt.Fprintln(stdout, "     docs/deploy/grommunio-debian.md.")                            //nolint:errcheck // best-effort diagnostic on stdout
+	} else {
+		fmt.Fprintln(stdout, "     — see docs/integrations/postfix.md.") //nolint:errcheck // best-effort diagnostic on stdout
+	}
+	fmt.Fprintln(stdout, "     If that proxy is co-located on this host, also set http.trusted_proxies in")         //nolint:errcheck // best-effort diagnostic on stdout
+	fmt.Fprintln(stdout, "     attachra.yaml (ATR-311), or audit/rate-limiting will see the proxy's address")       //nolint:errcheck // best-effort diagnostic on stdout
+	fmt.Fprintln(stdout, "     instead of the real client.")                                                        //nolint:errcheck // best-effort diagnostic on stdout
 	fmt.Fprintf(stdout, "  5. Validate the policy any time you edit it: attachra policy validate %s\n", policyPath) //nolint:errcheck // best-effort diagnostic on stdout
-	fmt.Fprintln(stdout, "  6. attachra doctor (coming soon) will provide a one-shot health check across")          //nolint:errcheck // best-effort diagnostic on stdout
-	fmt.Fprintln(stdout, "     these steps; for now use GET /healthz and GET /readyz on the http.listen")           //nolint:errcheck // best-effort diagnostic on stdout
-	fmt.Fprintln(stdout, "     address.")                                                                           //nolint:errcheck // best-effort diagnostic on stdout
+	fmt.Fprintln(stdout, "  6. Run `attachra doctor` for a one-shot health check across these steps; or use")       //nolint:errcheck // best-effort diagnostic on stdout
+	fmt.Fprintln(stdout, "     GET /healthz and GET /readyz on the http.listen address directly.")                  //nolint:errcheck // best-effort diagnostic on stdout
 	fmt.Fprintln(stdout)                                                                                            //nolint:errcheck // best-effort diagnostic on stdout
-	fmt.Fprintln(stdout, "Full guide: docs/deploy/grommunio-debian.md in the attachra source tree.")                //nolint:errcheck // best-effort diagnostic on stdout
+
+	switch env {
+	case mailEnvGrommunio:
+		fmt.Fprintln(stdout, "Detected: grommunio. Full guide: docs/deploy/grommunio-debian.md in the attachra source tree.") //nolint:errcheck // best-effort diagnostic on stdout
+	case mailEnvMailcow:
+		fmt.Fprintln(stdout, "Detected: mailcow-dockerized. See docs/integrations/postfix.md in the attachra source tree.") //nolint:errcheck // best-effort diagnostic on stdout
+	case mailEnvIRedMail:
+		fmt.Fprintln(stdout, "Detected: iRedMail. See docs/integrations/postfix.md in the attachra source tree.") //nolint:errcheck // best-effort diagnostic on stdout
+	case mailEnvPostfix:
+		fmt.Fprintln(stdout, "Detected: Postfix. Full guide: docs/integrations/postfix.md in the attachra source tree.") //nolint:errcheck // best-effort diagnostic on stdout
+	default:
+		fmt.Fprintln(stdout, "Full guide: docs/integrations/postfix.md in the attachra source tree.") //nolint:errcheck // best-effort diagnostic on stdout
+	}
+}
+
+// milterChain renders the postconf -e assignment value for a single
+// milter setting (smtpd_milters or non_smtpd_milters): existing is
+// either a previously configured value read via existingMilters (kept
+// first, so an already-wired filter like rspamd keeps running before
+// Attachra) or the "<existing>" placeholder when that could not be
+// determined, and ours is this run's own a.MilterListen, always
+// appended last.
+func milterChain(existing, ours string) string {
+	if strings.TrimSpace(existing) == "" {
+		return ours
+	}
+	return existing + ", " + ours
 }
 
 // generateAttachraYAML renders a.'s answers into an attachra.yaml

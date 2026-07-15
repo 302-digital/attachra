@@ -366,7 +366,7 @@ func TestApplySetupAnswers_ForceOverwrite_ValidationFailure_RestoresOriginal(t *
 		DryRun:        true,
 	}
 	var stdout1, stderr1 bytes.Buffer
-	if code := applySetupAnswers(dir, validAnswers, &stdout1, &stderr1); code != setupOK {
+	if code := applySetupAnswers(dir, validAnswers, mailEnvUnknown, &stdout1, &stderr1); code != setupOK {
 		t.Fatalf("initial applySetupAnswers() = %d, want %d; stderr = %q", code, setupOK, stderr1.String())
 	}
 
@@ -380,7 +380,7 @@ func TestApplySetupAnswers_ForceOverwrite_ValidationFailure_RestoresOriginal(t *
 	invalidAnswers.FailureMode = "not-a-real-mode"   // Rejected by config.Validate(), not by any of applySetupAnswers' own pre-checks.
 
 	var stdout2, stderr2 bytes.Buffer
-	code := applySetupAnswers(dir, invalidAnswers, &stdout2, &stderr2)
+	code := applySetupAnswers(dir, invalidAnswers, mailEnvUnknown, &stdout2, &stderr2)
 	if code != setupError {
 		t.Fatalf("applySetupAnswers() over an existing valid config = %d, want %d", code, setupError)
 	}
@@ -565,7 +565,7 @@ func TestApplySetupAnswers_ValidationFailureCleansUp(t *testing.T) {
 		DryRun:        true,
 	}
 
-	code := applySetupAnswers(dir, answers, &stdout, &stderr)
+	code := applySetupAnswers(dir, answers, mailEnvUnknown, &stdout, &stderr)
 	if code != setupError {
 		t.Fatalf("applySetupAnswers() = %d, want %d", code, setupError)
 	}
@@ -577,6 +577,188 @@ func TestApplySetupAnswers_ValidationFailureCleansUp(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
 			t.Errorf("%s should have been removed after validation failure; stat err = %v", name, err)
 		}
+	}
+}
+
+// --- ATR-337: detected mail environment wired into the wizard's defaults ---
+
+// TestCollectNonInteractiveAnswers_HTTPListenDefault_FollowsDetectedEnv
+// exercises collectNonInteractiveAnswers directly (bypassing
+// runSetupCommand's own real detectMailEnv call) with an explicit env,
+// confirming the http-listen default it falls back to (when the
+// operator did not pass --http-listen) tracks httpListenDefaultFor:
+// 18080 for grommunio, and the same unchanged default for an
+// undetected ("empty system") environment — no regression.
+func TestCollectNonInteractiveAnswers_HTTPListenDefault_FollowsDetectedEnv(t *testing.T) {
+	tests := []struct {
+		name string
+		env  mailEnv
+	}{
+		{"grommunio detected", mailEnvGrommunio},
+		{"empty system (unknown): unchanged default", mailEnvUnknown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := setupFlags{
+				domains:       "example.com",
+				publicBaseURL: "https://mail.example.com",
+				// http-listen deliberately left blank: this is exactly
+				// the default collectNonInteractiveAnswers must resolve
+				// via httpListenDefaultFor(env).
+			}
+			var stderr bytes.Buffer
+			answers, err := collectNonInteractiveAnswers(raw, tt.env, &stderr)
+			if err != nil {
+				t.Fatalf("collectNonInteractiveAnswers() error = %v", err)
+			}
+			if answers.HTTPListen != httpListenDefaultFor(tt.env) {
+				t.Errorf("collectNonInteractiveAnswers(env=%v).HTTPListen = %q, want %q", tt.env, answers.HTTPListen, httpListenDefaultFor(tt.env))
+			}
+		})
+	}
+}
+
+// TestRunSetupWizard_HTTPListenPromptDefault_FollowsDetectedEnv is the
+// interactive-mode counterpart: a bare Enter at the HTTP listen prompt
+// must accept httpListenDefaultFor(env), same as the non-interactive
+// path above.
+func TestRunSetupWizard_HTTPListenPromptDefault_FollowsDetectedEnv(t *testing.T) {
+	tests := []struct {
+		name string
+		env  mailEnv
+	}{
+		{"grommunio detected", mailEnvGrommunio},
+		{"empty system (unknown): unchanged default", mailEnvUnknown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := strings.Join([]string{
+				"example.com",
+				"https://mail.example.com",
+				"", // storage -> default fs
+				"", // fs base dir -> default
+				"", // HTTP listen -> bare Enter, must accept the env-specific default
+				"inet:127.0.0.1:0",
+				"", // failure mode -> default open
+				"", // dry-run -> default true
+			}, "\n") + "\n"
+
+			var stdout bytes.Buffer
+			answers, err := runSetupWizard(newPrompter(strings.NewReader(input), &stdout), setupFlags{}, tt.env)
+			if err != nil {
+				t.Fatalf("runSetupWizard() error = %v; stdout = %q", err, stdout.String())
+			}
+			want := httpListenDefaultFor(tt.env)
+			if answers.HTTPListen != want {
+				t.Errorf("runSetupWizard(env=%v).HTTPListen = %q, want %q", tt.env, answers.HTTPListen, want)
+			}
+		})
+	}
+}
+
+// TestPrintSetupNextSteps_MilterChain_PrefersDetectedExisting fakes
+// existingMilters (the same package-level function-value swap pattern
+// doctor.go's lookupOwnerUID uses) to confirm the printed postconf
+// example keeps a previously configured milter (e.g. rspamd) first and
+// appends Attachra's own listen address, instead of the bare
+// "<existing>" placeholder.
+func TestPrintSetupNextSteps_MilterChain_PrefersDetectedExisting(t *testing.T) {
+	original := existingMilters
+	existingMilters = func() (string, string, bool) {
+		return "inet:127.0.0.1:11332", "", true
+	}
+	defer func() { existingMilters = original }()
+
+	a := setupAnswers{MilterListen: "inet:127.0.0.1:6785"}
+	var stdout bytes.Buffer
+	printSetupNextSteps(&stdout, "/etc/attachra", "/etc/attachra/attachra.yaml", "/etc/attachra/policy.yaml", a, mailEnvUnknown)
+
+	out := stdout.String()
+	if !strings.Contains(out, "smtpd_milters = inet:127.0.0.1:11332, inet:127.0.0.1:6785") {
+		t.Errorf("stdout should keep the detected existing milter first; got:\n%s", out)
+	}
+	if !strings.Contains(out, "non_smtpd_milters = inet:127.0.0.1:6785") {
+		t.Errorf("stdout non_smtpd_milters line should be just Attachra's own listener (no existing detected); got:\n%s", out)
+	}
+	if strings.Contains(out, "<existing>") {
+		t.Errorf("stdout should not fall back to the <existing> placeholder once a real value was detected; got:\n%s", out)
+	}
+}
+
+// TestPrintSetupNextSteps_MilterChain_FallsBackToPlaceholder confirms
+// the pre-existing "<existing>" placeholder behavior is unchanged when
+// existingMilters cannot determine anything (postconf missing/failed) —
+// the common case on a dev machine or CI runner with no Postfix
+// installed at all.
+func TestPrintSetupNextSteps_MilterChain_FallsBackToPlaceholder(t *testing.T) {
+	original := existingMilters
+	existingMilters = func() (string, string, bool) { return "", "", false }
+	defer func() { existingMilters = original }()
+
+	a := setupAnswers{MilterListen: "inet:127.0.0.1:6785"}
+	var stdout bytes.Buffer
+	printSetupNextSteps(&stdout, "/etc/attachra", "/etc/attachra/attachra.yaml", "/etc/attachra/policy.yaml", a, mailEnvUnknown)
+
+	out := stdout.String()
+	if !strings.Contains(out, "smtpd_milters = <existing>, inet:127.0.0.1:6785") {
+		t.Errorf("stdout should fall back to the <existing> placeholder; got:\n%s", out)
+	}
+}
+
+// TestPrintSetupNextSteps_EnvSpecificGuidance confirms each detected
+// environment's next-steps output names the right doc/warning (ATR-337
+// acceptance: grommunio references its own deploy guide; mailcow warns
+// that this .deb targets a host Postfix, not its containerized stack).
+func TestPrintSetupNextSteps_EnvSpecificGuidance(t *testing.T) {
+	original := existingMilters
+	existingMilters = func() (string, string, bool) { return "", "", false }
+	defer func() { existingMilters = original }()
+
+	a := setupAnswers{MilterListen: "inet:127.0.0.1:6785"}
+
+	tests := []struct {
+		name           string
+		env            mailEnv
+		wantSubstrings []string
+	}{
+		{
+			name: "grommunio",
+			env:  mailEnvGrommunio,
+			wantSubstrings: []string{
+				"docs/deploy/grommunio-debian.md",
+				"nginx-grommunio.conf",
+			},
+		},
+		{
+			name: "mailcow",
+			env:  mailEnvMailcow,
+			wantSubstrings: []string{
+				"docs/integrations/postfix.md",
+				"mailcow-dockerized runs its own",
+			},
+		},
+		{
+			name:           "iredmail",
+			env:            mailEnvIRedMail,
+			wantSubstrings: []string{"docs/integrations/postfix.md"},
+		},
+		{
+			name:           "unknown (empty system)",
+			env:            mailEnvUnknown,
+			wantSubstrings: []string{"docs/integrations/postfix.md"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout bytes.Buffer
+			printSetupNextSteps(&stdout, "/etc/attachra", "/etc/attachra/attachra.yaml", "/etc/attachra/policy.yaml", a, tt.env)
+			out := stdout.String()
+			for _, want := range tt.wantSubstrings {
+				if !strings.Contains(out, want) {
+					t.Errorf("env=%v: stdout missing %q; got:\n%s", tt.env, want, out)
+				}
+			}
+		})
 	}
 }
 
