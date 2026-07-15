@@ -90,8 +90,9 @@ Exchange, Exim, Stalwart) as adapters later, without touching the core.
 ## Status & roadmap
 
 **v0.1.0 is released.** The architecture and scope decisions are recorded in
-`docs/Attachra_ADR.md`; the build plan and milestone breakdown live in
-[`docs/Attachra_Backlog.md`](docs/Attachra_Backlog.md).
+[`docs/Attachra_ADR.md`](docs/Attachra_ADR.md); the milestone breakdown and
+what's planned next live in [`ROADMAP.md`](ROADMAP.md) and the repo's
+issues and milestones.
 
 1. **M0 — Foundation**: repo layout, CI, local dev environment. Done.
 2. **M1 — End-to-end pipeline**: milter → policy → storage → link →
