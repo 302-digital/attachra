@@ -1,0 +1,26 @@
+version: 1
+name: "GDPR transfer control (starter)"
+description: "Attachments to non-EU recipients get bounded retention. Placeholder until geo-matching (v-next) lands."
+
+rules:
+  - name: "EU / EEA recipients: normal handling"
+    when:
+      recipient:
+        # List EU/EEA domains explicitly until geography matching lands (§7.3).
+        domain:
+          ["example.eu", "partner.de", "partner.fr", "partner.nl"]
+    then:
+      action: replace
+      ttl: "30d"
+      retention: "30d"
+
+  - name: "All other (treated as non-EU): bounded retention"
+    when:
+      attachment: {}          # any attachment; empty object = "there is an attachment"
+    then:
+      action: replace
+      ttl: "30d"
+      retention: "90d"
+
+default:
+  action: pass

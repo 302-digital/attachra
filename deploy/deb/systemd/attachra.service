@@ -1,0 +1,84 @@
+[Unit]
+Description=Attachra attachment policy engine
+Documentation=https://attachra.org
+# Attachra only ever talks to Postfix over a milter socket it listens
+# on itself (ADR-002/ADR-008): there is no hard start-order dependency
+# on postfix.service, but ordering after network-online.target keeps
+# the milter/HTTP listeners from racing an interface that isn't up yet
+# on boot.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/attachra --config /etc/attachra/attachra.yaml
+# attachra reloads its policy file (/etc/attachra/policy.yaml) on
+# SIGHUP without restarting (main.go's watchPolicyReload); ExecReload=
+# is what makes `systemctl reload attachra` send that signal instead
+# of failing with "Job type reload is not applicable".
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+
+# Optional root-only environment file for secrets referenced from
+# attachra.yaml via ${ENV_VAR} substitution (internal/config's
+# expandEnv), e.g. storage.s3.secret_key: "${ATTACHRA_S3_SECRET_KEY}".
+# systemd (PID 1, running as root) reads this file before dropping to
+# the DynamicUser, so it can stay root:root mode 0600 even though
+# attachra.yaml itself is world-readable (see nfpm.yaml's comment on
+# why). The leading "-" makes a missing file a non-fatal no-op — see
+# docs/deploy/grommunio-debian.md for how to use it.
+EnvironmentFile=-/etc/attachra/attachra.env
+
+# --- Identity & filesystem layout ---
+# DynamicUser allocates an ephemeral, unprivileged UID/GID for the
+# lifetime of the unit; combined with StateDirectory=, systemd creates
+# and chowns /var/lib/attachra to that UID/GID automatically on every
+# start (and does NOT persist a static UID in /etc/passwd).
+DynamicUser=yes
+StateDirectory=attachra
+ConfigurationDirectory=attachra
+UMask=0027
+
+# --- Filesystem hardening ---
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# StateDirectory=attachra is automatically writable under
+# ProtectSystem=strict; database.path and storage.fs.base_dir in
+# attachra.yaml both point under /var/lib/attachra to match.
+ReadWritePaths=/var/lib/attachra
+
+# --- Privilege & capability hardening ---
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+
+# --- Kernel / namespace / syscall hardening ---
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+# --- Network hardening ---
+# AF_UNIX is included for operators who switch milter.listen or
+# http.listen to a unix socket path instead of the default inet
+# addresses. AF_NETLINK is included defensively for Go's resolver and
+# the S3 storage driver's HTTP client, both of which can probe network
+# interface/route state via netlink on Linux depending on the runtime
+# resolver mode in use.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

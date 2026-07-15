@@ -1,0 +1,44 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - revive
+    - gosec
+    - ineffassign
+    - unused
+    - misspell
+
+  settings:
+    revive:
+      rules:
+        - name: exported
+        - name: error-strings
+        - name: unused-parameter
+    gosec:
+      excludes:
+        - G104 # duplicate of errcheck
+
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

@@ -1,0 +1,40 @@
+From: sender@example.com
+To: recipient@example.com
+Subject: Related plus alternative
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="OUTER-BOUNDARY"
+
+--OUTER-BOUNDARY
+Content-Type: multipart/related; boundary="RELATED-BOUNDARY"
+
+--RELATED-BOUNDARY
+Content-Type: multipart/alternative; boundary="ALT-BOUNDARY"
+
+--ALT-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+
+Plain text version.
+
+--ALT-BOUNDARY
+Content-Type: text/html; charset=utf-8
+
+<p>HTML version with <img src="cid:logo123"></p>
+
+--ALT-BOUNDARY--
+--RELATED-BOUNDARY
+Content-Type: image/png
+Content-Disposition: inline; filename="logo.png"
+Content-ID: <logo123>
+Content-Transfer-Encoding: base64
+
+iVBORw0KGgpzeW50aGV0aWMgcG5nIGJ5dGVz
+
+--RELATED-BOUNDARY--
+--OUTER-BOUNDARY
+Content-Type: application/pdf
+Content-Disposition: attachment; filename="attachment.pdf"
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjQKYW5vdGhlciBhdHRhY2htZW50
+
+--OUTER-BOUNDARY--

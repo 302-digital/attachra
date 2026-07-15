@@ -1,0 +1,1421 @@
+openapi: 3.0.3
+info:
+  title: Attachra REST API
+  version: "1.0.0"
+  description: |
+    Attachra's admin/automation REST API (US-8.1, epic E8). This document is
+    the **source of truth** for the API contract (ADR / API-first principle):
+    the HTTP handlers implementing each operation below (T-8.1.2..T-8.1.7)
+    must match it, not the other way around.
+
+    ## Scope
+
+    This spec covers only the versioned, token-authenticated admin API under
+    `/api/v1`. Three other HTTP surfaces already implemented by
+    `internal/adapters/http` are intentionally **out of scope** here, and are
+    listed for completeness rather than documented as paths below:
+
+    - `GET /p/{token}` and `POST /p/{token}/d/{ref}` — the anonymous
+      recipient-facing package/download pages (US-6.2). These are not JSON
+      resources, carry no Bearer auth, and are documented by their own
+      package (`internal/adapters/http/handler.go`,
+      `docs/architecture/package-page-decision.md`).
+    - `GET /metrics` — Prometheus text exposition format, not JSON; described
+      by the metrics library itself, not by an OpenAPI document.
+    - `GET /healthz` and `GET /readyz` — liveness/readiness probes
+      (`internal/adapters/http/health.go`). Both are mounted at the server
+      root, not under `/api/v1` (`internal/adapters/http/server.go`), so
+      including them as `paths` here — which inherit this document's
+      `servers: [{url: /api/v1}]` — would misrepresent their real mount
+      point as a contract detail. They are genuinely unauthenticated
+      (SR-130-1's explicit exception) but are operational Kubernetes/Docker
+      probe endpoints, not part of the admin/automation resource surface
+      this document is the source of truth for.
+
+    ## Versioning
+
+    All resources are mounted under `/api/v1`. A backward-incompatible change
+    to any request/response shape requires a new `/api/v2` prefix (or a new
+    ADR superseding this one) — additive, backward-compatible changes
+    (new optional fields, new endpoints) may be made in place under `/api/v1`.
+
+    ## Authentication
+
+    Every `/api/v1/*` operation requires `Authorization: Bearer <token>`
+    (SR-130-2): tokens are never accepted as a query parameter, and the
+    server compares them in constant time against the stored hash
+    (T-8.1.7). Every route under `/api/v1` is deny-by-default until proven
+    otherwise; the only endpoints excluded from authentication at all are
+    `GET /healthz` and `GET /readyz` (SR-130-1), which are out of this
+    document's scope entirely — see "Scope" above.
+
+    Repeated invalid-Bearer attempts against the same client are rate
+    limited (SR-130-5's "rate limit on auth failures"), independent of any
+    resource-level rate limiting: a client that keeps failing auth gets
+    throttled the same way as any other client tripping the `429` response
+    documented under "Errors" below, not just once it reaches a valid
+    token and starts making real requests.
+
+    ## Roles and access matrix
+
+    Community edition ships exactly three fixed roles (ADR-015, decision
+    OQ-4 in `docs/product/open-core-boundary.md`); a thinner/richer custom
+    RBAC model is an Identity Pack (Enterprise) concern, not implemented
+    here. Every operation below carries an `x-required-role` extension
+    listing which of these three roles may call it; a caller whose token
+    role is not in that list gets `403 forbidden`.
+
+    | Role      | Can access |
+    |-----------|------------|
+    | `admin`   | Everything: all reads, plus every mutation (revoke, hold/unhold, policy reload, API token management). |
+    | `viewer`  | Read-only: messages, attachments, links, policies (get/validate/dry-run), stats, audit. No mutations. |
+    | `auditor` | Read-only, and **only** the audit log and its export (`GET /audit`, `GET /audit/export`). No access to messages, attachments, links, policies, stats or API-token management. |
+
+    A `viewer` and an `auditor` both exist so an organization can hand a
+    read-only auditor a token that can see *nothing but* the audit trail —
+    a stricter guarantee than "read-only over everything" already gives.
+
+    `POST /policies/validate` and `POST /policies/dry-run` use the `POST`
+    method but are deliberately in `viewer`'s allowed set, not `admin`-only:
+    "mutating" here means "changes server state" (SR-130-3's actual
+    concern), and neither does — validate only parses/checks a submitted
+    document, dry-run only evaluates the already-active policy against a
+    hypothetical message, and neither ever touches the active policy, a
+    message, an attachment or a link. Only `POST /policies/reload` (which
+    swaps the active policy) is `admin`-only.
+
+    ## Pagination
+
+    Every list endpoint uses **opaque cursor pagination**, not offset/page
+    numbers: each list resource here is backed by an append-mostly,
+    concurrently-written table (messages/attachments/links keep growing as
+    mail flows through; the audit log is by definition append-only and
+    already ordered by a monotonic `seq`, see `internal/core/audit`).
+    Offset pagination silently skips or repeats rows when concurrent writes
+    land between two page requests — a real risk in exactly this kind of
+    table, and a correctness problem for `audit`/`export`, where compliance
+    consumers rely on seeing every row exactly once. A single, uniform
+    `limit`/`cursor` query-parameter pair is used everywhere instead:
+
+    - `limit` — page size, default 50, minimum 1, maximum 200 (SR-130-5's
+      mandatory response-size cap).
+    - `cursor` — an opaque, server-issued string (treat as an unstructured
+      token; do not parse or construct one). Omit it for the first page;
+      pass back the previous page's `next_cursor` for the next one.
+
+    A response's `next_cursor` is `null` when there is no further page.
+
+    `GET /audit/export` is the one exception: it streams the *entire*
+    filtered result set as newline-delimited JSON in one response
+    (mirroring `audit.ExportJSONL`, which is itself unbounded-but-streamed
+    per CLAUDE.md invariant #4), so it takes no `limit`/`cursor` — an
+    external SIEM/archival consumer wants the full export, not a page of it.
+
+    ## Errors
+
+    Every non-2xx response body is the single `Error` schema below: a
+    stable machine-readable `code`, a safe human-readable `message` that
+    never includes internal detail (stack traces, driver error text, SQL,
+    file paths — SR-130-1/SR-125-5's "no internal detail leakage"
+    principle, applied to the whole API surface, not just the download
+    path), and an optional `details` array used only by policy
+    validate/reload to carry structured, per-field validation issues.
+  contact:
+    name: Attachra
+    url: https://github.com/302-digital/attachra
+  license:
+    name: AGPL-3.0-only
+    url: https://github.com/302-digital/attachra/blob/main/LICENSE
+
+servers:
+  - url: /api/v1
+    description: Relative to whatever host/port this Attachra instance's operator has bound the API to.
+
+tags:
+  - name: Messages
+    description: Read-only view of processed messages (US-8.1, T-8.1.4).
+  - name: Attachments
+    description: Read-only view of replaced attachments (US-8.1, T-8.1.4).
+  - name: Links
+    description: Personal download links — list, get, revoke, legal hold (US-8.1, T-8.1.3).
+  - name: Policies
+    description: Policy Engine control surface — get/validate/reload/dry-run (US-8.1, T-8.1.5).
+  - name: Stats
+    description: Aggregated statistics, including deliverability by domain (US-8.1/US-7.2, T-8.1.6, ATR-274).
+  - name: Audit
+    description: Audit log — view and export (US-8.1/US-7.1, T-8.1.6).
+  - name: API Tokens
+    description: API token issuance and revocation (US-8.1, T-8.1.7).
+
+security:
+  - bearerAuth: []
+
+paths:
+  /messages:
+    get:
+      operationId: listMessages
+      summary: List processed messages
+      tags: [Messages]
+      x-required-role: [admin, viewer]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: sender
+          in: query
+          description: Exact, case-insensitive envelope-sender match.
+          schema: { type: string }
+        - name: recipient
+          in: query
+          description: >-
+            Exact, case-insensitive recipient match. Implemented as a join
+            against this message's links (a Message row itself carries no
+            recipient — recipients live on `store.Link`/`store.MessageLink`,
+            one per (message, recipient) pair).
+          schema: { type: string }
+        - name: status
+          in: query
+          description: >-
+            Aggregated worst-case policy action for the whole message
+            (mirrors `policy.MessageDecision.Action`). **Implementation
+            note:** `store.Message` does not persist this value today;
+            the T-8.1.4 implementation must derive or persist it (e.g. by
+            joining the message's `policy_decision` audit event, or adding
+            a column) before this filter can be honored — it is specified
+            here because the contract is expected to drive that addition,
+            not the other way around.
+          schema: { $ref: '#/components/schemas/Action' }
+        - name: from
+          in: query
+          description: Inclusive lower bound on `created_at`.
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          description: Exclusive upper bound on `created_at`.
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: A page of messages.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessageList' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /messages/{messageId}:
+    get:
+      operationId: getMessage
+      summary: Get a single message by ID
+      tags: [Messages]
+      x-required-role: [admin, viewer]
+      parameters:
+        - $ref: '#/components/parameters/MessageIdPath'
+      responses:
+        '200':
+          description: The message.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Message' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /attachments:
+    get:
+      operationId: listAttachments
+      summary: List replaced attachments
+      tags: [Attachments]
+      x-required-role: [admin, viewer]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: message_id
+          in: query
+          schema: { type: string }
+        - name: filename
+          in: query
+          description: Case-insensitive wildcard pattern matched against the sanitized attachment file name. Supports `*` (any run) and `?` (single character) only — unlike the policy format's `when.attachment.filename`, character classes such as `[a-z]` are not supported and match literally.
+          schema: { type: string }
+        - name: mime_type
+          in: query
+          description: Case-insensitive wildcard pattern (`*` and `?` only, no character classes) matched against the *detected* (magic-byte) type, e.g. `application/pdf`, `image/*`.
+          schema: { type: string }
+        - name: min_size
+          in: query
+          description: Inclusive lower bound on `size`, in bytes.
+          schema: { type: integer, format: int64, minimum: 0 }
+        - name: max_size
+          in: query
+          description: Inclusive upper bound on `size`, in bytes.
+          schema: { type: integer, format: int64, minimum: 0 }
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: A page of attachments.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AttachmentList' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /attachments/{attachmentId}:
+    get:
+      operationId: getAttachment
+      summary: Get a single attachment by ID
+      tags: [Attachments]
+      x-required-role: [admin, viewer]
+      parameters:
+        - $ref: '#/components/parameters/AttachmentIdPath'
+      responses:
+        '200':
+          description: The attachment.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Attachment' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /links:
+    get:
+      operationId: listLinks
+      summary: List personal download links
+      tags: [Links]
+      x-required-role: [admin, viewer]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: message_id
+          in: query
+          schema: { type: string }
+        - name: recipient
+          in: query
+          description: Exact, case-insensitive recipient match.
+          schema: { type: string }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/LinkStatus' }
+        - name: from
+          in: query
+          description: Inclusive lower bound on `created_at`.
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          description: Exclusive upper bound on `created_at`.
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: A page of links.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LinkList' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /links/{linkId}:
+    get:
+      operationId: getLink
+      summary: Get a single link by ID
+      tags: [Links]
+      x-required-role: [admin, viewer]
+      parameters:
+        - $ref: '#/components/parameters/LinkIdPath'
+      responses:
+        '200':
+          description: The link.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Link' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /links/{linkId}/revoke:
+    post:
+      operationId: revokeLink
+      summary: Revoke a single link
+      description: >-
+        Mirrors `link.Engine.Revoke`. Refuses with `409 held` if the link is
+        currently under legal hold (ATR-233/ATR-257) — the hold must be
+        explicitly lifted via `POST /links/{linkId}/unhold` first.
+      tags: [Links]
+      x-required-role: [admin]
+      parameters:
+        - $ref: '#/components/parameters/LinkIdPath'
+      responses:
+        '200':
+          description: The link, now revoked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Link' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: The link is under legal hold and cannot be revoked yet.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: { code: held, message: "link is under legal hold" } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /links/{linkId}/hold:
+    post:
+      operationId: holdLink
+      summary: Place a link under legal hold
+      description: >-
+        Mirrors `link.Engine.SetHold(ctx, actor, linkId, true)` (ATR-257).
+        While held, this link cannot be revoked and is excluded from
+        retention cleanup, until an explicit `unhold` call.
+      tags: [Links]
+      x-required-role: [admin]
+      parameters:
+        - $ref: '#/components/parameters/LinkIdPath'
+      responses:
+        '200':
+          description: The link, now held.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Link' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /links/{linkId}/unhold:
+    post:
+      operationId: unholdLink
+      summary: Lift a legal hold from a link
+      description: Mirrors `link.Engine.SetHold(ctx, actor, linkId, false)` (ATR-257).
+      tags: [Links]
+      x-required-role: [admin]
+      parameters:
+        - $ref: '#/components/parameters/LinkIdPath'
+      responses:
+        '200':
+          description: The link, no longer held.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Link' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /links/revoke-by-message:
+    post:
+      operationId: revokeLinksByMessage
+      summary: Revoke every link belonging to one message (cascade)
+      description: >-
+        Mirrors `link.Engine.RevokeMessage`: revokes every link of the
+        message except any currently under legal hold, which are skipped
+        and reported back via `held`, not treated as a hard failure — a
+        partial revoke is still reported as `200`, with `held > 0`
+        signalling that at least one link needs an explicit unhold first.
+      tags: [Links]
+      x-required-role: [admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RevokeByMessageRequest' }
+      responses:
+        '200':
+          description: Revoke outcome (possibly partial, see `held`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RevokeByMessageResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /links/revoke-by-sender:
+    post:
+      operationId: revokeLinksBySender
+      summary: Revoke every link belonging to every message from one sender (cascade)
+      description: >-
+        Mirrors `link.Engine.RevokeSender`, after resolving the sender's
+        message IDs via `store.MetadataStore.ListMessagesBySender`. Like
+        the by-message variant, held links are skipped and reported, not
+        treated as a hard failure.
+      tags: [Links]
+      x-required-role: [admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RevokeBySenderRequest' }
+      responses:
+        '200':
+          description: Revoke outcome (possibly partial, see `held_messages`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RevokeBySenderResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /policies/current:
+    get:
+      operationId: getCurrentPolicy
+      summary: Get the currently active policy
+      description: >-
+        Mirrors `policy.Store.Current()`. This JSON representation is
+        read-only and reports fully resolved values (durations in seconds,
+        sizes in bytes — see the `Duration`/`SizeBytes` schemas) rather
+        than the YAML file's convenience units ("30d", "10MB"); it is
+        **not** round-trip compatible with the YAML document
+        `POST /policies/validate` accepts. There is no
+        export-then-edit-then-validate workflow through this API: editing
+        a policy means editing the YAML file this server is configured to
+        read, then calling `POST /policies/reload`.
+      tags: [Policies]
+      x-required-role: [admin, viewer]
+      responses:
+        '200':
+          description: The active policy.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Policy' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /policies/validate:
+    post:
+      operationId: validatePolicy
+      summary: Validate a candidate policy document without applying it
+      description: >-
+        Mirrors `policy.Parse`: parses and validates the submitted YAML
+        document, returning **every** error and warning found (not just
+        the first), and never mutates the currently active policy —
+        `valid` reflects whether the document could be applied, but this
+        endpoint alone never applies it (see `POST /policies/reload`).
+      tags: [Policies]
+      x-required-role: [admin, viewer]
+      requestBody:
+        required: true
+        content:
+          application/x-yaml:
+            schema:
+              type: string
+              description: Raw policy YAML document (docs/architecture/policy-format-v1.md).
+      responses:
+        '200':
+          description: Validation result (present even when `valid` is false — this is not an error response).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidateResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /policies/reload:
+    post:
+      operationId: reloadPolicy
+      summary: Re-read and apply the configured policy file from disk
+      description: >-
+        Mirrors `policy.Store.Reload()` (US-4.2, T-4.2.1): re-reads and
+        re-validates the policy file at this server's configured path
+        (there is no request body — this is the SIGHUP/hot-reload
+        operation, not an upload). If the file fails to parse or validate,
+        the previously active policy **remains in effect** and this
+        returns `409` — an invalid policy is never applied
+        (SR-119-1/§3.5).
+      tags: [Policies]
+      x-required-role: [admin]
+      responses:
+        '200':
+          description: Reload succeeded; the returned policy is now active.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReloadResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: >-
+            The policy file on disk is invalid; the previously active
+            policy is unchanged and still in effect.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: invalid_policy
+                  message: "policy \"finance.yaml\": error at default: default action is required and must not be omitted"
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /policies/dry-run:
+    post:
+      operationId: dryRunPolicy
+      summary: Evaluate the active policy against a hypothetical message
+      description: >-
+        Mirrors `policy.Evaluate` against the currently active policy
+        (`policy.Store.Current()`), without creating any message,
+        attachment, link or storage object, and without recording an
+        audit event — a pure, side-effect-free simulation for testing
+        "what would this policy do?" ahead of a real reload.
+      tags: [Policies]
+      x-required-role: [admin, viewer]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DryRunRequest' }
+      responses:
+        '200':
+          description: The decision the active policy would have made.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DryRunResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /stats/summary:
+    get:
+      operationId: getStatsSummary
+      summary: Aggregated message/policy/download statistics for a time window
+      description: Mirrors `stats.Compute` (US-7.2/T-7.2.2).
+      tags: [Stats]
+      x-required-role: [admin, viewer]
+      parameters:
+        - name: from
+          in: query
+          required: true
+          description: Inclusive lower bound of the window (`stats.Query.From`).
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          required: true
+          description: Exclusive upper bound of the window (`stats.Query.To`).
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: The aggregated summary.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StatsSummary' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /stats/deliverability:
+    get:
+      operationId: getDeliverabilityStats
+      summary: Link download-rate statistics broken down by recipient domain
+      description: >-
+        ATR-231/ATR-274: surfaces which recipient domains are failing to
+        retrieve their replaced attachments (a low download-rate signals a
+        deliverability or spam-filtering problem with that domain), for
+        both the Web UI deliverability dashboard and external automation.
+        Sorted by `download_rate` ascending by default (worst-performing
+        domains first) so a problem domain is on page one.
+      tags: [Stats]
+      x-required-role: [admin, viewer]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: from
+          in: query
+          required: true
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          required: true
+          schema: { type: string, format: date-time }
+        - name: sort
+          in: query
+          description: Sort key. Only `download_rate` is supported in v1.
+          schema: { type: string, enum: [download_rate], default: download_rate }
+        - name: order
+          in: query
+          schema: { type: string, enum: [asc, desc], default: asc }
+      responses:
+        '200':
+          description: A page of per-domain deliverability statistics.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeliverabilityList' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /audit:
+    get:
+      operationId: listAuditEvents
+      summary: List audit log events
+      description: Mirrors `audit.Reader.StreamEvents`, paginated.
+      tags: [Audit]
+      x-required-role: [admin, viewer, auditor]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+        - name: type
+          in: query
+          schema: { $ref: '#/components/schemas/AuditType' }
+        - name: message_id
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: A page of audit events, in ascending `seq` order.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditEventList' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /audit/export:
+    get:
+      operationId: exportAuditEvents
+      summary: Export the full filtered audit log as JSON Lines
+      description: >-
+        Mirrors `audit.ExportJSONL`: streams every matching event as one
+        compact JSON object per line, in ascending `seq` order, without
+        buffering the full result set (CLAUDE.md invariant #4). Intended
+        for ingestion into an external, immutable store or SIEM
+        (SR-128-3). Unlike every other list endpoint, this is **not**
+        paginated — filter by `from`/`to`/`type` to bound the export size.
+      tags: [Audit]
+      x-required-role: [admin, viewer, auditor]
+      parameters:
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+        - name: type
+          in: query
+          schema: { $ref: '#/components/schemas/AuditType' }
+      responses:
+        '200':
+          description: Newline-delimited JSON, one `AuditEvent` object per line.
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+                format: binary
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api-tokens:
+    get:
+      operationId: listApiTokens
+      summary: List API tokens
+      description: Never returns a secret or its hash — only issuance metadata.
+      tags: [API Tokens]
+      x-required-role: [admin]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of API tokens.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiTokenList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      operationId: createApiToken
+      summary: Create a new API token
+      description: >-
+        The response's `secret` field is the only time the raw bearer
+        token is ever shown; only its hash is persisted thereafter
+        (CLAUDE.md invariant #5, SR-130-2). There is no "show secret
+        again" endpoint — losing it means issuing a new token.
+      tags: [API Tokens]
+      x-required-role: [admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApiTokenCreateRequest' }
+      responses:
+        '201':
+          description: The token was created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiTokenCreateResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api-tokens/{tokenId}:
+    get:
+      operationId: getApiToken
+      summary: Get a single API token's metadata
+      tags: [API Tokens]
+      x-required-role: [admin]
+      parameters:
+        - $ref: '#/components/parameters/TokenIdPath'
+      responses:
+        '200':
+          description: The token's metadata.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiToken' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      operationId: revokeApiToken
+      summary: Revoke an API token
+      description: Takes effect immediately — the next request bearing this token's secret is rejected as `401 unauthorized`.
+      tags: [API Tokens]
+      x-required-role: [admin]
+      parameters:
+        - $ref: '#/components/parameters/TokenIdPath'
+      responses:
+        '204':
+          description: The token was revoked.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: >-
+        An Attachra API token secret, shown once at creation time
+        (`POST /api-tokens`). Never accepted as a query parameter
+        (SR-130-2); compared server-side in constant time against the
+        stored SHA-256 hash.
+
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      description: Maximum number of items to return.
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque pagination cursor from a previous page's `next_cursor`. Omit for the first page.
+      schema: { type: string }
+    MessageIdPath:
+      name: messageId
+      in: path
+      required: true
+      schema: { type: string }
+    AttachmentIdPath:
+      name: attachmentId
+      in: path
+      required: true
+      schema: { type: string }
+    LinkIdPath:
+      name: linkId
+      in: path
+      required: true
+      schema: { type: string }
+    TokenIdPath:
+      name: tokenId
+      in: path
+      required: true
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Malformed request (bad query parameter, invalid JSON body, etc).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: bad_request, message: "invalid value for query parameter \"limit\"" } }
+    Unauthorized:
+      description: Missing, malformed or invalid Bearer token.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: unauthorized, message: "missing or invalid bearer token" } }
+    Forbidden:
+      description: The token's role is not permitted to call this operation (see `x-required-role`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: forbidden, message: "this token's role is not permitted to perform this action" } }
+    NotFound:
+      description: No resource exists with the given identifier.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: not_found, message: "no resource found for the given identifier" } }
+    PayloadTooLarge:
+      description: The request body exceeded the configured size limit.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: payload_too_large, message: "request body exceeds the configured size limit" } }
+    TooManyRequests:
+      description: Rate limit exceeded (SR-130-5).
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Seconds to wait before retrying.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: rate_limited, message: "too many requests, slow down" } }
+    InternalError:
+      description: An unexpected server-side failure. The response never includes internal detail (no stack trace, driver error text, or file path — SR-130-1).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: internal, message: "an internal error occurred" } }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Stable, machine-readable error identifier.
+              enum:
+                - bad_request
+                - unauthorized
+                - forbidden
+                - not_found
+                - conflict
+                - held
+                - invalid_policy
+                - validation_failed
+                - payload_too_large
+                - rate_limited
+                - internal
+            message:
+              type: string
+              description: Safe, human-readable message. Never includes internal detail (SR-130-1).
+            details:
+              type: array
+              description: Structured, per-field issues. Populated only by policy validate/reload failures.
+              items: { $ref: '#/components/schemas/ValidationIssue' }
+
+    Action:
+      type: string
+      description: One of the three policy actions (`policy.Action`).
+      enum: [pass, replace, block]
+
+    LinkStatus:
+      type: string
+      description: Link lifecycle state (`store.LinkStatus`).
+      enum: [active, revoked, expired]
+
+    Role:
+      type: string
+      description: >-
+        One of Community's three fixed roles (ADR-015). The model is
+        intentionally left extensible (Enterprise Identity Pack may add
+        custom roles) but Community itself implements exactly these three.
+      enum: [admin, viewer, auditor]
+
+    AuditType:
+      type: string
+      description: Audit event kind (`audit.Type`).
+      enum:
+        - message_processed
+        - policy_decision
+        - attachment_stored
+        - links_created
+        - download
+        - revoke
+        - hold
+        - retention_cleanup
+        - token_change
+        - error
+
+    Message:
+      type: object
+      required: [id, queue_id, sender, created_at]
+      properties:
+        id: { type: string, description: "store.Message.ID (milter queue ID-derived message identifier)." }
+        queue_id: { type: string, description: "store.Message.QueueID — the milter queue ID." }
+        sender: { type: string, description: "store.Message.Sender — the envelope-from address." }
+        created_at: { type: string, format: date-time }
+        recipients:
+          type: array
+          items: { type: string }
+          description: Distinct recipients derived from this message's links (not a stored column on `store.Message` itself).
+        attachment_count:
+          type: integer
+          description: Number of `store.Attachment` rows belonging to this message.
+        status:
+          allOf: [{ $ref: '#/components/schemas/Action' }]
+          type: string
+          nullable: true
+          description: >-
+            Aggregated message-level decision. See the `status` filter's
+            implementation note on `GET /messages` — not backed by a
+            persisted column today.
+
+    MessageList:
+      allOf:
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: array
+              items: { $ref: '#/components/schemas/Message' }
+        - $ref: '#/components/schemas/PageMeta'
+
+    Attachment:
+      type: object
+      required: [id, message_id, part_ref, filename, declared_type, detected_type, size, created_at]
+      properties:
+        id: { type: string }
+        message_id: { type: string }
+        part_ref: { type: string, description: "store.Attachment.PartRef — the MIME part's position within the message." }
+        filename: { type: string, description: Decoded and sanitized attachment file name. }
+        declared_type: { type: string, description: "The Content-Type the message declared for this part." }
+        detected_type: { type: string, description: The real content type detected from magic bytes. }
+        size: { type: integer, format: int64, description: Size in bytes. }
+        retain_until:
+          type: string
+          format: date-time
+          nullable: true
+          description: Storage retention deadline (US-5.3). Null for legacy pre-ATR-178 rows.
+        created_at: { type: string, format: date-time }
+      description: >-
+        Deliberately excludes `storage_key`: the object store key is an
+        opaque, unguessable identifier that is never exposed outside the
+        storage driver boundary (SR-121-3) — API consumers address bytes
+        only via a link, never directly.
+
+    AttachmentList:
+      allOf:
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: array
+              items: { $ref: '#/components/schemas/Attachment' }
+        - $ref: '#/components/schemas/PageMeta'
+
+    Link:
+      type: object
+      required: [id, message_id, attachment_id, recipient, expires_at, max_downloads, downloads, status, hold, created_at]
+      properties:
+        id: { type: string }
+        message_id: { type: string }
+        attachment_id: { type: string }
+        recipient: { type: string }
+        expires_at: { type: string, format: date-time }
+        max_downloads: { type: integer, minimum: 0, description: "0 means unlimited (store.Link.MaxDownloads)." }
+        downloads: { type: integer, minimum: 0 }
+        status: { $ref: '#/components/schemas/LinkStatus' }
+        hold: { type: boolean, description: "Legal hold flag (ATR-233/ATR-257). While true, revoke and retention deletion are refused." }
+        hold_set_by: { type: string, nullable: true }
+        hold_set_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+      description: Deliberately excludes `token_hash` — never exposed via the API.
+
+    LinkList:
+      allOf:
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: array
+              items: { $ref: '#/components/schemas/Link' }
+        - $ref: '#/components/schemas/PageMeta'
+
+    RevokeByMessageRequest:
+      type: object
+      required: [message_id]
+      properties:
+        message_id: { type: string }
+
+    RevokeByMessageResult:
+      type: object
+      required: [revoked, held]
+      properties:
+        revoked: { type: integer, description: Number of links actually revoked. }
+        held: { type: integer, description: Number of links skipped because they are under legal hold. }
+
+    RevokeBySenderRequest:
+      type: object
+      required: [sender]
+      properties:
+        sender: { type: string }
+
+    RevokeBySenderResult:
+      type: object
+      required: [revoked, held_messages]
+      properties:
+        revoked: { type: integer, description: Total links revoked across every message from this sender. }
+        held_messages: { type: integer, description: Number of messages that had at least one link skipped due to legal hold. }
+
+    Duration:
+      type: integer
+      format: int64
+      description: >-
+        A resolved duration in seconds. The policy YAML file accepts
+        convenience units ("30d", "48h" — see `policy.Duration`), but API
+        responses always report the fully resolved value in seconds,
+        since a response describes an already-parsed, validated policy.
+      example: 2592000
+
+    SizeBytes:
+      type: integer
+      format: int64
+      minimum: 0
+      description: >-
+        A resolved byte count. The policy YAML file accepts convenience
+        units ("10MB", "512KiB" — see `policy.Bound`), but API responses
+        always report the fully resolved byte count.
+      example: 10000000
+
+    SizeRange:
+      type: object
+      properties:
+        min: { allOf: [{ $ref: '#/components/schemas/SizeBytes' }], type: integer, nullable: true }
+        max: { allOf: [{ $ref: '#/components/schemas/SizeBytes' }], type: integer, nullable: true }
+
+    AddressMatch:
+      type: object
+      properties:
+        address: { type: array, items: { type: string } }
+        domain: { type: array, items: { type: string } }
+        pattern: { type: array, items: { type: string } }
+
+    AttachmentMatch:
+      type: object
+      properties:
+        size: { $ref: '#/components/schemas/SizeRange' }
+        mime_type: { type: array, items: { type: string } }
+        claimed_mime_type: { type: array, items: { type: string } }
+        extension: { type: array, items: { type: string } }
+        filename: { type: array, items: { type: string } }
+
+    When:
+      type: object
+      description: Combined with AND across present sections (`policy.When`).
+      properties:
+        sender: { $ref: '#/components/schemas/AddressMatch' }
+        recipient: { $ref: '#/components/schemas/AddressMatch' }
+        attachment: { $ref: '#/components/schemas/AttachmentMatch' }
+
+    ActionParams:
+      type: object
+      description: Valid only when `action` is `replace` (`policy.ActionParams`). Shared by `ActionSpec.then`/`default` and `Policy.defaults`.
+      properties:
+        ttl_seconds: { allOf: [{ $ref: '#/components/schemas/Duration' }], type: integer, nullable: true }
+        max_downloads: { type: integer, nullable: true, minimum: 1 }
+        retention_seconds: { allOf: [{ $ref: '#/components/schemas/Duration' }], type: integer, nullable: true }
+
+    ActionSpec:
+      type: object
+      required: [action]
+      properties:
+        action: { $ref: '#/components/schemas/Action' }
+        ttl_seconds: { allOf: [{ $ref: '#/components/schemas/Duration' }], type: integer, nullable: true }
+        max_downloads: { type: integer, nullable: true, minimum: 1 }
+        retention_seconds: { allOf: [{ $ref: '#/components/schemas/Duration' }], type: integer, nullable: true }
+        reason: { type: string, description: "Valid only when `action` is `block`." }
+        dry_run: { type: boolean, nullable: true, description: "Per-rule dry-run override (`policy.ActionSpec.DryRun`). Null means \"defer to the global setting\"." }
+
+    Rule:
+      type: object
+      required: [name, then, disabled]
+      properties:
+        name: { type: string }
+        description: { type: string }
+        when: { allOf: [{ $ref: '#/components/schemas/When' }], type: object, nullable: true, description: "Null means \"matches everything\" (catch-all)." }
+        then: { $ref: '#/components/schemas/ActionSpec' }
+        disabled: { type: boolean }
+
+    Policy:
+      type: object
+      required: [version, name, rules, default]
+      properties:
+        version: { type: integer, description: Policy format major version (currently 1 only). }
+        name: { type: string }
+        description: { type: string }
+        rules:
+          type: array
+          items: { $ref: '#/components/schemas/Rule' }
+        default: { $ref: '#/components/schemas/ActionSpec' }
+        metadata:
+          type: object
+          additionalProperties: { type: string }
+        defaults:
+          allOf: [{ $ref: '#/components/schemas/ActionParams' }]
+          type: object
+          nullable: true
+          description: "Reserved default action parameters inherited by rules that omit them (`policy.Policy.Defaults`). Parsed but does not affect evaluation in v1 (policy-format-v1.md §7.2)."
+
+    ValidationIssue:
+      type: object
+      required: [path, message]
+      properties:
+        path: { type: string, description: "JSON-pointer-like location, e.g. \"rules[2].then\" or \"default\" (policy.ValidationError.Path)." }
+        rule_name: { type: string, description: "Name of the offending rule, when known." }
+        message: { type: string }
+
+    ValidateResponse:
+      type: object
+      required: [valid, errors, warnings]
+      properties:
+        valid: { type: boolean, description: True only if `errors` is empty — a document with warnings but no errors is still valid. }
+        errors:
+          type: array
+          items: { $ref: '#/components/schemas/ValidationIssue' }
+        warnings:
+          type: array
+          items: { $ref: '#/components/schemas/ValidationIssue' }
+
+    ReloadResponse:
+      type: object
+      required: [policy, warnings]
+      properties:
+        policy:
+          type: object
+          required: [name, version, rule_count]
+          properties:
+            name: { type: string }
+            version: { type: integer }
+            rule_count: { type: integer }
+        warnings:
+          type: array
+          items: { type: string }
+          description: Non-fatal warnings produced while validating the newly loaded policy (`policy.Store.Reload`'s second return value).
+
+    DryRunAttachment:
+      type: object
+      required: [filename, size, detected_type]
+      properties:
+        filename: { type: string }
+        size: { type: integer, format: int64 }
+        declared_type: { type: string }
+        detected_type: { type: string }
+
+    DryRunRequest:
+      type: object
+      required: [sender, recipients, attachments]
+      properties:
+        sender: { type: string }
+        recipients:
+          type: array
+          minItems: 1
+          items: { type: string }
+        attachments:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/DryRunAttachment' }
+
+    DryRunAttachmentDecision:
+      type: object
+      required: [filename, action]
+      properties:
+        filename: { type: string }
+        action: { $ref: '#/components/schemas/Action' }
+        rule_name: { type: string, nullable: true, description: "Null if the decision came from the policy's `default` branch." }
+        reason: { type: string, nullable: true, description: "Populated only when `action` is `block`." }
+        ttl_seconds: { allOf: [{ $ref: '#/components/schemas/Duration' }], type: integer, nullable: true }
+        max_downloads: { type: integer, nullable: true }
+        retention_seconds: { allOf: [{ $ref: '#/components/schemas/Duration' }], type: integer, nullable: true }
+
+    DryRunResponse:
+      type: object
+      required: [action, attachments]
+      properties:
+        action: { $ref: '#/components/schemas/Action' }
+        reason: { type: string, nullable: true }
+        attachments:
+          type: array
+          items: { $ref: '#/components/schemas/DryRunAttachmentDecision' }
+
+    DailyCount:
+      type: object
+      required: [day, count]
+      properties:
+        day: { type: string, description: "UTC calendar day, YYYY-MM-DD." }
+        count: { type: integer, format: int64 }
+
+    LabeledCount:
+      type: object
+      required: [label, count]
+      properties:
+        label: { type: string }
+        count: { type: integer, format: int64 }
+
+    StatsSummary:
+      type: object
+      required: [from, to, messages_by_day, action_breakdown, policy_breakdown, downloads, errors]
+      properties:
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+        messages_by_day:
+          type: array
+          items: { $ref: '#/components/schemas/DailyCount' }
+        action_breakdown:
+          type: array
+          items: { $ref: '#/components/schemas/LabeledCount' }
+          description: Count of policy decisions per decided action, descending by count.
+        policy_breakdown:
+          type: array
+          items: { $ref: '#/components/schemas/LabeledCount' }
+          description: Count of policy decisions per matched policy name, descending by count.
+        downloads: { type: integer, format: int64 }
+        errors: { type: integer, format: int64 }
+
+    DeliverabilityEntry:
+      type: object
+      required: [domain, links_created, links_downloaded, download_rate]
+      properties:
+        domain: { type: string, description: Recipient domain (the part of the address after '@'). }
+        links_created: { type: integer, format: int64, description: Links created for recipients at this domain in the window. }
+        links_downloaded: { type: integer, format: int64, description: Links with at least one recorded download in the window. }
+        download_rate: { type: number, format: double, minimum: 0, maximum: 1, description: "links_downloaded / links_created." }
+
+    DeliverabilityList:
+      allOf:
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: array
+              items: { $ref: '#/components/schemas/DeliverabilityEntry' }
+        - $ref: '#/components/schemas/PageMeta'
+
+    AuditEvent:
+      type: object
+      required: [id, seq, prev_hash, timestamp, type]
+      properties:
+        id: { type: string }
+        seq: { type: integer, format: int64, description: Monotonically increasing sequence number (`audit.Recorded.Seq`). }
+        prev_hash: { type: string, description: "Hash of the previous record in the chain, or empty for the first record (tamper-evidence hook, SR-128-1)." }
+        timestamp: { type: string, format: date-time }
+        type: { $ref: '#/components/schemas/AuditType' }
+        actor: { type: string, description: "API principal, \"milter\", or \"system\"." }
+        message_id: { type: string }
+        recipient: { type: string }
+        details:
+          type: object
+          additionalProperties: true
+          description: Event-specific fields (rule name, IP, reason, etc — `audit.Event.Details`).
+
+    AuditEventList:
+      allOf:
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: array
+              items: { $ref: '#/components/schemas/AuditEvent' }
+        - $ref: '#/components/schemas/PageMeta'
+
+    ApiToken:
+      type: object
+      required: [id, name, role, created_at]
+      properties:
+        id: { type: string }
+        name: { type: string, description: Operator-chosen label for this token. }
+        role: { $ref: '#/components/schemas/Role' }
+        created_at: { type: string, format: date-time }
+        last_used_at: { type: string, format: date-time, nullable: true }
+      description: Never includes the token secret or its hash.
+
+    ApiTokenList:
+      allOf:
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: array
+              items: { $ref: '#/components/schemas/ApiToken' }
+        - $ref: '#/components/schemas/PageMeta'
+
+    ApiTokenCreateRequest:
+      type: object
+      required: [name, role]
+      properties:
+        name: { type: string }
+        role: { $ref: '#/components/schemas/Role' }
+
+    ApiTokenCreateResponse:
+      allOf:
+        - $ref: '#/components/schemas/ApiToken'
+        - type: object
+          required: [secret]
+          properties:
+            secret:
+              type: string
+              description: >-
+                The raw bearer token. Shown exactly once, at creation
+                time; only its hash is persisted (CLAUDE.md invariant #5,
+                SR-130-2). There is no way to retrieve it again.
+
+    PageMeta:
+      type: object
+      required: [next_cursor]
+      properties:
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor for the next page, or null if this is the last page.

@@ -1,0 +1,76 @@
+# Attachra milter integration reference for Postfix on a grommunio host.
+#
+# This file is DOCUMENTATION ONLY — it is not meant to be copied,
+# included, or pasted into main.cf. grommunio-admin typically
+# owns/regenerates Postfix's main.cf, so the supported way to apply
+# this is the idempotent `postconf -e` commands below (which is also
+# what grommunio-admin itself uses to manage main.cf), not a
+# hand-edited snippet. Full walkthrough with the "why" behind each
+# step: docs/deploy/grommunio-debian.md, section 5.
+#
+# --- Step 1: see what's really configured on this host -------------
+# Do not skip this: grommunio's exact milter values (rspamd's address
+# in particular) can differ by version/install.
+#
+#   postconf -h smtpd_milters non_smtpd_milters
+#
+# You should see rspamd already there on both lines, typically:
+#
+#   inet:localhost:11332
+#
+# --- Step 2: append Attachra, keeping rspamd first -------------------
+# Substitute your host's actual current value in place of
+# "inet:localhost:11332" below if step 1 showed something different —
+# the point is to APPEND ", inet:127.0.0.1:6785" to whatever is
+# already there, not replace it. Attachra must run AFTER rspamd: its
+# spam/AV verdict should be settled — and the message rejected if it's
+# spam/malware — before Attachra spends effort uploading attachments
+# and rewriting the message.
+#
+#   sudo postconf -e 'smtpd_milters = inet:localhost:11332, inet:127.0.0.1:6785'
+#   sudo postconf -e 'non_smtpd_milters = inet:localhost:11332, inet:127.0.0.1:6785'
+#   sudo systemctl reload postfix
+#
+# The resulting effective main.cf values look like this:
+#
+# smtpd_milters = inet:localhost:11332, inet:127.0.0.1:6785
+# non_smtpd_milters = inet:localhost:11332, inet:127.0.0.1:6785
+#
+# smtpd_milters applies to mail submitted over SMTP: this covers both
+# surfaces outbound mail can enter through on a grommunio host — the
+# gromox -> local Postfix (smtp:25 on localhost) delivery path, and
+# direct MSA submission on port 587 (milter_macro_daemon_name=
+# ORIGINATING). non_smtpd_milters applies to mail injected locally
+# without going through smtpd at all (pickup/sendmail(1), cron, etc.);
+# both chains get Attachra appended so no outbound path skips it. See
+# "How mail flows on grommunio" in docs/deploy/grommunio-debian.md.
+#
+# --- Already set — leave as is ---------------------------------------
+# milter_default_action and milter_protocol are already set correctly
+# on a stock grommunio host (grommunio ships them for rspamd); no
+# postconf -e needed for either:
+#
+# milter_default_action = accept
+# milter_protocol = 6
+#
+# milter_default_action=accept matters for Attachra too: if the milter
+# connection to Attachra can't be established at all, Postfix delivers
+# the mail unmodified rather than queuing or rejecting it, matching
+# attachra.yaml's milter.failure_mode: open (CLAUDE.md invariant #3:
+# mail must never be lost because of an Attachra failure). Keep both
+# settings in sync if you ever switch failure_mode to "closed".
+#
+# --- grommunio-setup can regenerate main.cf ---------------------------
+# If you re-run `grommunio-setup` (or an equivalent grommunio
+# provisioning step) later, re-check with
+# `postconf -h smtpd_milters non_smtpd_milters` and re-apply the two
+# postconf -e commands above if Attachra has fallen out of the chain.
+#
+# --- Rollback ----------------------------------------------------------
+# Restore the pre-Attachra value from step 1's `postconf -h` output —
+# substitute your actual original value if it differed from the
+# example below:
+#
+#   sudo postconf -e 'smtpd_milters = inet:localhost:11332'
+#   sudo postconf -e 'non_smtpd_milters = inet:localhost:11332'
+#   sudo systemctl reload postfix

@@ -1,0 +1,49 @@
+# Attachra configuration for the local dev-compose environment.
+# See internal/config/config.go for the full schema and defaults.
+
+log:
+  level: debug
+  format: text
+
+milter:
+  # Postfix in this dev environment is configured with
+  # smtpd_milters=inet:attachra:7357 (see deploy/dev/postfix/main.cf).
+  listen: inet:0.0.0.0:7357
+  failure_mode: open
+
+http:
+  listen: 0.0.0.0:8080
+
+# Public base URL for package-page links embedded in a rewritten
+# message body (docs/architecture/package-page-decision.md §4.1 item
+# 1). Points at this compose stack's own published HTTP port; not
+# reachable from outside the dev network, but sufficient for the e2e
+# test to observe the link's presence.
+public_base_url: "http://localhost:8080"
+
+# Storage backend for replaced attachment payloads (US-5.2): the
+# compose stack's MinIO service, bucket created by the mc-init job
+# (see docker-compose.yml).
+storage:
+  driver: s3
+  s3:
+    endpoint: "http://minio:9000"
+    region: us-east-1
+    bucket: attachra-dev
+    access_key: attachra-dev
+    secret_key: attachra-dev-secret
+    path_style: true
+
+# Metadata database (ADR-011): embedded sqlite, stored on the
+# dedicated writable volume mounted at /data (see docker-compose.yml;
+# the distroless nonroot image has no other writable path).
+database:
+  driver: sqlite
+  path: /data/attachra.db
+
+# Policy enabling the end-to-end replace path (ATR-167) so the e2e
+# suite can exercise storage upload + link creation + MIME rewrite,
+# not just SMTP acceptance.
+policy:
+  path: /etc/attachra/policy.yaml
+  dry_run: false

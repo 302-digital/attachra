@@ -1,0 +1,440 @@
+.TH ATTACHRA 1 "2026-07-15" "attachra" "Attachra Manual"
+.SH NAME
+attachra \- self\-hosted attachment policy engine (Postfix milter server)
+.SH SYNOPSIS
+.B attachra
+.RB [ \-\-config
+.IR file ]
+.RB [ \-\-version ]
+.br
+.B attachra version
+.br
+.B attachra policy validate
+.RB [ \-\-strict ]
+.I file
+.br
+.B attachra setup
+.RB [ \-\-config\-dir
+.IR dir ]
+.RB [ \-\-force ]
+.RB [ \-\-non\-interactive
+.RI [ flags ...]]
+.br
+.B attachra audit export
+.RB [ \-\-from
+.IR timestamp ]
+.RB [ \-\-to
+.IR timestamp ]
+.RB [ \-\-type
+.IR type ]
+.br
+.B attachra link hold
+.B \-\-actor
+.I actor
+.I link\-id
+.br
+.B attachra link unhold
+.B \-\-actor
+.I actor
+.I link\-id
+.br
+.B attachra link revoke
+.B \-\-actor
+.I actor
+.RI ( link\-id " | " \-\-message\-id " " id " | " \-\-sender " " address )
+.br
+.B attachra token create
+.B \-\-name
+.I name
+.B \-\-role
+.I role
+.B \-\-actor
+.I actor
+.SH DESCRIPTION
+.B attachra
+is the single static binary that runs the Attachra attachment policy
+engine. Run without a subcommand, it starts the long\-lived server
+process: a Postfix milter adapter that intercepts outbound mail, a MIME
+rewrite pipeline that applies the active policy document to each
+attachment, an S3\-compatible or local filesystem storage backend, and
+an HTTP adapter that serves the personal download links attachments are
+replaced with. Configuration is read from a single YAML file; see
+.BR attachra.yaml (5).
+.PP
+Every attachment stays in the message unmodified unless a policy rule
+matches it. If Attachra itself fails (crash, timeout, bug), the default
+.I open
+failure mode delivers the message unchanged rather than blocking mail
+(see \fBmilter.failure_mode\fR in \fBattachra.yaml\fR(5)).
+.PP
+In addition to the server, several operator subcommands are provided
+that talk directly to the local metadata store and do not require the
+server to be running: \fBpolicy validate\fR, \fBaudit export\fR,
+\fBlink hold\fR/\fBunhold\fR/\fBrevoke\fR and \fBtoken create\fR. These
+subcommands still read \fB\-\-config\fR (or the default search path) to
+locate the metadata database and other settings, but they exit
+immediately after the operation instead of starting the milter/HTTP
+listeners.
+.PP
+\fBsetup\fR is the odd one out: it does not read an existing
+configuration at all \(em its entire purpose is to
+.B create
+one, either by interactive wizard or from flags, before Attachra has
+ever been configured on this host.
+.PP
+For remote administration of an already\-running instance over its REST
+API instead, see
+.BR attachractl (1).
+.SH GLOBAL OPTIONS
+.TP
+.BI \-\-config " file"
+Path to the YAML configuration file. If omitted, built\-in defaults are
+used (see \fBattachra.yaml\fR(5) \(dq DEFAULTS \(dq).
+.TP
+.B \-\-version
+Print the version, commit and build date, then exit 0. Equivalent to
+the
+.B version
+subcommand below.
+.SH COMMANDS
+.SS "attachra version"
+Prints
+.RI \(dq attachra " " VERSION " (commit " COMMIT ", built " DATE )\(dq
+to stdout and exits 0.
+.SS "attachra policy validate [\-\-strict] file"
+Loads and validates the policy document at
+.I file
+(see \fBdocs/architecture/policy-format-v1.md\fR in the source tree for
+the format) without starting the server or touching the metadata
+store. Prints a one\-line summary plus any warnings to stdout.
+.TP
+.B \-\-strict
+Treat warnings as failures: exit 2 instead of 0 when the policy is
+valid but produced one or more warnings.
+.PP
+Exit status: \fB0\fR valid (no warnings, or warnings without
+\fB\-\-strict\fR); \fB1\fR invalid policy or malformed command line;
+\fB2\fR valid with warnings under \fB\-\-strict\fR.
+.SS "attachra setup [\-\-config\-dir dir] [\-\-force] [\-\-non\-interactive] [flags...]"
+First\-run wizard that generates a working
+.I attachra.yaml
+/
+.I policy.yaml
+pair under
+.B \-\-config\-dir
+(and an
+.I attachra.env
+sidecar, if S3 credentials are given), so a new operator does not have
+to hand\-author YAML from the packaged templates in
+.I deploy/deb/etc/
+to get started. Every generated file is verified with the exact same
+validation
+.B attachra \-\-config ...
+applies at startup before it is committed to disk; on any failure
+(including that verification), nothing already written is left
+half\-done \(em a freshly created file is removed, and a file that
+existed before this run (a
+.B \-\-force
+re\-run) is restored to its exact prior content.
+.PP
+With no
+.BR \-\-non\-interactive ,
+.B setup
+prompts interactively for every answer, in this fixed order: sender
+domain(s), public base URL, storage driver (and its
+endpoint/region/bucket/credentials for
+.BR s3 ),
+HTTP and milter listen addresses (each probed for availability, with a
+warning and a retry\-or\-keep\-anyway choice if the address looks busy),
+failure mode, and dry\-run. Interactive mode requires a real terminal on
+stdin; a piped or redirected stdin is rejected with a message pointing
+at
+.BR \-\-non\-interactive .
+Any of the answer flags below may still be given alongside interactive
+mode to pre\-fill (not silently apply) that prompt's default.
+.PP
+With
+.BR \-\-non\-interactive ,
+no prompts are shown at all; every required answer must come from the
+flags below, or the command fails listing exactly which ones are
+missing.
+.TP
+.BI \-\-config\-dir " dir"
+Directory to write
+.IR attachra.yaml / policy.yaml
+(and
+.IR attachra.env ,
+if S3 credentials are given) into. Default:
+.IR /etc/attachra .
+.TP
+.B \-\-force
+Overwrite an existing
+.IR attachra.yaml / policy.yaml
+in
+.BR \-\-config\-dir .
+Without it, setup refuses to run at all if any of those files (or
+.IR attachra.env )
+already exist, before prompting for anything.
+.TP
+.B \-\-non\-interactive
+Skip prompts entirely; every answer must be supplied via the flags
+below.
+.TP
+.BI \-\-domains " domains"
+Comma\-separated sender domain(s) to process. Required with
+.BR \-\-non\-interactive .
+The generated policy replaces attachments only for mail from these
+domains; every other sender passes through unmodified.
+.TP
+.BI \-\-public\-base\-url " url"
+Public base URL embedded in download links, e.g.
+.IR https://mail.example.com .
+Required with
+.BR \-\-non\-interactive .
+.TP
+.BI \-\-storage " driver"
+Storage driver:
+.B fs
+or
+.BR s3 .
+Default:
+.BR fs .
+.TP
+.BI \-\-fs\-base\-dir " dir"
+.B fs
+driver: base directory for stored attachments. Default:
+.IR /var/lib/attachra/files .
+.TP
+.BI \-\-s3\-endpoint " url"
+.B s3
+driver: S3\-compatible endpoint URL. Required for
+.BR \-\-storage=s3 .
+.TP
+.BI \-\-s3\-region " region"
+.B s3
+driver: region. Required for
+.BR \-\-storage=s3 .
+.TP
+.BI \-\-s3\-bucket " bucket"
+.B s3
+driver: bucket name. Required for
+.BR \-\-storage=s3 .
+.TP
+.BI \-\-s3\-access\-key " key"
+.B s3
+driver: access key. Written to
+.IR <config\-dir>/attachra.env ,
+never to
+.IR attachra.yaml ;
+leave blank to use the AWS SDK's default credential chain.
+.TP
+.BI \-\-s3\-secret\-key " key"
+.B s3
+driver: secret key. Same handling as
+.BR \-\-s3\-access\-key .
+.TP
+.B \-\-s3\-path\-style
+.B s3
+driver: use path\-style bucket addressing, required by MinIO and most
+non\-AWS S3 services. Only consulted with
+.BR \-\-non\-interactive ;
+interactive mode always asks this as its own yes/no prompt instead
+(see the note under
+.B \-\-dry\-run
+below, which has the identical reason).
+.TP
+.BI \-\-http\-listen " addr"
+Download server listen address. Default:
+.IR 127.0.0.1:18080 .
+.TP
+.BI \-\-milter\-listen " addr"
+Milter listen address, Postfix syntax. Default:
+.IR inet:127.0.0.1:6785 .
+.TP
+.BI \-\-failure\-mode " mode"
+Milter failure resolution:
+.B open
+or
+.BR closed .
+Default:
+.BR open .
+.TP
+.B \-\-dry\-run
+Start the policy in dry\-run mode: log would\-be decisions without
+replacing attachments (recommended). Default:
+.BR true .
+Like
+.BR \-\-s3\-path\-style ,
+only consulted with
+.BR \-\-non\-interactive :
+a boolean flag's unset zero value is indistinguishable from an
+explicit
+.BR false ,
+so interactive mode always asks this as its own yes/no prompt (default
+.BR yes )
+instead of reading this flag at all \(em unlike every string\-valued
+flag above, which interactive mode DOES use to pre\-fill (not silently
+apply) its corresponding prompt's default.
+.PP
+Exit status: \fB0\fR success; \fB1\fR error (invalid or missing
+answers, an existing config without \fB\-\-force\fR, a write or
+verification failure, or malformed command line).
+.SS "attachra audit export [\-\-from ts] [\-\-to ts] [\-\-type type]"
+Streams every audit event matching the given filter to stdout as JSON
+Lines (one compact JSON object per line, in ascending order), reading
+directly from the local metadata database configured by
+\fB\-\-config\fR. Intended for ingestion into an external immutable
+store or SIEM. Output is streamed, not buffered, so memory use does not
+grow with audit log size.
+.TP
+.BI \-\-from " timestamp"
+Only include events at or after this RFC 3339 timestamp.
+.TP
+.BI \-\-to " timestamp"
+Only include events strictly before this RFC 3339 timestamp.
+.TP
+.BI \-\-type " type"
+Only include events of this type (e.g. \fBdownload\fR, \fBrevoke\fR,
+\fBerror\fR, \fBtoken_change\fR).
+.PP
+Exit status: \fB0\fR success; \fB1\fR error (bad filter value, store
+failure, or malformed command line).
+.SS "attachra link hold \-\-actor actor link\-id"
+.PD 0
+.SS "attachra link unhold \-\-actor actor link\-id"
+.PD
+Sets (\fBhold\fR) or clears (\fBunhold\fR) the legal\-hold flag on a
+single download link identified by its store\-assigned ID. A link
+under hold cannot be revoked (see \fBlink revoke\fR below) until it is
+unheld again.
+.TP
+.BI \-\-actor " actor"
+Required. Identity of the operator performing this action, recorded in
+the audit log (the CLI has no HTTP\-auth principal to attribute the
+action to automatically).
+.PP
+Exit status: \fB0\fR success; \fB1\fR error (link not found, malformed
+command line).
+.SS "attachra link revoke \-\-actor actor (link\-id | \-\-message\-id id | \-\-sender address)"
+Revokes one or more download links immediately, so any further
+download attempt against them fails. Exactly one of a positional
+.IR link\-id ,
+.B \-\-message\-id
+or
+.B \-\-sender
+must be given:
+.TP
+.I link\-id
+Revoke exactly one link by its store\-assigned ID.
+.TP
+.BI \-\-message\-id " id"
+Revoke every link belonging to the given message ID.
+.TP
+.BI \-\-sender " address"
+Revoke every link belonging to every message sent by the given address.
+.TP
+.BI \-\-actor " actor"
+Required, same meaning as for \fBlink hold\fR/\fBunhold\fR above.
+.PP
+A link currently under legal hold is refused rather than revoked; in
+the \fB\-\-message\-id\fR/\fB\-\-sender\fR cascade modes, held links are
+skipped and reported separately instead of aborting the whole
+operation. Clear the hold first with \fBlink unhold\fR.
+.PP
+Exit status: \fB0\fR success (even if some cascade members were held
+and skipped); \fB1\fR error (link not found, all targets held, or
+malformed command line).
+.SS "attachra token create \-\-name name \-\-role role \-\-actor actor"
+Mints a new API bearer token directly against the metadata store,
+without a running server. This is the bootstrap path for the very
+first API token: the REST API itself is deny\-by\-default and cannot
+mint its own first credential. The raw secret is printed to stdout
+.B exactly once
+and is never persisted (only its hash is stored) \(em capture it
+immediately, e.g.:
+.RS
+.EX
+attachra token create \-\-name ci \-\-role viewer \-\-actor alice > token.secret
+.EE
+.RE
+.TP
+.BI \-\-name " name"
+Required. Operator\-chosen label for the token.
+.TP
+.BI \-\-role " role"
+Required. One of \fBadmin\fR, \fBviewer\fR or \fBauditor\fR.
+.TP
+.BI \-\-actor " actor"
+Required, same meaning as for \fBlink hold\fR/\fBunhold\fR/\fBrevoke\fR
+above.
+.PP
+Listing and revoking existing tokens is done through the REST API (or
+.BR attachractl (1)'s
+.B token list
+/
+.B token revoke
+subcommands) instead of this CLI, which exists only to break the
+chicken\-and\-egg problem of the very first token.
+.PP
+Exit status: \fB0\fR success; \fB1\fR error (invalid role, store
+failure, or malformed command line).
+.SH EXIT STATUS
+When run as the server (no subcommand), \fBattachra\fR exits \fB0\fR on
+a clean shutdown (SIGINT/SIGTERM), \fB1\fR on a startup or runtime
+failure, and \fB2\fR if the global command line itself could not be
+parsed. Each subcommand defines its own exit status; see
+.B COMMANDS
+above.
+.SH SIGNALS
+.TP
+.B SIGHUP
+Reloads the policy file configured by \fBpolicy.path\fR from disk
+without restarting. A failed reload logs the error and keeps the
+previously active policy in effect. Sent by
+.RB \(dq "systemctl reload attachra" \(dq
+under the packaged systemd unit.
+.TP
+.BR SIGINT ", " SIGTERM
+Begin a graceful shutdown: both the milter and HTTP listeners stop
+accepting new connections and drain in\-flight work before the process
+exits.
+.SH ENVIRONMENT
+Every configuration key can be overridden with an
+.B ATTACHRA_
+\-prefixed environment variable; see
+.BR attachra.yaml (5)
+.B ENVIRONMENT
+for the full list. \fB${VAR}\fR placeholders inside the YAML file
+itself are also expanded against the process environment before
+parsing, independent of the \fBATTACHRA_*\fR override mechanism \(em
+this is the recommended way to keep secrets (S3 keys, etc.) out of the
+world\-readable configuration file.
+.SH FILES
+.TP
+.I /etc/attachra/attachra.yaml
+Default configuration file location on a package install (see
+.BR attachra.yaml (5)).
+Not read automatically \(em must be passed via \fB\-\-config\fR (the
+packaged systemd unit does this).
+.TP
+.I /etc/attachra/policy.yaml
+Default policy document location referenced from \fBattachra.yaml\fR's
+\fBpolicy.path\fR key on a package install.
+.TP
+.I /etc/attachra/attachra.env
+Optional, root\-only (0600) environment file read by systemd before
+starting the process, for secrets referenced from \fBattachra.yaml\fR
+via \fB${ENV_VAR}\fR substitution.
+.TP
+.I /var/lib/attachra/attachra.db
+Default SQLite metadata database path on a package install.
+.TP
+.I /var/lib/attachra/files
+Default local filesystem storage directory on a package install (only
+used when \fBstorage.driver\fR is \fBfs\fR).
+.SH SEE ALSO
+.BR attachractl (1),
+.BR attachra.yaml (5),
+.BR systemctl (1)
+.SH AUTHOR
+The Attachra Project <https://attachra.org>.

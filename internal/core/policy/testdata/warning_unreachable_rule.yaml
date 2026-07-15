@@ -1,0 +1,15 @@
+version: 1
+name: "Catch-all followed by dead rule"
+rules:
+  - name: "catch-all"
+    then:
+      action: pass
+  - name: "unreachable"
+    when:
+      attachment:
+        extension: ["exe"]
+    then:
+      action: block
+      reason: "never reached"
+default:
+  action: pass

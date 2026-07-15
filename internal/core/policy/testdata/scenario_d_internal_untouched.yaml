@@ -1,0 +1,14 @@
+version: 1
+name: "Internal mail untouched"
+
+rules:
+  - name: "Both sides internal: pass everything"
+    when:
+      recipient:
+        domain: ["example.com"]
+    then:
+      action: pass
+
+default:
+  action: replace
+  ttl: "30d"

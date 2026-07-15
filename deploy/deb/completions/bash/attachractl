@@ -1,0 +1,172 @@
+# bash completion for attachractl(1)
+#
+# attachractl is built on cobra (cmd/attachractl), which can generate a
+# fuller completion script at runtime via `attachractl completion bash`
+# once that subcommand is wired up (it is not, as of ATR-322) — until
+# then this static file is maintained by hand and must be kept in sync
+# with cmd/attachractl/root.go and the newXxxCmd() constructors in
+# links.go, policy.go, stats.go, audit.go, token.go, version.go.
+#
+# New subcommands to wire in here as they land: `setup` (ATR-320),
+# `doctor` (ATR-321).
+
+_attachractl() {
+    local cur prev words cword
+    _init_completion || {
+        cur="${COMP_WORDS[COMP_CWORD]}"
+        prev="${COMP_WORDS[COMP_CWORD-1]}"
+        words=("${COMP_WORDS[@]}")
+        cword=$COMP_CWORD
+    }
+
+    local global_flags="--config --url --token-file --insecure --json --timeout"
+    local top_commands="policy links stats audit token version"
+
+    case "$prev" in
+        --config|--token-file)
+            COMPREPLY=($(compgen -f -- "$cur"))
+            return
+            ;;
+        --url|--timeout)
+            return
+            ;;
+    esac
+
+    case "${words[1]}" in
+        policy)
+            case "${words[2]}" in
+                validate)
+                    COMPREPLY=($(compgen -f -- "$cur"))
+                    return
+                    ;;
+                current|reload)
+                    return
+                    ;;
+                dry-run)
+                    case "$prev" in
+                        -f|--file) COMPREPLY=($(compgen -f -- "$cur")); return ;;
+                        --sender|--recipient|--attachment) return ;;
+                    esac
+                    COMPREPLY=($(compgen -W "--sender --recipient --attachment -f --file" -- "$cur"))
+                    return
+                    ;;
+                *)
+                    COMPREPLY=($(compgen -W "current validate reload dry-run" -- "$cur"))
+                    return
+                    ;;
+            esac
+            ;;
+        links)
+            case "${words[2]}" in
+                list)
+                    case "$prev" in
+                        --status) COMPREPLY=($(compgen -W "active revoked expired" -- "$cur")); return ;;
+                        --message-id|--recipient|--from|--to|--limit) return ;;
+                    esac
+                    COMPREPLY=($(compgen -W "--message-id --recipient --status --from --to --limit" -- "$cur"))
+                    return
+                    ;;
+                get|hold|unhold)
+                    return
+                    ;;
+                revoke)
+                    case "$prev" in
+                        --message-id|--sender) return ;;
+                    esac
+                    COMPREPLY=($(compgen -W "--message-id --sender" -- "$cur"))
+                    return
+                    ;;
+                *)
+                    COMPREPLY=($(compgen -W "list get revoke hold unhold" -- "$cur"))
+                    return
+                    ;;
+            esac
+            ;;
+        stats)
+            case "${words[2]}" in
+                summary)
+                    case "$prev" in
+                        --from|--to) return ;;
+                    esac
+                    COMPREPLY=($(compgen -W "--from --to" -- "$cur"))
+                    return
+                    ;;
+                deliverability)
+                    case "$prev" in
+                        --sort) COMPREPLY=($(compgen -W "download_rate" -- "$cur")); return ;;
+                        --order) COMPREPLY=($(compgen -W "asc desc" -- "$cur")); return ;;
+                        --from|--to|--limit) return ;;
+                    esac
+                    COMPREPLY=($(compgen -W "--from --to --sort --order --limit" -- "$cur"))
+                    return
+                    ;;
+                *)
+                    COMPREPLY=($(compgen -W "summary deliverability" -- "$cur"))
+                    return
+                    ;;
+            esac
+            ;;
+        audit)
+            case "${words[2]}" in
+                list)
+                    case "$prev" in
+                        --message-id|--type|--from|--to|--cursor|--limit) return ;;
+                    esac
+                    COMPREPLY=($(compgen -W "--message-id --type --from --to --cursor --limit --all" -- "$cur"))
+                    return
+                    ;;
+                tail)
+                    case "$prev" in
+                        --message-id|--type|--from|--to|--lines|--interval) return ;;
+                    esac
+                    COMPREPLY=($(compgen -W "--message-id --type --from --to --lines --follow --interval" -- "$cur"))
+                    return
+                    ;;
+                export)
+                    case "$prev" in
+                        --type|--from|--to) return ;;
+                    esac
+                    COMPREPLY=($(compgen -W "--type --from --to" -- "$cur"))
+                    return
+                    ;;
+                *)
+                    COMPREPLY=($(compgen -W "list tail export" -- "$cur"))
+                    return
+                    ;;
+            esac
+            ;;
+        token)
+            case "${words[2]}" in
+                create)
+                    case "$prev" in
+                        --role) COMPREPLY=($(compgen -W "admin viewer auditor" -- "$cur")); return ;;
+                        --name) return ;;
+                    esac
+                    COMPREPLY=($(compgen -W "--name --role" -- "$cur"))
+                    return
+                    ;;
+                list|revoke)
+                    case "$prev" in
+                        --limit) return ;;
+                    esac
+                    COMPREPLY=($(compgen -W "--limit" -- "$cur"))
+                    return
+                    ;;
+                *)
+                    COMPREPLY=($(compgen -W "create list revoke" -- "$cur"))
+                    return
+                    ;;
+            esac
+            ;;
+        version)
+            return
+            ;;
+    esac
+
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=($(compgen -W "$global_flags" -- "$cur"))
+    else
+        COMPREPLY=($(compgen -W "$top_commands" -- "$cur"))
+    fi
+} &&
+    complete -F _attachractl attachractl

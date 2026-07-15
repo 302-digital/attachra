@@ -1,0 +1,8 @@
+version: 1
+name: "Typo in rules"
+rule:
+  - name: "Should be rules, not rule"
+    then:
+      action: pass
+default:
+  action: pass

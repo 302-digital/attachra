@@ -1,0 +1,87 @@
+From: sender@example.com
+To: recipient@example.com
+Subject: Deeply nested multipart
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="NEST-BOUNDARY-0"
+
+--NEST-BOUNDARY-0
+Content-Type: multipart/mixed; boundary="NEST-BOUNDARY-1"
+
+--NEST-BOUNDARY-1
+Content-Type: multipart/mixed; boundary="NEST-BOUNDARY-2"
+
+--NEST-BOUNDARY-2
+Content-Type: multipart/mixed; boundary="NEST-BOUNDARY-3"
+
+--NEST-BOUNDARY-3
+Content-Type: multipart/mixed; boundary="NEST-BOUNDARY-4"
+
+--NEST-BOUNDARY-4
+Content-Type: multipart/mixed; boundary="NEST-BOUNDARY-5"
+
+--NEST-BOUNDARY-5
+Content-Type: multipart/mixed; boundary="NEST-BOUNDARY-6"
+
+--NEST-BOUNDARY-6
+Content-Type: multipart/mixed; boundary="NEST-BOUNDARY-7"
+
+--NEST-BOUNDARY-7
+Content-Type: multipart/mixed; boundary="NEST-BOUNDARY-8"
+
+--NEST-BOUNDARY-8
+Content-Type: multipart/mixed; boundary="NEST-BOUNDARY-9"
+
+--NEST-BOUNDARY-9
+Content-Type: multipart/mixed; boundary="NEST-BOUNDARY-10"
+
+--NEST-BOUNDARY-10
+Content-Type: multipart/mixed; boundary="NEST-BOUNDARY-11"
+
+--NEST-BOUNDARY-11
+Content-Type: multipart/mixed; boundary="NEST-BOUNDARY-12"
+
+--NEST-BOUNDARY-12
+Content-Type: multipart/mixed; boundary="NEST-BOUNDARY-13"
+
+--NEST-BOUNDARY-13
+Content-Type: multipart/mixed; boundary="NEST-BOUNDARY-14"
+
+--NEST-BOUNDARY-14
+Content-Type: multipart/mixed; boundary="NEST-BOUNDARY-15"
+
+--NEST-BOUNDARY-15
+Content-Type: multipart/mixed; boundary="NEST-BOUNDARY-16"
+
+--NEST-BOUNDARY-16
+Content-Type: multipart/mixed; boundary="NEST-BOUNDARY-17"
+
+--NEST-BOUNDARY-17
+Content-Type: multipart/mixed; boundary="NEST-BOUNDARY-18"
+
+--NEST-BOUNDARY-18
+Content-Type: multipart/mixed; boundary="NEST-BOUNDARY-19"
+
+--NEST-BOUNDARY-19
+Content-Type: text/plain; charset=utf-8
+
+Leaf content at the bottom of the nest.
+--NEST-BOUNDARY-19--
+--NEST-BOUNDARY-18--
+--NEST-BOUNDARY-17--
+--NEST-BOUNDARY-16--
+--NEST-BOUNDARY-15--
+--NEST-BOUNDARY-14--
+--NEST-BOUNDARY-13--
+--NEST-BOUNDARY-12--
+--NEST-BOUNDARY-11--
+--NEST-BOUNDARY-10--
+--NEST-BOUNDARY-9--
+--NEST-BOUNDARY-8--
+--NEST-BOUNDARY-7--
+--NEST-BOUNDARY-6--
+--NEST-BOUNDARY-5--
+--NEST-BOUNDARY-4--
+--NEST-BOUNDARY-3--
+--NEST-BOUNDARY-2--
+--NEST-BOUNDARY-1--
+--NEST-BOUNDARY-0--

@@ -1,0 +1,6 @@
+version: 1
+name: "Missing default"
+rules:
+  - name: "Pass everything"
+    then:
+      action: pass

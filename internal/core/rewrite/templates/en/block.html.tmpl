@@ -1,0 +1,13 @@
+<div style="font-family:sans-serif;border:1px solid #ddd;border-radius:6px;padding:16px;margin:16px 0;">
+  <p>
+    {{if eq (len .Files) 1}}An attachment was removed and is available for download:{{else}}{{len .Files}} attachments were removed and are available for download:{{end}}
+  </p>
+  <ul>
+    {{range .Files}}<li>{{.Name}} ({{.SizeHuman}})</li>
+    {{end}}
+  </ul>
+  <p><a href="{{.PackageURL}}">Download files</a></p>
+  {{if .ExpiresAt}}<p style="color:#666;font-size:0.9em;">This link expires on {{.ExpiresAt}}.</p>{{end}}
+  {{if .SenderName}}<p style="color:#666;font-size:0.9em;">Sent by: {{.SenderName}}</p>{{end}}
+  <p style="color:#999;font-size:0.8em;">This message was processed by Attachra.</p>
+</div>

@@ -1,0 +1,20 @@
+From: sender@example.com
+To: recipient@example.com
+Subject: Inline image only
+MIME-Version: 1.0
+Content-Type: multipart/related; boundary="INLINE-IMG-BOUNDARY"
+
+--INLINE-IMG-BOUNDARY
+Content-Type: text/html; charset=utf-8
+
+<html><body><img src="cid:img001"></body></html>
+
+--INLINE-IMG-BOUNDARY
+Content-Type: image/jpeg
+Content-Disposition: inline
+Content-ID: <img001>
+Content-Transfer-Encoding: base64
+
+/9j/4HN5bnRoZXRpYyBqcGVnIGJ5dGVz
+
+--INLINE-IMG-BOUNDARY--

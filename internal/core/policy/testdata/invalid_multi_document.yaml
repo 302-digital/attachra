@@ -1,0 +1,11 @@
+version: 1
+name: "First document"
+rules: []
+default:
+  action: pass
+---
+version: 1
+name: "Second document"
+rules: []
+default:
+  action: pass

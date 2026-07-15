@@ -1,0 +1,415 @@
+.TH ATTACHRACTL 1 "2026-07-15" "attachra" "Attachra Manual"
+.SH NAME
+attachractl \- command\-line client for the Attachra admin/automation REST API
+.SH SYNOPSIS
+.B attachractl
+.RI [ global\ options ]
+.I command
+.RI [ subcommand ]
+.RI [ flags ]
+.RI [ args ...]
+.SH DESCRIPTION
+.B attachractl
+drives a running Attachra instance entirely over its
+.B /api/v1
+REST API
+.RI ( api/openapi.yaml
+in the source tree is the contract of record) \(em it never touches the
+metadata store or configuration file directly, and can run from any
+host that can reach the Attachra API endpoint.
+.PP
+Commands are organized as
+.IR command " " subcommand
+pairs, e.g.
+.B links list
+or
+.BR "token create" .
+Every command except
+.B version
+requires a resolved API endpoint URL and bearer token (see
+.B CONNECTION CONFIGURATION
+below); a warning is printed to stderr whenever
+.B \-\-insecure
+disables TLS certificate verification.
+.PP
+By default, output is a human\-readable table or summary line; pass the
+persistent
+.B \-\-json
+flag to get newline\-delimited, machine\-readable JSON instead (one
+compact JSON object per matched resource for list\-shaped commands).
+.SH GLOBAL OPTIONS
+These persistent flags apply to every command except
+.BR version .
+.TP
+.BI \-\-config " file"
+Path to the attachractl config file. Default:
+.IR ~/.config/attachractl/config.yaml .
+.TP
+.BI \-\-url " url"
+Attachra API base URL, e.g.
+.IR https://attachra.example.com .
+Also settable via the
+.B ATTACHRACTL_URL
+environment variable or the config file's
+.B url
+key.
+.TP
+.BI \-\-token\-file " file"
+Path to a file containing the bearer token. The token is
+.B never
+accepted as a plain flag value, since a flag value is visible to other
+local users via
+.IR /proc/<pid>/cmdline " or " ps.
+Also settable via the
+.B ATTACHRACTL_TOKEN
+environment variable (the raw token value, not a path) or the config
+file's
+.B token
+/
+.B token_file
+keys.
+.TP
+.B \-\-insecure
+Skip TLS certificate verification.
+.B INSECURE \(em testing only.
+Prints a warning to stderr whenever it takes effect (including via the
+config file's
+.B insecure
+key).
+.TP
+.B \-\-json
+Output machine\-readable JSON (newline\-delimited, one object per
+result) instead of a human\-readable table.
+.TP
+.BI \-\-timeout " duration"
+Request timeout, in Go duration syntax (e.g.
+.IR 30s ", " 2m ).
+Default: 30s.
+.SH CONNECTION CONFIGURATION
+The API endpoint URL, bearer token and TLS verification setting are
+each resolved independently with the following precedence, highest
+first:
+.IP 1. 4
+Command\-line flags
+.RB ( \-\-url ", " \-\-token\-file ", " \-\-insecure ).
+.IP 2. 4
+Environment variables
+.RB ( ATTACHRACTL_URL ", " ATTACHRACTL_TOKEN ).
+.IP 3. 4
+The YAML config file
+.RI ( \-\-config ,
+default
+.IR ~/.config/attachractl/config.yaml ).
+.PP
+A missing config file is not an error; a present\-but\-malformed one
+is. See
+.B FILES
+below for the config file's shape.
+.SH COMMANDS
+.SS "attachractl version"
+Prints the client's own build metadata
+.RI ( VERSION ", " COMMIT ", " DATE )
+and exits. The only command exempt from connection resolution above
+\(em no API call is made.
+.SS "attachractl policy current"
+Shows the currently active policy: name, version, rule count, default
+action, and a table of every rule's name/action/disabled/reason.
+Calls
+.BR "GET /policies/current" .
+.SS "attachractl policy validate file"
+Sends the local YAML file at
+.I file
+to
+.BR "POST /policies/validate" .
+Prints every error and warning found; exits non\-zero
+.RB ( exitValidation ", 7)"
+if the document has errors, matching a CI gate's expectations.
+.SS "attachractl policy reload"
+Calls
+.B "POST /policies/reload"
+(admin\-only): re\-reads and re\-applies the server's configured
+policy file from disk. If the file on disk fails to validate, the
+server rejects the reload with 409 and the previously active policy
+remains in effect.
+.SS "attachractl policy dry\-run"
+Calls
+.B "POST /policies/dry\-run"
+: a pure, side\-effect\-free simulation of what the active policy would
+decide for a hypothetical message, without creating a message,
+attachment, link or audit event.
+.TP
+.BI \-\-sender " address"
+Envelope sender address.
+.TP
+.BI \-\-recipient " address"
+Recipient address (repeatable).
+.TP
+.BI \-\-attachment " spec"
+Attachment in
+.RI \(dq filename:size[:mime_type[:detected_type]] \(dq
+form (repeatable).
+.TP
+.BI \-f ", " \-\-file " file"
+Read the full DryRunRequest JSON body from this file (or
+.RB \(dq - \(dq
+for stdin) instead of assembling one from
+.BR \-\-sender / \-\-recipient / \-\-attachment .
+.SS "attachractl links list"
+Lists every link matching the given filters, automatically walking
+every page of
+.BR "GET /links" .
+.TP
+.BI \-\-message\-id " id"
+Filter by message ID.
+.TP
+.BI \-\-recipient " address"
+Filter by exact, case\-insensitive recipient address.
+.TP
+.BI \-\-status " status"
+Filter by status: \fBactive\fR, \fBrevoked\fR, \fBexpired\fR.
+.TP
+.BI \-\-from " timestamp"
+Inclusive lower bound on \fBcreated_at\fR (RFC 3339).
+.TP
+.BI \-\-to " timestamp"
+Exclusive upper bound on \fBcreated_at\fR (RFC 3339).
+.TP
+.BI \-\-limit " n"
+Page size requested per API call (server default 50, max 200);
+auto\-pagination still fetches every page regardless.
+.SS "attachractl links get link\-id"
+Gets a single link by ID. Calls
+.BR "GET /links/{id}" .
+.SS "attachractl links revoke [link\-id]"
+Revokes one link, every link of a message, or every link of a sender.
+Exactly one of a positional
+.IR link\-id ,
+.B \-\-message\-id
+or
+.B \-\-sender
+must be given. Revoking is admin\-only; a link under legal hold is
+refused (single\-link mode) or reported as skipped (message/sender
+cascade mode).
+.TP
+.BI \-\-message\-id " id"
+Revoke every link belonging to this message.
+.TP
+.BI \-\-sender " address"
+Revoke every link belonging to every message from this sender.
+.SS "attachractl links hold link\-id"
+.PD 0
+.SS "attachractl links unhold link\-id"
+.PD
+Places a link under legal hold, or lifts one. Calls
+.BR "POST /links/{id}/hold" " or " "POST /links/{id}/unhold" .
+.SS "attachractl stats summary"
+Aggregated message/policy/download statistics for a time window: calls
+.BR "GET /stats/summary" .
+.TP
+.BI \-\-from " timestamp"
+Inclusive lower bound of the window (RFC 3339, required).
+.TP
+.BI \-\-to " timestamp"
+Exclusive upper bound of the window (RFC 3339, required).
+.SS "attachractl stats deliverability"
+Link download\-rate statistics broken down by recipient domain, sorted
+worst\-performing first by default; automatically walks every page of
+.BR "GET /stats/deliverability" .
+.TP
+.BI \-\-from " timestamp"
+Inclusive lower bound of the window (RFC 3339, required).
+.TP
+.BI \-\-to " timestamp"
+Exclusive upper bound of the window (RFC 3339, required).
+.TP
+.BI \-\-sort " key"
+Sort key; only
+.B download_rate
+is supported.
+.TP
+.BI \-\-order " order"
+Sort order:
+.B asc
+(default, worst first) or
+.BR desc .
+.TP
+.BI \-\-limit " n"
+Page size requested per API call (server default 50, max 200).
+.SS "attachractl audit list"
+Fetches audit log events. By default fetches a single page of
+.BR "GET /audit" ;
+pass
+.B \-\-all
+to auto\-paginate through every matching event instead.
+.TP
+.BI \-\-message\-id " id"
+Filter by message ID.
+.TP
+.BI \-\-type " type"
+Filter by audit event type.
+.TP
+.BI \-\-from " timestamp"
+Inclusive lower bound on timestamp (RFC 3339).
+.TP
+.BI \-\-to " timestamp"
+Exclusive upper bound on timestamp (RFC 3339).
+.TP
+.BI \-\-cursor " token"
+Opaque pagination cursor from a previous page.
+.TP
+.BI \-\-limit " n"
+Page size (server default 50, max 200).
+.TP
+.B \-\-all
+Auto\-paginate through every matching event instead of a single page.
+.SS "attachractl audit tail"
+Shows the most recent audit events, optionally following new ones.
+Fetches the last
+.B \-\-lines
+matching events, then, with
+.BR \-\-follow ,
+polls for new events every
+.BR \-\-interval .
+.TP
+.BI \-\-message\-id " id"
+Filter by message ID.
+.TP
+.BI \-\-type " type"
+Filter by audit event type.
+.TP
+.BI \-\-from " timestamp"
+Inclusive lower bound on timestamp (RFC 3339).
+.TP
+.BI \-\-to " timestamp"
+Exclusive upper bound on timestamp (RFC 3339).
+.TP
+.BI \-\-lines " n"
+Number of recent events to show. Default: 20.
+.TP
+.B \-\-follow
+Keep running and print new events as they are recorded (exits cleanly
+on SIGINT/SIGTERM).
+.TP
+.BI \-\-interval " duration"
+Polling interval when
+.B \-\-follow
+is set. Default: 2s.
+.SS "attachractl audit export"
+Streams
+.B "GET /audit/export"
+directly to stdout without buffering: one JSON object per line, in
+ascending sequence order, unaffected by
+.BR \-\-json .
+Unlike
+.BR "audit list" / "audit tail" ,
+this is not paginated \(em narrow the result with
+.BR \-\-from / \-\-to / \-\-type .
+.TP
+.BI \-\-type " type"
+Filter by audit event type.
+.TP
+.BI \-\-from " timestamp"
+Inclusive lower bound on timestamp (RFC 3339).
+.TP
+.BI \-\-to " timestamp"
+Exclusive upper bound on timestamp (RFC 3339).
+.SS "attachractl token create"
+Calls
+.B "POST /api-tokens"
+(admin\-only). The response's secret is the only time the raw bearer
+token is shown: it is printed to stdout on its own line so scripts can
+capture it directly, e.g.:
+.RS
+.EX
+attachractl token create \-\-name ci \-\-role viewer > token.secret
+.EE
+.RE
+The id/name/role summary goes to stderr instead; neither is ever
+logged.
+.TP
+.BI \-\-name " name"
+Required. Operator\-chosen label for the token.
+.TP
+.BI \-\-role " role"
+Required. One of \fBadmin\fR, \fBviewer\fR or \fBauditor\fR.
+.SS "attachractl token list"
+Lists every token's metadata (never a secret or hash), automatically
+walking every page of
+.BR "GET /api-tokens" .
+.TP
+.BI \-\-limit " n"
+Page size requested per API call (server default 50, max 200).
+.SS "attachractl token revoke token\-id"
+Calls
+.B "DELETE /api-tokens/{tokenId}"
+(admin\-only). Takes effect immediately.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Unexpected/internal failure (network, decode, bug).
+.TP
+.B 2
+Bad arguments, or the API rejected the request as malformed (HTTP 400).
+.TP
+.B 3
+HTTP 401: missing or invalid bearer token.
+.TP
+.B 4
+HTTP 403: the token's role may not perform this action.
+.TP
+.B 5
+HTTP 404: no such resource.
+.TP
+.B 6
+HTTP 409: e.g. a link under legal hold, or an invalid policy on reload.
+.TP
+.B 7
+.B policy validate
+found errors in the submitted document.
+.SH ENVIRONMENT
+.TP
+.B ATTACHRACTL_URL
+Attachra API base URL. Overridden by
+.BR \-\-url ;
+overrides the config file's
+.B url
+key.
+.TP
+.B ATTACHRACTL_TOKEN
+Raw bearer token value. Overridden by
+.BR \-\-token\-file ;
+overrides the config file's
+.B token
+/
+.B token_file
+keys.
+.SH FILES
+.TP
+.I ~/.config/attachractl/config.yaml
+Default config file
+.RI ( \-\-config
+overrides the path). YAML with optional keys
+.BR url ", " token ", " token_file " and " insecure .
+Prefer
+.B token_file
+(or
+.BR ATTACHRACTL_TOKEN )
+over inline
+.B token
+so the secret lives in a file whose permissions the operator controls
+independently of this config file. Example:
+.RS
+.EX
+url: https://attachra.example.com
+token_file: /run/secrets/attachractl-token
+insecure: false
+.EE
+.RE
+.SH SEE ALSO
+.BR attachra (1),
+.BR attachra.yaml (5)
+.SH AUTHOR
+The Attachra Project <https://attachra.org>.

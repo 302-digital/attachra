@@ -1,0 +1,14 @@
+# Gitleaks configuration. Extends the default ruleset; the allowlist
+# below suppresses known synthetic test fixtures that pattern-match as
+# secrets but contain no real credential material.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Synthetic test fixtures (not credentials)"
+regexes = [
+    # Fake storage object key used by the fs storage driver tests
+    # (internal/core/storage/fs/fs_test.go).
+    '''ab/ab1234567890''',
+]

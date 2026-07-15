@@ -1,0 +1,39 @@
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Build
+/bin/
+/dist/
+attachra
+attachractl
+sendmail-test
+!cmd/attachra/
+!cmd/attachractl/
+!hack/sendmail-test/
+# bash-completion's naming convention requires the installed file to be
+# named exactly after the command (no extension) — same basename the
+# "Build" patterns above ignore, so these need an explicit exception
+# (ATR-322).
+!deploy/deb/completions/bash/attachra
+!deploy/deb/completions/bash/attachractl
+
+# Go
+*.test
+*.out
+coverage.*
+
+# OS
+.DS_Store
+
+# Local env / secrets
+.env
+*.local.yaml
+
+# OMC state
+.omc/
+
+# Local secrets (never commit)
+
+# Agent worktrees (never commit)

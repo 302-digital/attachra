@@ -1,0 +1,19 @@
+From: sender@example.com
+To: recipient@example.com
+Subject: RFC2231 greek filename
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="RFC2231-BOUNDARY"
+
+--RFC2231-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+
+See attached.
+
+--RFC2231-BOUNDARY
+Content-Type: application/pdf
+Content-Disposition: attachment; filename*=UTF-8''%CE%B1%CE%BD%CE%B1%CF%86%CE%BF%CF%81%CE%AC.pdf
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjQKcmZjMjIzMSBmaWxlbmFtZSB0ZXN0
+
+--RFC2231-BOUNDARY--

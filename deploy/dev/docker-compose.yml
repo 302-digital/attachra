@@ -1,0 +1,95 @@
+# Attachra local dev environment (US-1.2 / ATR-145).
+#
+# `docker compose up` from this directory brings up:
+#   - postfix:  SMTP relay configured to hand outgoing mail to the
+#               Attachra milter (see postfix/main.cf).
+#   - minio:    S3-compatible storage for extracted attachments, plus a
+#               one-shot mc-init job that creates the "attachra-dev" bucket.
+#   - attachra: the application itself, built from the repo root Dockerfile.
+#
+# The milter server (port 7357, US-2.1) is implemented and started from
+# cmd/attachra/main.go.
+#
+# Not verified with Docker on this machine (unavailable in this
+# environment) — validate `docker compose config` and `docker compose up`
+# on a host with Docker before relying on this file.
+
+services:
+  postfix:
+    build:
+      context: ./postfix
+    container_name: attachra-dev-postfix
+    hostname: attachra-dev.local
+    environment:
+      # boky/postfix refuses to start without an explicit sender-domain
+      # allowlist; the e2e suite sends as sender@attachra-dev.local.
+      ALLOWED_SENDER_DOMAINS: attachra-dev.local
+    ports:
+      - "2525:25"
+    networks:
+      - attachra-dev
+    depends_on:
+      - attachra
+
+  minio:
+    image: minio/minio:latest
+    container_name: attachra-dev-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: attachra-dev
+      MINIO_ROOT_PASSWORD: attachra-dev-secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    networks:
+      - attachra-dev
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  mc-init:
+    image: minio/mc:latest
+    container_name: attachra-dev-mc-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - attachra-dev
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 attachra-dev attachra-dev-secret &&
+      mc mb --ignore-existing local/attachra-dev &&
+      echo 'bucket attachra-dev ready'
+      "
+    restart: "no"
+
+  attachra:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: attachra-dev-attachra
+    command: ["--config", "/etc/attachra/attachra.yaml"]
+    volumes:
+      - ./attachra.yaml:/etc/attachra/attachra.yaml:ro
+      - ./policy.yaml:/etc/attachra/policy.yaml:ro
+      - attachra-data:/data
+    ports:
+      - "8080:8080"
+      - "7357:7357"
+    networks:
+      - attachra-dev
+    depends_on:
+      mc-init:
+        condition: service_completed_successfully
+
+networks:
+  attachra-dev:
+    driver: bridge
+
+volumes:
+  minio-data:
+  attachra-data:

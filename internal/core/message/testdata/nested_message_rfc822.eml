@@ -1,0 +1,35 @@
+From: forwarder@example.com
+To: recipient@example.com
+Subject: Fwd: Original message being forwarded
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="OUTER-FWD-BOUNDARY"
+
+--OUTER-FWD-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+
+See forwarded message below.
+
+--OUTER-FWD-BOUNDARY
+Content-Type: message/rfc822
+Content-Disposition: attachment; filename="forwarded.eml"
+
+From: original-sender@example.com
+To: original-recipient@example.com
+Subject: Original message being forwarded
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="INNER-FWD-BOUNDARY"
+
+--INNER-FWD-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+
+This is the original message body.
+
+--INNER-FWD-BOUNDARY
+Content-Type: application/zip
+Content-Disposition: attachment; filename="archive.zip"
+Content-Transfer-Encoding: base64
+
+UEsDBHN5bnRoZXRpYyB6aXAgY29udGVudA==
+
+--INNER-FWD-BOUNDARY--
+--OUTER-FWD-BOUNDARY--

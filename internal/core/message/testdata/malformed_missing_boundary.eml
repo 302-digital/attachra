@@ -1,0 +1,7 @@
+From: sender@example.com
+To: recipient@example.com
+Subject: Malformed multipart with no boundary
+MIME-Version: 1.0
+Content-Type: multipart/mixed
+
+This body has no valid boundary structure.

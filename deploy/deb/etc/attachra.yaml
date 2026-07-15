@@ -1,0 +1,97 @@
+# Attachra configuration — grommunio/Debian 13 host template.
+#
+# This file is a dpkg conffile (config|noreplace): your local edits
+# survive package upgrades. See internal/config/config.go in the
+# attachra source tree for the full schema, every field's meaning and
+# its default value — fields omitted here simply keep their built-in
+# default (see config.Default()).
+#
+# After editing this file, restart with `systemctl restart attachra` and
+# check `journalctl -u attachra -e` — there is no standalone `attachra
+# config validate` subcommand (unlike `attachra policy validate` for
+# policy.yaml below): an invalid attachra.yaml makes the process exit 1
+# immediately, before it binds any listener, so the journal is the
+# fastest way to see the specific validation error.
+#
+# See docs/deploy/grommunio-debian.md for the full installation guide.
+
+log:
+  level: info
+  format: text
+
+milter:
+  # Postfix on this same host connects to Attachra over loopback TCP.
+  # See /usr/share/attachra/examples/postfix-milter.cf for the
+  # smtpd_milters snippet that points at this address.
+  listen: "inet:127.0.0.1:6785"
+  # "open": if Attachra cannot process a message (crash, timeout, bug),
+  # the message is delivered unmodified rather than blocked. This is
+  # the safe default for a system that is not the mail server itself
+  # (CLAUDE.md invariant #3) — mail must never be lost because of an
+  # Attachra failure. Switch to "closed" only if your compliance
+  # posture requires attachments to be provably policy-checked before
+  # delivery, and you have alerting on Attachra's health (/readyz).
+  failure_mode: open
+
+http:
+  # Bound to loopback only: the public download page is published to
+  # the outside world through the reverse-proxy snippet at
+  # /usr/share/attachra/examples/nginx-grommunio.conf, not by exposing
+  # this port directly.
+  #
+  # Port 18080, NOT the more obvious 8080: grommunio-admin's own nginx
+  # already listens on 0.0.0.0:8080 (and 8443) for its admin UI on a
+  # stock grommunio host, so 8080 is taken. Verify with
+  # `ss -ltnp | grep 8080` before changing this if your host's port
+  # layout differs.
+  listen: "127.0.0.1:18080"
+
+  # nginx on THIS SAME HOST is the only thing that ever connects to
+  # http.listen (see the snippet above): it terminates the recipient's
+  # TLS connection and proxies to Attachra over loopback, so without
+  # this setting Attachra would see every download/audit/rate-limit
+  # event as coming from 127.0.0.1 (nginx's own peer address) instead of
+  # the real recipient (ATR-311). Listing nginx's loopback addresses
+  # here tells Attachra to trust the X-Real-IP/X-Forwarded-For headers
+  # nginx sets (see the `proxy_set_header` lines in
+  # nginx-grommunio.conf) ONLY when the direct connection came from one
+  # of these addresses — a client that connects to http.listen directly
+  # (bypassing nginx) cannot spoof its IP by setting these headers
+  # itself. Safe default for this host's co-located nginx; remove or
+  # narrow it if you ever move nginx to a different host or add another
+  # hop in front of it.
+  trusted_proxies:
+    - "127.0.0.1/32"
+    - "::1/128"
+
+# Base URL embedded in every rewritten message's download link. REPLACE
+# with your grommunio host's real, publicly reachable hostname —
+# whatever your grommunio/nginx TLS certificate covers. Must be
+# reachable by the mail recipients this system sends to, since it
+# becomes the link they click to retrieve the attachment.
+public_base_url: "https://mail.example.com"
+
+# Local filesystem storage under the systemd unit's StateDirectory
+# (see deploy/deb/systemd/attachra.service: DynamicUser=yes +
+# StateDirectory=attachra creates and owns /var/lib/attachra). Switch
+# to `driver: s3` for MinIO/S3/Ceph-backed storage instead — see
+# docs/integrations/s3-iam.md and docs/deploy/grommunio-debian.md for
+# how to keep S3 credentials out of this world-readable file via
+# ${ENV_VAR} substitution and /etc/attachra/attachra.env.
+storage:
+  driver: fs
+  fs:
+    base_dir: /var/lib/attachra/files
+
+# Embedded sqlite metadata store, also under StateDirectory (ADR-011:
+# no external database dependency in MVP).
+database:
+  driver: sqlite
+  path: /var/lib/attachra/attachra.db
+
+# Policy document controlling which attachments get replaced with a
+# download link. See /etc/attachra/policy.yaml (installed alongside
+# this file) and docs/architecture/policy-format-v1.md for the format.
+policy:
+  path: /etc/attachra/policy.yaml
+  dry_run: false

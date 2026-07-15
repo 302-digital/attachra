@@ -1,0 +1,16 @@
+# Dev-compose policy (ATR-167 e2e scenario): every attachment is
+# replaced with a personal download link, unconditionally, so the
+# end-to-end e2e test (test/e2e/e2e_test.go) can exercise the full
+# storage-upload + link-creation + MIME-rewrite path without needing a
+# richer policy for its purposes. See
+# docs/architecture/policy-format-v1.md for the full format.
+version: 1
+name: "dev-compose: replace everything"
+description: "Local dev-compose policy exercising the ATR-167 end-to-end replace path."
+
+rules: []
+
+default:
+  action: replace
+  ttl: "7d"
+  retention: "30d"

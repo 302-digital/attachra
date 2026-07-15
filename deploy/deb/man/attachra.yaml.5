@@ -1,0 +1,447 @@
+.TH ATTACHRA.YAML 5 "2026-07-15" "attachra" "Attachra Manual"
+.SH NAME
+attachra.yaml \- configuration file for the attachra attachment policy engine
+.SH SYNOPSIS
+.I /etc/attachra/attachra.yaml
+.SH DESCRIPTION
+.B attachra.yaml
+is a YAML document read by
+.BR attachra (1)
+via its
+.B \-\-config
+flag. Every key is optional; an omitted key keeps the built\-in default
+listed below. Keys not recognized here are ignored.
+.PP
+Before parsing, any
+.RI \(dq ${ENV_VAR} \(dq
+placeholder appearing anywhere in the raw file text is substituted
+with the value of the corresponding process environment variable. A
+placeholder referencing an
+.B unset
+variable is left unchanged (never silently replaced with an empty
+string), so a typo does not silently coerce a secret into an empty
+value. This is the recommended way to keep secrets (S3 keys, etc.) out
+of an otherwise world\-readable configuration file \(em see
+.BR attachra (1)
+.B FILES
+for the packaged
+.I attachra.env
+mechanism this pairs with.
+.PP
+After substitution and parsing, every key listed below can additionally
+be overridden by an
+.B ATTACHRA_
+\-prefixed environment variable (see
+.B ENVIRONMENT
+below); this is a separate mechanism from the
+.RI \(dq ${ENV_VAR} \(dq
+substitution above and applies whether or not a config file is used at
+all. There is no
+.RB \(dq "attachra config validate" \(dq
+subcommand: an invalid file makes the process exit 1 immediately,
+before it binds any listener, so check the process's log output (or
+.RB \(dq "journalctl -u attachra -e" \(dq
+under the packaged systemd unit) for the specific validation error.
+.SH KEYS
+.SS "log"
+Logger settings.
+.TP
+.B log.level
+One of
+.BR debug ", " info ", " warn ", " error .
+Default:
+.BR info .
+.TP
+.B log.format
+One of
+.B json
+or
+.BR text .
+Default:
+.BR text .
+.SS "milter"
+Postfix milter adapter settings.
+.TP
+.B milter.listen
+Milter listen address, in Postfix milter syntax, e.g.
+.RI \(dq inet:127.0.0.1:6785 \(dq
+or
+.RI \(dq unix:/var/run/attachra.sock \(dq .
+Must not be empty. Default:
+.RI \(dq inet:127.0.0.1:6785 \(dq .
+.TP
+.B milter.failure_mode
+One of
+.B open
+or
+.BR closed .
+.B open
+accepts a message unmodified when Attachra encounters an error or
+panic while processing it;
+.B closed
+temp\-fails it (SMTP 4xx) so the sending MTA retries later. Default:
+.BR open .
+.SS "http"
+Download adapter (public package/download page) settings.
+.TP
+.B http.listen
+TCP address the download server binds to, e.g.
+.RI \(dq 127.0.0.1:8080 \(dq .
+Must not be empty. Default:
+.RI \(dq 127.0.0.1:8080 \(dq .
+.TP
+.B http.trusted_proxies
+List of CIDR ranges (IPv4 and/or IPv6, e.g.
+.RI \(dq 127.0.0.1/32 \(dq
+or
+.RI \(dq 10.0.0.0/8 \(dq )
+of reverse proxies allowed to set the client identity via
+.B X\-Forwarded\-For
+/
+.BR X\-Real\-IP .
+Default: empty, meaning no proxy is trusted and the TCP peer address
+is always used \(em a deployment that puts a reverse proxy in front of
+Attachra must opt in explicitly by listing that proxy's address here.
+.SS "http.rate_limit"
+Per\-IP and global request throttling plus the not\-found\-response
+tarpit, for the download adapter. Every
+.I *_per_minute
+field is a sustained\-rate token\-bucket budget; a value \(<= 0
+disables that specific limit.
+.TP
+.B http.rate_limit.per_ip_per_minute
+Sustained request rate allowed for a single client IP across all
+routes. Default: 120.
+.TP
+.B http.rate_limit.per_ip_burst
+Maximum short burst size for a single client IP. 0 defaults to
+.BR per_ip_per_minute .
+Default: 20.
+.TP
+.B http.rate_limit.global_per_minute
+Sustained request rate allowed across all clients combined. Default:
+6000.
+.TP
+.B http.rate_limit.global_burst
+Maximum short burst size across all clients combined. 0 defaults to
+.BR global_per_minute .
+Default: 200.
+.TP
+.B http.rate_limit.not_found_per_ip_per_minute
+Tighter sustained rate for a single IP's requests that resolve to the
+generic not\-found/expired/revoked/exhausted response (the signature of
+token enumeration). Exceeding it triggers the tarpit delay on further
+responses to that IP. Default: 20.
+.TP
+.B http.rate_limit.tarpit_delay_seconds
+Artificial delay, in seconds (may be fractional, e.g. 0.5), added to a
+not\-found\-shaped response once an IP has exceeded
+.BR not_found_per_ip_per_minute .
+Default: 1.0.
+.SS "limits"
+Global resource limits enforced across milter session handling, MIME
+parsing and HTTP serving. All fields below must be positive.
+.TP
+.B limits.max_message_size
+Maximum accepted size, in bytes, of an entire email message (headers +
+body). Default: 104857600 (100 MiB).
+.TP
+.B limits.max_attachment_size
+Maximum accepted size, in bytes, of a single MIME part/attachment.
+Default: 26214400 (25 MiB).
+.TP
+.B limits.max_mime_parts
+Maximum number of MIME parts (leaf and container) a message may
+contain before parsing is aborted. Default: 1000.
+.TP
+.B limits.max_mime_depth
+Maximum nesting depth of MIME multipart/message containers before
+parsing is aborted. Default: 20.
+.TP
+.B limits.max_header_bytes
+Maximum total size, in bytes, of a message's header block. Default:
+1048576 (1 MiB).
+.TP
+.B limits.milter_max_connections
+Maximum number of concurrent milter sessions accepted. Default: 100.
+.TP
+.B limits.milter_timeout
+Maximum duration, in seconds, a single milter session may remain open.
+Default: 30.
+.TP
+.B limits.http_timeout
+Maximum duration, in seconds, for a single HTTP request/response
+cycle. Default: 30.
+.TP
+.B limits.inline_max_size
+Maximum size, in bytes, of a presentation\-inline asset (a
+.BR cid: \-referenced
+image inside
+.BR multipart/related )
+eligible for the policy engine's protective downgrade to a pass
+action, when its detected type is
+.B image/*
+and it is within this bound. Default: 262144 (256 KiB).
+.SS "storage"
+Attachment object storage backend. Exactly one of the
+.B s3
+or
+.B fs
+subsections is used, chosen by
+.BR driver .
+.TP
+.B storage.driver
+One of
+.B s3
+or
+.BR fs .
+Default:
+.BR fs .
+.SS "storage.s3"
+Used when
+.B storage.driver
+is
+.BR s3 .
+.TP
+.B storage.s3.endpoint
+S3\-compatible service endpoint URL, e.g.
+.RI \(dq https://s3.amazonaws.com \(dq
+or
+.RI \(dq http://localhost:9000 \(dq
+for MinIO. Empty means use the AWS SDK's default region resolution.
+.TP
+.B storage.s3.region
+AWS region, or a placeholder such as
+.RI \(dq us-east-1 \(dq
+for services (e.g. MinIO) that ignore it but require a value. Must not
+be empty when
+.B driver
+is
+.BR s3 .
+.TP
+.B storage.s3.bucket
+Name of the S3 bucket objects are stored in. Must not be empty when
+.B driver
+is
+.BR s3 .
+.TP
+.B storage.s3.access_key ", " storage.s3.secret_key
+Static credentials. If either is empty, the AWS SDK's default
+credential chain (environment, shared config, instance/task role) is
+used instead. Never printed in logs or error messages; typically set
+via
+.RI \(dq ${ENV_VAR} \(dq
+substitution rather than written inline.
+.TP
+.B storage.s3.path_style
+Boolean. Forces path\-style bucket addressing
+.RI ( https://endpoint/bucket/key
+instead of
+.RI https://bucket.endpoint/key ),
+required by MinIO and most non\-AWS S3\-compatible services. Default:
+.BR false .
+.TP
+.B storage.s3.sse
+Server\-side encryption applied to objects on put. One of
+.RB \(dq\(dq
+(no SSE header sent),
+.RB \(dq AES256 \(dq
+(SSE\-S3), or
+.RB \(dq aws:kms \(dq
+(SSE\-KMS). Default:
+.RB \(dq\(dq .
+.TP
+.B storage.s3.sse_kms_key_id
+KMS key ID/ARN to use when
+.B sse
+is
+.RB \(dq aws:kms \(dq .
+Ignored otherwise.
+.SS "storage.fs"
+Used when
+.B storage.driver
+is
+.BR fs .
+.TP
+.B storage.fs.base_dir
+Root directory under which all objects are stored. Created
+automatically if missing; every object path is validated to resolve
+inside it. Must not be empty when
+.B driver
+is
+.BR fs .
+Default:
+.RI \(dq ./data/attachments \(dq .
+.SS "database"
+Metadata database backend (message/link/audit/token records).
+.TP
+.B database.driver
+Only
+.B sqlite
+is supported in this build.
+.TP
+.B database.path
+Filesystem path to the SQLite database file. The containing directory
+must exist and be writable; the file itself is created on first run if
+missing. Must not be empty. Default:
+.RI \(dq ./data/attachra.db \(dq .
+.SS "links"
+Link Engine fallback parameters, applied whenever a matched policy rule
+(or its defaults) leaves a field unset.
+.TP
+.B links.default_ttl_seconds
+Link lifetime, in seconds, used when a policy does not set
+.BR ttl .
+Must be positive. Default: 604800 (7 days).
+.TP
+.B links.default_max_downloads
+Download budget used when a policy does not set
+.BR max_downloads .
+0 means unlimited. Must not be negative. Default: 0.
+.TP
+.B links.token_bytes
+Number of
+.B crypto/rand
+bytes used to generate each link token. Must be at least 16 (128
+bits). Default: 16.
+.TP
+.B links.default_retention_seconds
+Storage retention, in seconds, used when a policy does not set
+.BR retention .
+0 means fall back to whichever TTL applies to the link. If set, must
+not be shorter than
+.BR links.default_ttl_seconds .
+Default: 2592000 (30 days).
+.SS "policy"
+Attachment policy engine.
+.TP
+.B policy.path
+Filesystem path to the policy YAML document (see
+.I docs/architecture/policy-format-v1.md
+in the source tree). Empty (the default) means no policy is loaded:
+every attachment passes through unmodified. When non\-empty, the file
+must parse and validate or the process fails to start. Default: empty.
+.TP
+.B policy.dry_run
+Boolean. When true, the policy engine computes and logs every decision
+as usual but always returns a pass action to the caller, so operators
+can validate a new policy against live traffic before enforcing it. A
+rule's own
+.B then.dry_run
+overrides this global default for matches of that rule. Default:
+.BR false .
+.SS "retention"
+Background storage\-retention cleanup job.
+.TP
+.B retention.enabled
+Boolean. Toggles the background cleanup loop. Default:
+.BR true .
+.TP
+.B retention.interval_seconds
+How often a sweep pass runs, in seconds. Must be positive when
+enabled. Default: 3600 (hourly).
+.TP
+.B retention.chunk_size
+Maximum number of expired attachments fetched per database round trip
+within a single sweep pass. Must be positive when enabled. Default:
+200.
+.SS "public_base_url"
+.TP
+.B public_base_url
+Base URL embedded in every rewritten message's download link, e.g.
+.RI \(dq https://mail.example.com \(dq .
+Must be an absolute, well\-formed
+.B http
+or
+.B https
+URL with a host when set. Empty by default (no default value is
+provided \(em a deployment configuring a policy that replaces
+attachments must set this).
+.SH DEFAULTS
+The values shown above match
+.RB \(dq config.Default() \(dq
+in
+.I internal/config/config.go
+of the attachra source tree, which is the definitive source if this
+page and the code ever disagree.
+.SH ENVIRONMENT
+Every key above can be overridden by setting the corresponding
+.B ATTACHRA_<SECTION>_<FIELD>
+environment variable (uppercase, underscored), independent of any
+.RI \(dq ${ENV_VAR} \(dq
+substitution already applied to the file's own text. Only the keys
+below are currently wired to an environment override; every other key
+listed above can only be set via the YAML file itself:
+.RS
+.EX
+ATTACHRA_LOG_LEVEL
+ATTACHRA_LOG_FORMAT
+ATTACHRA_MILTER_LISTEN
+ATTACHRA_MILTER_FAILURE_MODE
+ATTACHRA_HTTP_LISTEN
+ATTACHRA_HTTP_RATE_LIMIT_PER_IP_PER_MINUTE
+ATTACHRA_HTTP_RATE_LIMIT_GLOBAL_PER_MINUTE
+ATTACHRA_PUBLIC_BASE_URL
+ATTACHRA_STORAGE_DRIVER
+ATTACHRA_STORAGE_S3_ENDPOINT
+ATTACHRA_STORAGE_S3_REGION
+ATTACHRA_STORAGE_S3_BUCKET
+ATTACHRA_STORAGE_S3_ACCESS_KEY
+ATTACHRA_STORAGE_S3_SECRET_KEY
+ATTACHRA_STORAGE_FS_BASE_DIR
+ATTACHRA_POLICY_PATH
+ATTACHRA_POLICY_DRY_RUN
+ATTACHRA_DATABASE_DRIVER
+ATTACHRA_DATABASE_PATH
+.EE
+.RE
+.B ATTACHRA_POLICY_DRY_RUN
+accepts
+.RB \(dq true \(dq
+(case\-insensitive) or
+.RB \(dq 1 \(dq ;
+any other value is treated as false.
+.SH EXAMPLE
+.RS
+.EX
+log:
+  level: info
+  format: text
+
+milter:
+  listen: "inet:127.0.0.1:6785"
+  failure_mode: open
+
+http:
+  listen: "127.0.0.1:8080"
+  trusted_proxies:
+    - "127.0.0.1/32"
+
+public_base_url: "https://mail.example.com"
+
+storage:
+  driver: fs
+  fs:
+    base_dir: /var/lib/attachra/files
+
+database:
+  driver: sqlite
+  path: /var/lib/attachra/attachra.db
+
+policy:
+  path: /etc/attachra/policy.yaml
+  dry_run: false
+.EE
+.RE
+.SH FILES
+.TP
+.I /etc/attachra/attachra.yaml
+Default location on a package install; passed explicitly via
+.B \-\-config
+by the packaged systemd unit (this file is not searched for
+automatically).
+.SH SEE ALSO
+.BR attachra (1),
+.BR attachractl (1)
+.SH AUTHOR
+The Attachra Project <https://attachra.org>.

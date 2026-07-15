@@ -1,0 +1,9 @@
+version: 1
+name: "Wrong field for action"
+rules:
+  - name: "Block with ttl"
+    then:
+      action: block
+      ttl: "30d"
+default:
+  action: pass

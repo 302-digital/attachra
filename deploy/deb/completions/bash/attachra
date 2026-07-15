@@ -1,0 +1,118 @@
+# bash completion for attachra(1)
+#
+# attachra uses the stdlib "flag" package (cmd/attachra), not a CLI
+# framework that can generate this file, so it is maintained by hand —
+# keep it in sync with cmd/attachra/main.go, policyvalidate.go,
+# auditexport.go, link.go, token.go and setup.go whenever a subcommand
+# or flag is added or renamed.
+#
+# New subcommands to wire in here as they land: `doctor` (ATR-321).
+
+_attachra() {
+    local cur prev words cword
+    _init_completion || {
+        cur="${COMP_WORDS[COMP_CWORD]}"
+        prev="${COMP_WORDS[COMP_CWORD-1]}"
+        words=("${COMP_WORDS[@]}")
+        cword=$COMP_CWORD
+    }
+
+    local top_commands="version policy setup audit link token"
+
+    case "${words[1]}" in
+        setup)
+            case "$prev" in
+                --config-dir|--fs-base-dir) COMPREPLY=($(compgen -f -- "$cur")); return ;;
+                --storage) COMPREPLY=($(compgen -W "fs s3" -- "$cur")); return ;;
+                --failure-mode) COMPREPLY=($(compgen -W "open closed" -- "$cur")); return ;;
+                --domains|--public-base-url|--s3-endpoint|--s3-region|--s3-bucket|--s3-access-key|--s3-secret-key|--http-listen|--milter-listen) return ;;
+            esac
+            COMPREPLY=($(compgen -W "--config-dir --force --non-interactive --domains --public-base-url --storage --fs-base-dir --s3-endpoint --s3-region --s3-bucket --s3-access-key --s3-secret-key --s3-path-style --http-listen --milter-listen --failure-mode --dry-run" -- "$cur"))
+            return
+            ;;
+        policy)
+            case "${words[2]}" in
+                validate)
+                    case "$prev" in
+                        --strict) ;;
+                        *) COMPREPLY=($(compgen -f -- "$cur")) ;;
+                    esac
+                    [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--strict" -- "$cur"))
+                    return
+                    ;;
+                *)
+                    COMPREPLY=($(compgen -W "validate" -- "$cur"))
+                    return
+                    ;;
+            esac
+            ;;
+        audit)
+            case "${words[2]}" in
+                export)
+                    case "$prev" in
+                        --from|--to) return ;;
+                        --type) COMPREPLY=($(compgen -W "download revoke error token_change" -- "$cur")); return ;;
+                    esac
+                    COMPREPLY=($(compgen -W "--from --to --type" -- "$cur"))
+                    return
+                    ;;
+                *)
+                    COMPREPLY=($(compgen -W "export" -- "$cur"))
+                    return
+                    ;;
+            esac
+            ;;
+        link)
+            case "${words[2]}" in
+                hold|unhold)
+                    case "$prev" in
+                        --actor) return ;;
+                    esac
+                    COMPREPLY=($(compgen -W "--actor" -- "$cur"))
+                    return
+                    ;;
+                revoke)
+                    case "$prev" in
+                        --actor|--message-id|--sender) return ;;
+                    esac
+                    COMPREPLY=($(compgen -W "--actor --message-id --sender" -- "$cur"))
+                    return
+                    ;;
+                *)
+                    COMPREPLY=($(compgen -W "hold unhold revoke" -- "$cur"))
+                    return
+                    ;;
+            esac
+            ;;
+        token)
+            case "${words[2]}" in
+                create)
+                    case "$prev" in
+                        --role) COMPREPLY=($(compgen -W "admin viewer auditor" -- "$cur")); return ;;
+                        --name|--actor) return ;;
+                    esac
+                    COMPREPLY=($(compgen -W "--name --role --actor" -- "$cur"))
+                    return
+                    ;;
+                *)
+                    COMPREPLY=($(compgen -W "create" -- "$cur"))
+                    return
+                    ;;
+            esac
+            ;;
+    esac
+
+    case "$prev" in
+        --config)
+            COMPREPLY=($(compgen -f -- "$cur"))
+            return
+            ;;
+    esac
+
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=($(compgen -W "--config --version" -- "$cur"))
+    else
+        COMPREPLY=($(compgen -W "$top_commands" -- "$cur"))
+    fi
+} &&
+    complete -F _attachra attachra

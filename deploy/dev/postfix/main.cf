@@ -1,0 +1,39 @@
+# Minimal Postfix configuration for the Attachra local dev environment.
+#
+# This is not a production configuration. It exists so that the compose
+# stack has a working SMTP relay that hands outgoing mail to the Attachra
+# milter for policy processing. See docs/Attachra_ADR.md (ADR-008) and
+# US-2.1 (docs/Attachra_Backlog.md) for the real milter adapter, which is
+# not implemented yet — Postfix will retry/queue until it is, since
+# milter_default_action=accept only covers milter connection failures,
+# not the (currently nonexistent) milter response itself.
+
+smtpd_banner = $myhostname ESMTP attachra-dev
+biff = no
+append_dot_mydomain = no
+readme_directory = no
+compatibility_level = 3.6
+
+myhostname = attachra-dev.local
+mydomain = attachra-dev.local
+myorigin = $mydomain
+mydestination =
+mynetworks = 0.0.0.0/0
+inet_interfaces = all
+inet_protocols = ipv4
+
+# Accept mail from any client in the dev network without auth. Never use
+# this configuration outside a throwaway local/dev environment.
+smtpd_relay_restrictions = permit_mynetworks, defer_unauth_destination
+relay_domains =
+
+# --- Attachra milter integration ---
+# Attachra is expected to listen on TCP port 7357 inside the compose
+# network (service name "attachra"). milter_default_action=accept means
+# outgoing mail still flows if the milter connection cannot be
+# established, which matches the fail-open dev-default described in
+# US-2.2 until the milter server is implemented.
+milter_protocol = 6
+milter_default_action = accept
+smtpd_milters = inet:attachra:7357
+non_smtpd_milters = inet:attachra:7357

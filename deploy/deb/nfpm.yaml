@@ -1,0 +1,177 @@
+# nfpm package definition for the attachra Debian package
+# (ATR: grommunio/Debian 13 packaging).
+#
+# Built with nfpm (https://nfpm.goreleaser.com, MIT license), invoked via
+# `make build-deb` as `go run github.com/goreleaser/nfpm/v2/cmd/nfpm@<pinned
+# version>` — nfpm is a build-time tool only and is deliberately NOT a
+# dependency in the project's go.mod/go.sum (ADR-001: it plays no part in
+# the attachra/attachractl static binaries themselves).
+#
+# nfpm must be invoked with the repository root as the working directory:
+# every relative `src` path below is resolved against the CWD nfpm was
+# started from, not against this file's own location. See the `build-deb`
+# target in the top-level Makefile.
+#
+# ${VAR} env references: nfpm always expands them in the well-known
+# top-level Info fields (version, arch, maintainer, ...), but for a
+# `contents[]` entry's own `src`/`dst` that only happens when the entry
+# sets `expand: true` (see files.Content.Expand in nfpm's own source) —
+# every entry below that references ${DEB_BIN_DIR} sets it explicitly.
+name: attachra
+# Set by `make build-deb-%` via the DEB_ARCH env var to "amd64" or
+# "arm64" (ATR-322): both are valid Debian arch field values as well as
+# valid GOARCH values, so the Makefile passes the same string through
+# unchanged for the GOARCH cross-compile and this field.
+arch: "${DEB_ARCH}"
+platform: linux
+# Set by `make build-deb` via the DEB_VERSION env var (derived from
+# VERSION, itself from `git describe --tags` when a tag is reachable,
+# or "<latest-tag>+git.<shortsha>" otherwise (e.g. dev builds) — see
+# the Makefile's VERSION/DEB_VERSION comments), sanitized to a valid
+# Debian upstream version. nfpm expands ${VAR} references anywhere in
+# this file against the process environment before parsing the YAML.
+version: "${DEB_VERSION}"
+section: mail
+priority: optional
+maintainer: "Attachra Project <security@attachra.org>"
+description: |
+  Self-hosted attachment policy engine for corporate email (Postfix
+  milter). Intercepts outbound attachments, applies declarative
+  policies, uploads matching files to S3-compatible or local storage,
+  and rewrites the message to reference a personal, revocable download
+  link instead. Not a mail server: it sits next to one (grommunio,
+  Mailcow, iRedMail, Mail-in-a-Box, ...).
+vendor: "Attachra Project"
+homepage: "https://attachra.org"
+license: "AGPL-3.0-only"
+
+contents:
+  # Static, linux/${DEB_ARCH}, CGO_ENABLED=0 binaries (ADR-001). Staged
+  # by `make build-deb-%` into $DEB_BIN_DIR (dist/deb-bin/<arch>/) before
+  # nfpm runs; DEB_BIN_DIR is set per-arch by that same Makefile target.
+  - src: ${DEB_BIN_DIR}/attachra
+    dst: /usr/bin/attachra
+    expand: true
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
+
+  - src: ${DEB_BIN_DIR}/attachractl
+    dst: /usr/bin/attachractl
+    expand: true
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
+
+  # Man pages (ATR-322): gzipped -9n by `make build-deb` into
+  # dist/deb-man/ before nfpm runs (see the Makefile's DEB_MAN_GZ rule);
+  # sources are the hand-written troff files in deploy/deb/man/.
+  - src: dist/deb-man/attachra.1.gz
+    dst: /usr/share/man/man1/attachra.1.gz
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+
+  - src: dist/deb-man/attachractl.1.gz
+    dst: /usr/share/man/man1/attachractl.1.gz
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+
+  - src: dist/deb-man/attachra.yaml.5.gz
+    dst: /usr/share/man/man5/attachra.yaml.5.gz
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+
+  # Shell completions (ATR-322): hand-written, not staged/compressed —
+  # installed as-is from deploy/deb/completions/. bash-completion and
+  # zsh both auto-load from these standard system directories; no
+  # postinstall step is needed for either.
+  - src: deploy/deb/completions/bash/attachra
+    dst: /usr/share/bash-completion/completions/attachra
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+
+  - src: deploy/deb/completions/bash/attachractl
+    dst: /usr/share/bash-completion/completions/attachractl
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+
+  - src: deploy/deb/completions/zsh/_attachra
+    dst: /usr/share/zsh/vendor-completions/_attachra
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+
+  - src: deploy/deb/completions/zsh/_attachractl
+    dst: /usr/share/zsh/vendor-completions/_attachractl
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+
+  # Config files. Packaged as `config|noreplace` (dpkg conffile
+  # handling): dpkg preserves any local edits on upgrade and never
+  # silently overwrites an operator's domain/storage settings; on
+  # conflict it prompts (or ships the new version as *.dpkg-dist) per
+  # normal dpkg conffile semantics. World-readable (0644): the systemd
+  # unit runs the daemon under DynamicUser=yes, so the runtime UID is
+  # not known at packaging time and cannot be chgrp'd here — see
+  # deploy/deb/systemd/attachra.service and docs/deploy/grommunio-debian.md
+  # for how to keep real secrets (S3 keys, etc.) out of this
+  # world-readable file via ${ENV_VAR} substitution + a root-only
+  # EnvironmentFile instead.
+  - src: deploy/deb/etc/attachra.yaml
+    dst: /etc/attachra/attachra.yaml
+    type: config|noreplace
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+
+  - src: deploy/deb/etc/policy.yaml
+    dst: /etc/attachra/policy.yaml
+    type: config|noreplace
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+
+  - src: deploy/deb/systemd/attachra.service
+    dst: /lib/systemd/system/attachra.service
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+
+  - src: deploy/deb/examples/nginx-grommunio.conf
+    dst: /usr/share/attachra/examples/nginx-grommunio.conf
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+
+  - src: deploy/deb/examples/postfix-milter.cf
+    dst: /usr/share/attachra/examples/postfix-milter.cf
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+
+scripts:
+  postinstall: deploy/deb/scripts/postinstall.sh
+  postremove: deploy/deb/scripts/postremove.sh
+
+deb:
+  compression: xz

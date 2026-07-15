@@ -1,0 +1,19 @@
+From: sender@example.com
+To: recipient@example.com
+Subject: Basic multipart/mixed
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="MIXED-BOUNDARY-1"
+
+--MIXED-BOUNDARY-1
+Content-Type: text/plain; charset=utf-8
+
+Hello, please find the report attached.
+
+--MIXED-BOUNDARY-1
+Content-Type: application/pdf; name="report.pdf"
+Content-Disposition: attachment; filename="report.pdf"
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjQKc3ludGhldGljIHBkZiBjb250ZW50IGZvciB0ZXN0IGNvcnB1cw==
+
+--MIXED-BOUNDARY-1--

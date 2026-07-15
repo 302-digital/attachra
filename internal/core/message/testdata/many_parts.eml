@@ -1,0 +1,257 @@
+From: sender@example.com
+To: recipient@example.com
+Subject: Many sibling parts
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="MANY-PARTS-BOUNDARY"
+
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part0.txt"
+
+content of part 0
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part1.txt"
+
+content of part 1
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part2.txt"
+
+content of part 2
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part3.txt"
+
+content of part 3
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part4.txt"
+
+content of part 4
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part5.txt"
+
+content of part 5
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part6.txt"
+
+content of part 6
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part7.txt"
+
+content of part 7
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part8.txt"
+
+content of part 8
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part9.txt"
+
+content of part 9
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part10.txt"
+
+content of part 10
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part11.txt"
+
+content of part 11
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part12.txt"
+
+content of part 12
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part13.txt"
+
+content of part 13
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part14.txt"
+
+content of part 14
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part15.txt"
+
+content of part 15
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part16.txt"
+
+content of part 16
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part17.txt"
+
+content of part 17
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part18.txt"
+
+content of part 18
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part19.txt"
+
+content of part 19
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part20.txt"
+
+content of part 20
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part21.txt"
+
+content of part 21
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part22.txt"
+
+content of part 22
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part23.txt"
+
+content of part 23
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part24.txt"
+
+content of part 24
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part25.txt"
+
+content of part 25
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part26.txt"
+
+content of part 26
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part27.txt"
+
+content of part 27
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part28.txt"
+
+content of part 28
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part29.txt"
+
+content of part 29
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part30.txt"
+
+content of part 30
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part31.txt"
+
+content of part 31
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part32.txt"
+
+content of part 32
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part33.txt"
+
+content of part 33
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part34.txt"
+
+content of part 34
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part35.txt"
+
+content of part 35
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part36.txt"
+
+content of part 36
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part37.txt"
+
+content of part 37
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part38.txt"
+
+content of part 38
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part39.txt"
+
+content of part 39
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part40.txt"
+
+content of part 40
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part41.txt"
+
+content of part 41
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part42.txt"
+
+content of part 42
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part43.txt"
+
+content of part 43
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part44.txt"
+
+content of part 44
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part45.txt"
+
+content of part 45
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part46.txt"
+
+content of part 46
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part47.txt"
+
+content of part 47
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part48.txt"
+
+content of part 48
+--MANY-PARTS-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="part49.txt"
+
+content of part 49
+--MANY-PARTS-BOUNDARY--

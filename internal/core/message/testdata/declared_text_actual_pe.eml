@@ -1,0 +1,19 @@
+From: sender@example.com
+To: recipient@example.com
+Subject: Mismatched declared and actual type
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="DECLARED-TEXT-ACTUAL-PE-BOUNDARY"
+
+--DECLARED-TEXT-ACTUAL-PE-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+
+See attached notes.txt.
+
+--DECLARED-TEXT-ACTUAL-PE-BOUNDARY
+Content-Type: text/plain
+Content-Disposition: attachment; filename="notes.txt"
+Content-Transfer-Encoding: base64
+
+TVqQAAMAAABmYWtlIFBFIHBheWxvYWQgYnl0ZXMgZm9yIHRlc3Rpbmc=
+
+--DECLARED-TEXT-ACTUAL-PE-BOUNDARY--

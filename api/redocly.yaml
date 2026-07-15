@@ -1,0 +1,10 @@
+# Redocly CLI config for api/openapi.yaml (ATR-195).
+#
+# Kept intentionally minimal: extend the built-in recommended ruleset,
+# no overrides. (An earlier revision disabled operation-4xx-response for
+# the /healthz and /readyz operations; those were removed from this
+# document's paths entirely — see the "Scope" section of
+# openapi.yaml's info.description — so every remaining operation already
+# declares a 4XX response and no override is needed.)
+extends:
+  - recommended

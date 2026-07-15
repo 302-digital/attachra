@@ -1,0 +1,51 @@
+# Attachra policy — grommunio/Debian 13 host template.
+#
+# This file is a dpkg conffile (config|noreplace): your local edits
+# survive package upgrades. Validate any change with:
+#
+#   attachra policy validate /etc/attachra/policy.yaml
+#
+# then `systemctl reload attachra` (SIGHUP) to pick it up without a
+# restart. Full grammar: docs/architecture/policy-format-v1.md.
+#
+# Out of the box this policy processes attachments ONLY for outbound
+# mail from example.com (your own organization's sending domain) and
+# passes every other message through completely unmodified — safe to
+# install on a shared/multi-domain grommunio host without affecting
+# domains you don't intend to police yet.
+#
+# >>> CHANGE THIS: replace "example.com" below with your real sending
+# >>> domain(s) (the domain(s) grommunio accepts outbound mail for).
+version: 1
+name: "grommunio: replace attachments from example.com"
+description: >
+  Replaces every attachment on outbound mail from example.com with a
+  personal, revocable download link. All other senders pass through
+  unmodified. Adjust the domain list and/or add attachment-shape
+  conditions (size, mime_type, extension — see When.Attachment in
+  docs/architecture/policy-format-v1.md §2.3.2) to narrow this further.
+
+rules:
+  # This rule's broad "replace everything" scope is safe by default
+  # (ADR-016): inline logo/signature images (referenced from the HTML
+  # body via cid:, inside multipart/related) are protected from
+  # replacement automatically, so they won't turn into broken links.
+  # To replace inline images too, add `disposition: ["inline"]` under
+  # `when.attachment` (see docs/architecture/policy-format-v1.md §2.3.2).
+  - name: "example.com senders: replace attachments with a download link"
+    when:
+      sender:
+        # Add more domains here as needed, e.g. ["example.com", "example.org"].
+        domain: ["example.com"]
+    then:
+      action: replace
+      ttl: "7d"
+      retention: "30d"
+
+# Every other sender (any domain not listed in the rule above) is left
+# untouched: attachments pass through exactly as sent. This is the
+# required fallback (SR-119-1 forbids a policy that silently passes
+# attachments by omission) and is also the deliberately conservative
+# choice for a freshly installed package.
+default:
+  action: pass

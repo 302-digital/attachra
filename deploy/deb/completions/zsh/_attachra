@@ -1,0 +1,164 @@
+#compdef attachra
+# zsh completion for attachra(1)
+#
+# attachra uses the stdlib "flag" package (cmd/attachra), not a CLI
+# framework that can generate this file, so it is maintained by hand —
+# keep it in sync with cmd/attachra/main.go, policyvalidate.go,
+# auditexport.go, link.go, token.go and setup.go whenever a subcommand
+# or flag is added or renamed.
+#
+# New subcommands to wire in here as they land: `doctor` (ATR-321).
+
+_attachra() {
+    local -a top_commands
+    top_commands=(
+        'version:print the version and exit'
+        'policy:policy document operations'
+        'setup:first-run configuration wizard'
+        'audit:audit log operations'
+        'link:manage individual download links'
+        'token:manage API tokens (bootstrap)'
+    )
+
+    _arguments -C \
+        '--config[path to YAML configuration file]:file:_files' \
+        '--version[print version and exit]' \
+        '1: :->command' \
+        '*:: :->args'
+
+    case $state in
+        command)
+            _describe -t commands 'attachra command' top_commands
+            ;;
+        args)
+            case $words[1] in
+                policy)
+                    _attachra_policy
+                    ;;
+                setup)
+                    _attachra_setup
+                    ;;
+                audit)
+                    _attachra_audit
+                    ;;
+                link)
+                    _attachra_link
+                    ;;
+                token)
+                    _attachra_token
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_attachra_policy() {
+    local -a sub
+    sub=('validate:validate a policy document')
+    _arguments -C '1: :->sub' '*:: :->args'
+    case $state in
+        sub) _describe -t commands 'policy subcommand' sub ;;
+        args)
+            case $words[1] in
+                validate)
+                    _arguments \
+                        '--strict[treat warnings as failures]' \
+                        '1:policy file:_files'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_attachra_setup() {
+    # Unlike policy/audit/link/token, setup has no further subcommand —
+    # every flag below applies directly to `attachra setup` itself
+    # (ATR-320, cmd/attachra/setup.go).
+    _arguments \
+        '--config-dir[directory to write attachra.yaml/policy.yaml into]:directory:_files -/' \
+        '--force[overwrite an existing attachra.yaml/policy.yaml]' \
+        '--non-interactive[skip prompts; every answer must come from flags]' \
+        '--domains[comma-separated sender domain(s), required with --non-interactive]:domains' \
+        '--public-base-url[public base URL embedded in download links, required with --non-interactive]:url' \
+        '--storage[storage driver]:driver:(fs s3)' \
+        '--fs-base-dir[fs driver: base directory for stored attachments]:directory:_files -/' \
+        '--s3-endpoint[s3 driver: S3-compatible endpoint URL]:url' \
+        '--s3-region[s3 driver: region]:region' \
+        '--s3-bucket[s3 driver: bucket name]:bucket' \
+        '--s3-access-key[s3 driver: access key, written to attachra.env]:access key' \
+        '--s3-secret-key[s3 driver: secret key, written to attachra.env]:secret key' \
+        '--s3-path-style[s3 driver: use path-style bucket addressing]' \
+        '--http-listen[download server listen address]:address' \
+        '--milter-listen[milter listen address, Postfix syntax]:address' \
+        '--failure-mode[milter failure resolution]:mode:(open closed)' \
+        '--dry-run[start the policy in dry-run mode (recommended)]'
+}
+
+_attachra_audit() {
+    local -a sub
+    sub=('export:export audit events as JSON Lines')
+    _arguments -C '1: :->sub' '*:: :->args'
+    case $state in
+        sub) _describe -t commands 'audit subcommand' sub ;;
+        args)
+            case $words[1] in
+                export)
+                    _arguments \
+                        '--from[inclusive lower bound, RFC3339]:timestamp' \
+                        '--to[exclusive upper bound, RFC3339]:timestamp' \
+                        '--type[event type]:type:(download revoke error token_change)'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_attachra_link() {
+    local -a sub
+    sub=(
+        'hold:place a link under legal hold'
+        'unhold:lift a legal hold'
+        'revoke:revoke one or more links'
+    )
+    _arguments -C '1: :->sub' '*:: :->args'
+    case $state in
+        sub) _describe -t commands 'link subcommand' sub ;;
+        args)
+            case $words[1] in
+                hold|unhold)
+                    _arguments \
+                        '--actor[operator identity, required]:actor' \
+                        '1:link id'
+                    ;;
+                revoke)
+                    _arguments \
+                        '--actor[operator identity, required]:actor' \
+                        '--message-id[revoke every link of this message]:message id' \
+                        '--sender[revoke every link of this sender]:sender address' \
+                        '1:link id'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_attachra_token() {
+    local -a sub
+    sub=('create:mint a new API token (bootstrap)')
+    _arguments -C '1: :->sub' '*:: :->args'
+    case $state in
+        sub) _describe -t commands 'token subcommand' sub ;;
+        args)
+            case $words[1] in
+                create)
+                    _arguments \
+                        '--name[operator-chosen label, required]:name' \
+                        '--role[token role, required]:role:(admin viewer auditor)' \
+                        '--actor[operator identity, required]:actor'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_attachra "$@"

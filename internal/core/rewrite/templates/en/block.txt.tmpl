@@ -1,0 +1,9 @@
+{{if eq (len .Files) 1}}An attachment was removed and is available for download:{{else}}{{len .Files}} attachments were removed and are available for download:{{end}}
+{{range .Files}}
+  - {{.Name}} ({{.SizeHuman}}){{end}}
+
+Download link: {{.PackageURL}}
+{{if .ExpiresAt}}This link expires on {{.ExpiresAt}}.
+{{end}}{{if .SenderName}}Sent by: {{.SenderName}}
+{{end}}
+This message was processed by Attachra.

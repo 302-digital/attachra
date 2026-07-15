@@ -1,0 +1,219 @@
+#compdef attachractl
+# zsh completion for attachractl(1)
+#
+# attachractl is built on cobra (cmd/attachractl), which can generate a
+# fuller completion script at runtime via `attachractl completion zsh`
+# once that subcommand is wired up (it is not, as of ATR-322) — until
+# then this static file is maintained by hand and must be kept in sync
+# with cmd/attachractl/root.go and the newXxxCmd() constructors in
+# links.go, policy.go, stats.go, audit.go, token.go, version.go.
+#
+# New subcommands to wire in here as they land: `setup` (ATR-320),
+# `doctor` (ATR-321).
+
+_attachractl() {
+    local -a top_commands global_opts
+    top_commands=(
+        'policy:inspect and control the active policy'
+        'links:list and manage personal download links'
+        'stats:aggregated statistics'
+        'audit:view and export the audit log'
+        'token:manage API tokens'
+        'version:print the attachractl version and exit'
+    )
+    global_opts=(
+        '--config[path to the attachractl config file]:file:_files'
+        '--url[Attachra API base URL]:url'
+        '--token-file[path to a file containing the bearer token]:file:_files'
+        '--insecure[skip TLS certificate verification]'
+        '--json[output machine-readable JSON]'
+        '--timeout[request timeout]:duration'
+    )
+
+    _arguments -C \
+        $global_opts \
+        '1: :->command' \
+        '*:: :->args'
+
+    case $state in
+        command)
+            _describe -t commands 'attachractl command' top_commands
+            ;;
+        args)
+            case $words[1] in
+                policy) _attachractl_policy ;;
+                links) _attachractl_links ;;
+                stats) _attachractl_stats ;;
+                audit) _attachractl_audit ;;
+                token) _attachractl_token ;;
+            esac
+            ;;
+    esac
+}
+
+_attachractl_policy() {
+    local -a sub
+    sub=(
+        'current:show the currently active policy'
+        'validate:validate a candidate policy document'
+        'reload:re-read and apply the configured policy file'
+        'dry-run:evaluate the active policy against a hypothetical message'
+    )
+    _arguments -C '1: :->sub' '*:: :->args'
+    case $state in
+        sub) _describe -t commands 'policy subcommand' sub ;;
+        args)
+            case $words[1] in
+                validate)
+                    _arguments '1:policy file:_files'
+                    ;;
+                dry-run)
+                    _arguments \
+                        '--sender[envelope sender address]:sender' \
+                        '*--recipient[recipient address]:recipient' \
+                        '*--attachment[filename\:size[\:mime_type[\:detected_type]]]:attachment spec' \
+                        '(-f --file)'{-f,--file}'[read DryRunRequest JSON from file or -]:file:_files'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_attachractl_links() {
+    local -a sub
+    sub=(
+        'list:list personal download links'
+        'get:get a single link by ID'
+        'revoke:revoke one link, a message, or a sender'
+        'hold:place a link under legal hold'
+        'unhold:lift a legal hold'
+    )
+    _arguments -C '1: :->sub' '*:: :->args'
+    case $state in
+        sub) _describe -t commands 'links subcommand' sub ;;
+        args)
+            case $words[1] in
+                list)
+                    _arguments \
+                        '--message-id[filter by message ID]:message id' \
+                        '--recipient[filter by recipient address]:recipient' \
+                        '--status[filter by status]:status:(active revoked expired)' \
+                        '--from[inclusive lower bound, RFC3339]:timestamp' \
+                        '--to[exclusive upper bound, RFC3339]:timestamp' \
+                        '--limit[page size]:limit'
+                    ;;
+                get|hold|unhold)
+                    _arguments '1:link id'
+                    ;;
+                revoke)
+                    _arguments \
+                        '--message-id[revoke every link of this message]:message id' \
+                        '--sender[revoke every link of this sender]:sender address' \
+                        '1:link id'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_attachractl_stats() {
+    local -a sub
+    sub=(
+        'summary:aggregated message/policy/download statistics'
+        'deliverability:link download-rate statistics by domain'
+    )
+    _arguments -C '1: :->sub' '*:: :->args'
+    case $state in
+        sub) _describe -t commands 'stats subcommand' sub ;;
+        args)
+            case $words[1] in
+                summary)
+                    _arguments \
+                        '--from[inclusive lower bound, RFC3339, required]:timestamp' \
+                        '--to[exclusive upper bound, RFC3339, required]:timestamp'
+                    ;;
+                deliverability)
+                    _arguments \
+                        '--from[inclusive lower bound, RFC3339, required]:timestamp' \
+                        '--to[exclusive upper bound, RFC3339, required]:timestamp' \
+                        '--sort[sort key]:key:(download_rate)' \
+                        '--order[sort order]:order:(asc desc)' \
+                        '--limit[page size]:limit'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_attachractl_audit() {
+    local -a sub
+    sub=(
+        'list:list audit log events'
+        'tail:show recent audit events, optionally following'
+        'export:export the full filtered audit log as JSON Lines'
+    )
+    _arguments -C '1: :->sub' '*:: :->args'
+    case $state in
+        sub) _describe -t commands 'audit subcommand' sub ;;
+        args)
+            case $words[1] in
+                list)
+                    _arguments \
+                        '--message-id[filter by message ID]:message id' \
+                        '--type[filter by event type]:type' \
+                        '--from[inclusive lower bound, RFC3339]:timestamp' \
+                        '--to[exclusive upper bound, RFC3339]:timestamp' \
+                        '--cursor[opaque pagination cursor]:cursor' \
+                        '--limit[page size]:limit' \
+                        '--all[auto-paginate through every matching event]'
+                    ;;
+                tail)
+                    _arguments \
+                        '--message-id[filter by message ID]:message id' \
+                        '--type[filter by event type]:type' \
+                        '--from[inclusive lower bound, RFC3339]:timestamp' \
+                        '--to[exclusive upper bound, RFC3339]:timestamp' \
+                        '--lines[number of recent events]:lines' \
+                        '--follow[keep running and print new events]' \
+                        '--interval[polling interval]:duration'
+                    ;;
+                export)
+                    _arguments \
+                        '--type[filter by event type]:type' \
+                        '--from[inclusive lower bound, RFC3339]:timestamp' \
+                        '--to[exclusive upper bound, RFC3339]:timestamp'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_attachractl_token() {
+    local -a sub
+    sub=(
+        'create:create a new API token'
+        'list:list API tokens'
+        'revoke:revoke an API token'
+    )
+    _arguments -C '1: :->sub' '*:: :->args'
+    case $state in
+        sub) _describe -t commands 'token subcommand' sub ;;
+        args)
+            case $words[1] in
+                create)
+                    _arguments \
+                        '--name[operator-chosen label, required]:name' \
+                        '--role[token role, required]:role:(admin viewer auditor)'
+                    ;;
+                list)
+                    _arguments '--limit[page size]:limit'
+                    ;;
+                revoke)
+                    _arguments '1:token id'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_attachractl "$@"

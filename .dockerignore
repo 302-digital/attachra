@@ -1,0 +1,12 @@
+.git/
+.github/
+.idea/
+.vscode/
+.omc/
+bin/
+dist/
+*.md
+docs/
+deploy/
+test/
+hack/

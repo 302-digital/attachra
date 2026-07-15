@@ -1,0 +1,19 @@
+From: sender@example.com
+To: recipient@example.com
+Subject: Attachment without a filename
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="NO-FILENAME-BOUNDARY"
+
+--NO-FILENAME-BOUNDARY
+Content-Type: text/plain; charset=utf-8
+
+See attached.
+
+--NO-FILENAME-BOUNDARY
+Content-Type: application/octet-stream
+Content-Disposition: attachment
+Content-Transfer-Encoding: base64
+
+dW5uYW1lZCBiaW5hcnkgY29udGVudA==
+
+--NO-FILENAME-BOUNDARY--
