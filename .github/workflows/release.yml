@@ -1,0 +1,162 @@
+name: Release
+
+# Publishes the two artifacts a self-hosted install actually needs: the
+# .deb packages (linux/amd64+arm64) attached to the GitHub Release, and a
+# multi-arch container image pushed to GHCR. Mirrors the internal build
+# pipeline that already does this on a tag, just aimed at the public
+# registries instead.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  # Lets a maintainer (re-)run this workflow against a tag that already
+  # exists — e.g. a release that shipped before this workflow did.
+  # Trigger it from the Actions UI and pick the tag as the run's ref;
+  # github.ref_name will then be that tag name, same as on a tag push.
+  workflow_dispatch:
+    inputs:
+      publish_latest:
+        description: "Also move the :latest image tag and the Latest release badge to this tag"
+        type: boolean
+        default: false
+
+jobs:
+  # The push trigger's tag glob ("v*.*.*") is looser than it looks — it
+  # also matches things like "v1.2.3-rc1" — and workflow_dispatch can be
+  # run against any ref at all (a branch, "dev", anything). Fail fast and
+  # clearly instead of letting either case reach make build-deb or the
+  # image push with a non-release ref.
+  #
+  # This job also decides whether this run is allowed to move the
+  # floating ":latest" image tag / the Release "Latest" badge: a normal
+  # tag push always does (it's assumed to be the newest release), but a
+  # workflow_dispatch re-run against an older tag must not, unless the
+  # operator opts in via the publish_latest input — otherwise a
+  # retroactive run would drag :latest and the badge backwards onto an
+  # old version.
+  guard:
+    name: Validate release ref
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      promote_latest: ${{ steps.decide.outputs.promote_latest }}
+    steps:
+      - name: Require a vX.Y.Z tag
+        run: |
+          ref="${{ github.ref_name }}"
+          if [[ ! "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release workflow requires a semver tag (vX.Y.Z), got ref '$ref' (event: ${{ github.event_name }})."
+            echo "If this was a manual run, re-dispatch and select an existing vX.Y.Z tag as the ref."
+            exit 1
+          fi
+          echo "Releasing $ref"
+
+      - name: Decide whether to promote :latest
+        id: decide
+        run: |
+          if [[ "${{ github.event_name }}" == "push" || "${{ inputs.publish_latest }}" == "true" ]]; then
+            echo "promote_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "promote_latest=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  deb:
+    name: Build and publish .deb packages
+    needs: guard
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build .deb packages (amd64 + arm64)
+        run: make build-deb VERSION=${{ github.ref_name }}
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum *.deb > SHA256SUMS
+
+      # Release notes are expected to already exist on this tag's GitHub
+      # Release (written by a human before the tag is pushed, per the
+      # release checklist). If the tag arrives before the release notes
+      # do, action-gh-release creates the release with an empty body —
+      # that's intentional fallback behavior, not a bug in this workflow.
+      - name: Attach assets to the GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          fail_on_unmatched_files: true
+          make_latest: ${{ needs.guard.outputs.promote_latest }}
+          files: |
+            dist/*.deb
+            dist/SHA256SUMS
+
+  image:
+    name: Build and publish container image
+    needs: guard
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Compute build date
+        id: meta
+        run: echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      # Only include the floating ":latest" tag when this run is allowed
+      # to promote it (see the guard job) — otherwise a retroactive
+      # workflow_dispatch on an old tag would move :latest backwards.
+      - name: Compute image tags
+        id: tags
+        run: |
+          tags="ghcr.io/302-digital/attachra:${{ github.ref_name }}"
+          if [[ "${{ needs.guard.outputs.promote_latest }}" == "true" ]]; then
+            tags="${tags}"$'\n'"ghcr.io/302-digital/attachra:latest"
+          fi
+          {
+            echo "tags<<EOF"
+            echo "$tags"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+            DATE=${{ steps.meta.outputs.date }}
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
