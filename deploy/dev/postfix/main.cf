@@ -3,10 +3,10 @@
 # This is not a production configuration. It exists so that the compose
 # stack has a working SMTP relay that hands outgoing mail to the Attachra
 # milter for policy processing. See docs/Attachra_ADR.md (ADR-008) and
-# US-2.1 (docs/Attachra_Backlog.md) for the real milter adapter, which is
-# not implemented yet — Postfix will retry/queue until it is, since
-# milter_default_action=accept only covers milter connection failures,
-# not the (currently nonexistent) milter response itself.
+# US-2.1 (docs/Attachra_Backlog.md) for the milter adapter itself.
+# milter_default_action=accept only covers milter connection failures
+# (fail-open dev default per US-2.2); it does not cover the milter
+# rejecting or tempfailing a message once connected.
 
 smtpd_banner = $myhostname ESMTP attachra-dev
 biff = no
@@ -17,7 +17,10 @@ compatibility_level = 3.6
 myhostname = attachra-dev.local
 mydomain = attachra-dev.local
 myorigin = $mydomain
-mydestination =
+# Accept mail addressed to this host/domain locally instead of trying to
+# relay it elsewhere (the dev e2e test sends to
+# recipient@attachra-dev.local, which is not a relayable destination).
+mydestination = $myhostname, attachra-dev.local, localhost
 mynetworks = 0.0.0.0/0
 inet_interfaces = all
 inet_protocols = ipv4
@@ -27,12 +30,30 @@ inet_protocols = ipv4
 smtpd_relay_restrictions = permit_mynetworks, defer_unauth_destination
 relay_domains =
 
+# Skip local recipient validation (there's no real user database in this
+# throwaway container) and hand every locally-destined message to root's
+# mailbox, so the e2e test/operator can inspect the delivered, rewritten
+# message at /var/spool/mail/root regardless of the original recipient.
+# alias_maps is also disabled: the image's baked-in alias database is in
+# the wrong format for the lmdb lookup it advertises, which otherwise
+# soft-fails local(8) delivery ("alias database unavailable") before
+# luser_relay ever gets a chance to apply.
+local_recipient_maps =
+alias_maps =
+luser_relay = root
+
+# Dev-only: disable opportunistic STARTTLS. The image's default snakeoil
+# certificate isn't valid for any hostname a test client dials (e.g.
+# "localhost"), so Go's net/smtp (and other strict clients) fail
+# certificate verification once STARTTLS is advertised. Never disable TLS
+# like this outside a throwaway local/dev environment.
+smtpd_tls_security_level = none
+
 # --- Attachra milter integration ---
-# Attachra is expected to listen on TCP port 7357 inside the compose
-# network (service name "attachra"). milter_default_action=accept means
-# outgoing mail still flows if the milter connection cannot be
-# established, which matches the fail-open dev-default described in
-# US-2.2 until the milter server is implemented.
+# Attachra listens on TCP port 7357 inside the compose network (service
+# name "attachra"). milter_default_action=accept means outgoing mail still
+# flows if the milter connection cannot be established (see the comment
+# at the top of this file).
 milter_protocol = 6
 milter_default_action = accept
 smtpd_milters = inet:attachra:7357

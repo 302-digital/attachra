@@ -10,9 +10,11 @@
 # The milter server (port 7357, US-2.1) is implemented and started from
 # cmd/attachra/main.go.
 #
-# Not verified with Docker on this machine (unavailable in this
-# environment) — validate `docker compose config` and `docker compose up`
-# on a host with Docker before relying on this file.
+# Verified end-to-end with `docker compose up --build`: hack/sendmail-test
+# sends a message through postfix -> attachra (milter rewrite) -> back to
+# postfix for local delivery, the rewritten message lands in the
+# postfix container's /var/spool/mail/root, and its package-page link
+# downloads successfully.
 
 services:
   postfix:
@@ -30,6 +32,22 @@ services:
       - attachra-dev
     depends_on:
       - attachra
+    # Guard against a silent milter-wiring regression: if smtpd_milters
+    # ends up empty or missing the attachra milter (e.g. the dev
+    # postfix/docker-init.d/*.sh overlay script gets placed in a directory
+    # this image doesn't execute), mail would flow through Postfix
+    # completely unprocessed while every other part of the stack still
+    # looks healthy. Fail loudly instead.
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >-
+          postconf -h smtpd_milters 2>/dev/null | grep -q attachra ||
+          { echo "FATAL: smtpd_milters does not reference the attachra milter (dev init script did not run - see deploy/dev/postfix/docker-init.d/10-attachra-main-cf.sh)" >&2; exit 1; }
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   minio:
     image: minio/minio:latest
