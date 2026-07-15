@@ -20,8 +20,7 @@ vulnerabilities.**
 
 Report privately to:
 
-**security@attachra.org** *(placeholder — will be confirmed/updated
-before the first public release)*
+**security@attachra.org**
 
 Include as much of the following as you can:
 
