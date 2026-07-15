@@ -127,6 +127,13 @@ attach the milter to.
    sudo apt install ./attachra_${version}_amd64.deb
    ```
 
+   Or use the convenience installer (read it first — it only downloads
+   the release `.deb`, verifies checksums and runs `apt`):
+
+   ```sh
+   curl -fsSL https://attachra.org/install | sudo bash
+   ```
+
    Or build it yourself — no Debian tooling is required to build it, only
    to install it, since Attachra is a cross-compiled static binary
    ([ADR-001](docs/Attachra_ADR.md#adr-001-language)): `make build-deb`
