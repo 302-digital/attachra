@@ -2,9 +2,11 @@ name: Release
 
 # Publishes the two artifacts a self-hosted install actually needs: the
 # .deb packages (linux/amd64+arm64) attached to the GitHub Release, and a
-# multi-arch container image pushed to GHCR. Mirrors the internal build
-# pipeline that already does this on a tag, just aimed at the public
-# registries instead.
+# multi-arch container image pushed to GHCR. Both are signed keylessly
+# with cosign (Sigstore/Fulcio via GitHub OIDC, no private key material
+# anywhere) — see "Verifying releases" in README.md for the verification
+# commands. Mirrors the internal build pipeline that already does this on
+# a tag, just aimed at the public registries instead.
 on:
   push:
     tags:
@@ -118,9 +120,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Exchanged for a short-lived GitHub OIDC token that Fulcio uses to
+      # mint a one-time signing certificate for cosign's keyless mode —
+      # no signing key is stored or managed anywhere.
+      id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ needs.guard.outputs.release_tag }}
           fetch-depth: 0
@@ -139,13 +145,30 @@ jobs:
           cd dist
           sha256sum *.deb > SHA256SUMS
 
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Signs the checksum file rather than each .deb individually:
+      # SHA256SUMS already binds to every package by hash, so one
+      # signature over it transitively covers all of them. Keyless
+      # (Sigstore/Fulcio, no key material — see the job's id-token
+      # permission comment above). The bundle format is cosign's current
+      # recommendation over separate .sig/.pem files, and is one of the
+      # asset patterns OpenSSF Scorecard's Signed-Releases check
+      # recognizes.
+      - name: Sign checksums (keyless)
+        run: |
+          cosign sign-blob --yes \
+            --bundle dist/SHA256SUMS.sigstore.json \
+            dist/SHA256SUMS
+
       # Release notes are expected to already exist on this tag's GitHub
       # Release (written by a human before the tag is pushed, per the
       # release checklist). If the tag arrives before the release notes
       # do, action-gh-release creates the release with an empty body —
       # that's intentional fallback behavior, not a bug in this workflow.
       - name: Attach assets to the GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -155,6 +178,7 @@ jobs:
           files: |
             dist/*.deb
             dist/SHA256SUMS
+            dist/SHA256SUMS.sigstore.json
 
   image:
     name: Build and publish container image
@@ -163,9 +187,13 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # Exchanged for a short-lived GitHub OIDC token that Fulcio uses to
+      # mint a one-time signing certificate for cosign's keyless mode —
+      # no signing key is stored or managed anywhere.
+      id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ needs.guard.outputs.release_tag }}
 
@@ -210,7 +238,8 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -222,3 +251,17 @@ jobs:
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Signs the image by its content digest, not by tag: the digest is
+      # immutable and every tag above (including a promoted :latest)
+      # resolves to this same one, so a single signature covers all of
+      # them. Keyless (Sigstore/Fulcio via GitHub OIDC — see the job's
+      # id-token permission comment above); reuses the registry session
+      # the login step already established.
+      - name: Sign the container image (keyless)
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/302-digital/attachra@${IMAGE_DIGEST}"
