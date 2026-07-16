@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-07-16
+
+### Added
+
+- **Signed releases.** Release artifacts are now signed with cosign
+  (keyless, GitHub OIDC): the container image is signed by digest, and
+  `SHA256SUMS` ships with a Sigstore bundle
+  (`SHA256SUMS.sigstore.json`). A new "Verifying releases" section in
+  the README documents the two verification commands.
+
+### Changed
+
+- Dependency updates: `spf13/cobra` 1.10.2 and the `aws-sdk-go-v2`
+  modules used by the S3 storage driver (config 1.32.30, credentials
+  1.19.29, s3 1.105.1). No behavior changes.
+- CI: every GitHub Action bumped to its current major (checkout v7,
+  build-push-action v7, gitleaks-action v3, golangci-lint-action v9,
+  action-gh-release v3) — the only breaking change in all five is the
+  Node 24 runtime, which GitHub-hosted runners already provide.
+
 ## [0.2.0] - 2026-07-16
 
 A REST API and a companion CLI client, link lifecycle management
@@ -186,5 +206,6 @@ trail. Single static binary, linux/amd64 + linux/arm64.
 - Container image built by CI from git tags and pushed to the project
   container registry (Kaniko, staging branch and version tags).
 
+[0.2.1]: https://github.com/302-digital/attachra/releases/tag/v0.2.1
 [0.2.0]: https://github.com/302-digital/attachra/releases/tag/v0.2.0
 [0.1.0]: https://github.com/302-digital/attachra/releases/tag/v0.1.0

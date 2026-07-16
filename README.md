@@ -16,7 +16,7 @@ handles a problem your MTA and your spam/AV stack don't: what happens to
 
 ![Demo: an outbound attachment is replaced with a personal download link, downloaded, then revoked](docs/assets/demo.gif)
 
-> **Status: v0.2.0 released.** The full pipeline — Postfix milter → MIME
+> **Status: v0.2.1 released.** The full pipeline — Postfix milter → MIME
 > parsing → policy engine → S3/filesystem storage → personal download link →
 > MIME rewrite → audit trail — works end to end and has been **tested in
 > production on a live [grommunio](https://grommunio.com/) (Postfix-based)
@@ -93,7 +93,7 @@ Exchange, Exim, Stalwart) as adapters later, without touching the core.
 
 ## Status & roadmap
 
-**v0.2.0 is released.** The architecture and scope decisions are recorded in
+**v0.2.1 is released.** The architecture and scope decisions are recorded in
 [`docs/Attachra_ADR.md`](docs/Attachra_ADR.md); the milestone breakdown and
 what's planned next live in [`ROADMAP.md`](ROADMAP.md) and the repo's
 issues and milestones.
@@ -124,7 +124,7 @@ attach the milter to.
    On your Debian 13 mail server:
 
    ```sh
-   version=0.2.0   # match the release you want
+   version=0.2.1   # match the release you want
    curl -LO https://github.com/302-digital/attachra/releases/download/v${version}/attachra_${version}_amd64.deb
    curl -LO https://github.com/302-digital/attachra/releases/download/v${version}/SHA256SUMS
    sha256sum -c SHA256SUMS --ignore-missing
@@ -221,6 +221,33 @@ Then watch `docker compose logs -f attachra` to see the milter session,
 the policy decision, the upload to MinIO, and the rewritten MIME body with
 its download link. This environment is for exploration only — for a real
 deployment, use Option A.
+
+## Verifying releases
+
+Every tagged release is signed keylessly with [cosign](https://docs.sigstore.dev/)
+(Sigstore/Fulcio via GitHub Actions OIDC — no private key exists to leak
+or rotate). `cosign` binaries are at
+[github.com/sigstore/cosign/releases](https://github.com/sigstore/cosign/releases).
+
+Verify the `.deb` checksums (`SHA256SUMS.sigstore.json` is published
+alongside `SHA256SUMS` on every [GitHub Release](https://github.com/302-digital/attachra/releases)):
+
+```sh
+cosign verify-blob SHA256SUMS \
+  --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp '^https://github\.com/302-digital/attachra/\.github/workflows/release\.yml@.+$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Verify the container image (sign by digest — resolve `:vX.Y.Z` to a
+digest first, since only the digest is signed):
+
+```sh
+digest=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/302-digital/attachra:v0.2.0)
+cosign verify "$digest" \
+  --certificate-identity-regexp '^https://github\.com/302-digital/attachra/\.github/workflows/release\.yml@.+$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
 
 ## Open-core: what's free, forever
 
