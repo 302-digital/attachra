@@ -15,7 +15,7 @@ handles a problem your MTA and your spam/AV stack don't: what happens to
 
 ![Demo: an outbound attachment is replaced with a personal download link, downloaded, then revoked](docs/assets/demo.gif)
 
-> **Status: v0.1.0 released.** The full pipeline — Postfix milter → MIME
+> **Status: v0.2.0 released.** The full pipeline — Postfix milter → MIME
 > parsing → policy engine → S3/filesystem storage → personal download link →
 > MIME rewrite → audit trail — works end to end and has been **tested in
 > production on a live [grommunio](https://grommunio.com/) (Postfix-based)
@@ -92,7 +92,7 @@ Exchange, Exim, Stalwart) as adapters later, without touching the core.
 
 ## Status & roadmap
 
-**v0.1.0 is released.** The architecture and scope decisions are recorded in
+**v0.2.0 is released.** The architecture and scope decisions are recorded in
 [`docs/Attachra_ADR.md`](docs/Attachra_ADR.md); the milestone breakdown and
 what's planned next live in [`ROADMAP.md`](ROADMAP.md) and the repo's
 issues and milestones.
@@ -123,7 +123,7 @@ attach the milter to.
    On your Debian 13 mail server:
 
    ```sh
-   version=0.1.0   # match the release you want
+   version=0.2.0   # match the release you want
    curl -LO https://github.com/302-digital/attachra/releases/download/v${version}/attachra_${version}_amd64.deb
    curl -LO https://github.com/302-digital/attachra/releases/download/v${version}/SHA256SUMS
    sha256sum -c SHA256SUMS --ignore-missing
