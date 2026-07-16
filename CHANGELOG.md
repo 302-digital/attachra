@@ -5,18 +5,90 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-07-16
 
-### Fixed
+A REST API and a companion CLI client, link lifecycle management
+(hold/revoke/retention), a guided setup wizard and install diagnostics,
+and first-class packaging (Debian package, Docker image, one-line
+installer). Also two pipeline hardening fixes surfaced by a live
+production pilot: inline (CID) assets and message bodies are no longer
+at risk from a broad `replace` policy.
 
-- **Structural body parts are never replace candidates**: a
-  `default: replace` policy previously destroyed message bodies, because
-  every leaf MIME part — including the text/plain and text/html body
-  itself — was submitted to policy evaluation. The message body is now
-  always excluded from evaluation and delivered intact.
+### Added
+
+- **REST API** (US-8.1): a versioned admin API under `/api/v1` covering
+  everything an operator previously had to do by hand or by reaching
+  into the database — inspect processed messages and attachments;
+  list, hold, unhold and revoke download links (one at a time, by
+  message, or by sender); view, validate, reload and dry-run the active
+  policy; pull summary and per-domain deliverability stats; and page or
+  stream-export the audit log. Authentication is Bearer-token,
+  deny-by-default, with three roles (`admin`, `viewer`, `auditor`);
+  bootstrap the first token with `attachra token create`. Repeated
+  invalid-token attempts are throttled, and creating or revoking a
+  token is itself recorded in the audit trail. The OpenAPI spec
+  (`api/openapi.yaml`) is the source of truth and is linted in CI.
+- **`attachractl`**: a second, self-contained binary that is a pure
+  REST API client for the API above — `policy`, `links`, `stats`,
+  `audit` and `token` subcommands, human-readable tables or `--json`,
+  TLS verification on by default. The API token is only ever read from
+  a file, an environment variable, or a config file, never a
+  command-line flag, so it can't leak into `ps` output or shell
+  history.
+- **`attachra link hold` / `unhold` / `revoke`** (US-6.3): put a link
+  under legal hold, clear a hold, or revoke it — one link at a time,
+  every link on a message, or every link ever sent by a given sender
+  address. A held link refuses revocation until the hold is cleared.
+- **Automatic attachment retention** (US-5.3): a background job deletes
+  stored attachments once their retention period has passed (30 days by
+  default, configurable globally via `links.default_retention_seconds`
+  or per policy), runs hourly by default (`retention.interval_seconds`),
+  and skips anything under legal hold instead of deleting it.
+- **`attachra setup`**: a guided first-run wizard that writes a working
+  config, interactively or non-interactively via flags, and starts new
+  installs in dry-run/log-only mode by default. It makes a best-effort,
+  advisory-only guess at the mail stack it's running alongside (plain
+  Postfix, grommunio, Mailcow, iRedMail) to suggest sane defaults — it
+  never modifies that other software.
+- **`attachra doctor`**: one command to check whether an install is
+  actually healthy — config and policy loading, storage and database
+  directory permissions, whether the HTTP and milter ports are
+  listening, whether the public download URL and SPF record look
+  right, and whether Postfix is actually wired to the milter. Supports
+  `--json` for scripting.
+- Man pages and shell completions for both `attachra` and `attachractl`.
+- Official Debian packages (amd64 and arm64), built with a hardened
+  systemd unit (dynamic unprivileged user, filesystem/network
+  sandboxing), published with checksums on every GitHub release.
+- A Docker image, published to `ghcr.io/302-digital/attachra`.
+- A one-line install/uninstall script for the Debian package
+  (`curl -fsSL https://attachra.org/install | sudo bash`, see the
+  README Quickstart). Neither script touches Postfix or writes a
+  config — that's what `attachra setup` is for.
+- `http.trusted_proxies`: a CIDR allowlist for a co-located reverse
+  proxy (e.g. nginx in front of the download page and API). Configure
+  it so audit records and rate limiting see the real client IP instead
+  of the proxy's; left empty (the default), behavior is unchanged from
+  v0.1.0.
+- A per-message `INFO` log line (`milter: message processed`) is now
+  written by the milter for every ordinary message handled, not just
+  errors — previously an operator tailing logs had no confirmation a
+  message was even seen unless something went wrong.
+- Supply-chain hardening: OpenSSF Scorecard (badge in the README),
+  CodeQL scanning, Dependabot and `govulncheck` are now part of CI, and
+  every GitHub Action and base image is pinned to a specific
+  commit/digest.
 
 ### Changed
 
+- **A `default: replace` policy no longer risks the message body.**
+  Every leaf MIME part, including the message's own text/plain and
+  text/html body, is evaluated against policy as normal, but a body
+  part's `replace` decision is now automatically downgraded to `pass`
+  instead of being dropped or corrupted; a `block` rule matching the
+  body's actual (detected, not declared) content still rejects the
+  message. Downgrades are recorded in the audit trail (`body_protected`
+  detail) and as a metric label.
 - **Inline (CID) attachment protection** (ADR-016): a
   presentation-inline asset (e.g. a logo or signature image referenced
   from the HTML body via `cid:`, inside `multipart/related`) decided
@@ -37,6 +109,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operators needing a different language can supply
   `TextTemplatePath`/`HTMLTemplatePath` overrides pointing at a custom
   template.
+
+### Fixed
+
+- **The filesystem storage driver no longer crash-loops on a fresh
+  install.** It previously required its configured storage directory
+  to already exist; a freshly installed system only has its parent
+  directory created for it, so every clean install failed to start.
+  The directory is now created automatically if missing.
+- **Debian package versions built from a development commit now
+  compare correctly for upgrades.** A package built from a commit with
+  no reachable release tag previously fell back to a bare short commit
+  hash as its version, which `dpkg` treats as newer than any real
+  release and breaks upgrade ordering. It now falls back to the latest
+  known release tag plus a commit suffix instead.
 
 ## [0.1.0] - 2026-07-09
 
@@ -91,4 +177,5 @@ trail. Single static binary, linux/amd64 + linux/arm64.
 - Container image built by CI from git tags and pushed to the project
   container registry (Kaniko, staging branch and version tags).
 
+[0.2.0]: https://github.com/302-digital/attachra/releases/tag/v0.2.0
 [0.1.0]: https://github.com/302-digital/attachra/releases/tag/v0.1.0
