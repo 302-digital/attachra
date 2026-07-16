@@ -5,6 +5,7 @@
 [![Go Version](https://img.shields.io/github/go-mod/go-version/302-digital/attachra)](go.mod)
 [![Latest Release](https://img.shields.io/github/v/release/302-digital/attachra)](https://github.com/302-digital/attachra/releases)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/302-digital/attachra/badge)](https://scorecard.dev/viewer/?uri=github.com/302-digital/attachra)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13635/badge)](https://www.bestpractices.dev/projects/13635)
 
 **Open Attachment Gateway** — a self-hosted policy engine that governs how
 files leave your organization by email.
