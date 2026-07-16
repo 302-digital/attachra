@@ -131,6 +131,15 @@ Postfix milter → MIME parsing → policy engine → object storage → persona
 links → MIME rewrite → recipient download page, with an append-only audit
 trail. Single static binary, linux/amd64 + linux/arm64.
 
+> **Note on the published v0.1.0 packages.** The v0.1.0 packages and
+> container image published on GitHub were built from a 2026-07-15
+> development snapshot, which already included early versions of several
+> features documented under 0.2.0 — the REST API, `attachractl`, link
+> lifecycle management, retention, and the setup wizard. 0.2.0 is the
+> first release in which those features are properly versioned and
+> documented. The entries below describe the original v0.1.0 release
+> line.
+
 ### Added
 
 - **Postfix milter adapter** (US-2.1): milter server with session lifecycle,
@@ -166,7 +175,7 @@ trail. Single static binary, linux/amd64 + linux/arm64.
 - **Project foundation** (US-1.1/1.2/1.3): single static binary with
   version from `git describe` (`attachra --version`), YAML + env configuration
   with startup validation, structured logging (slog), Makefile, golangci-lint,
-  GitLab CI (build + race tests + lint + cross-compile), docker-compose dev
+  CI (build + race tests + lint + cross-compile), docker-compose dev
   environment with Postfix + MinIO, e2e test harness, security hardening of
   the skeleton (SR-113).
 
