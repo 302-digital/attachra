@@ -145,7 +145,7 @@ jobs:
       # do, action-gh-release creates the release with an empty body —
       # that's intentional fallback behavior, not a bug in this workflow.
       - name: Attach assets to the GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
