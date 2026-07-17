@@ -25,4 +25,13 @@
 // --token-file or the config file's token/token_file field) or the
 // ATTACHRACTL_TOKEN environment variable, and it is never logged or
 // echoed back by this CLI.
+//
+// Whichever file the token lives in (--token-file, the config file's
+// token_file, or an inline token: in the config file itself) should be
+// chmod 0600 — readable and writable only by its owner. attachractl
+// checks this on every invocation and prints a WARNING to stderr (it
+// does not refuse to run, since an operator may have deliberate
+// reasons, e.g. a read-only mount inside a container image with its
+// own access controls) when the file grants group or other access
+// (SR-130-2).
 package main

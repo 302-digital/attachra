@@ -43,13 +43,22 @@ func parseHeaderBlock(raw []byte) (textprotoHeader, error) {
 // injects the replacement block as a new multipart/alternative
 // sibling if descending never found an existing text/plain or
 // text/html leaf to append it to (see rewriteLeaf).
-func (rw *rewriter) rewriteMultipart(br *bufio.Reader, dst io.Writer, boundary, partPath string) error {
+// topLevel reports whether this call's output is written directly to
+// Rewrite's final output (true) rather than being embedded as the
+// body of some enclosing part — a nested multipart/* child, a
+// message/rfc822 envelope's own body, or the synthesized
+// attachra-block-* alternative part (false). It is threaded through so
+// the boundaryWriter constructed here knows whether its own closing
+// delimiter owns the message's final trailing CRLF; see
+// boundaryWriter.finalCRLF's doc comment for why getting this wrong
+// corrupts the message.
+func (rw *rewriter) rewriteMultipart(br *bufio.Reader, dst io.Writer, boundary, partPath string, topLevel bool) error {
 	if boundary == "" {
 		return fmt.Errorf("rewrite: part %q: multipart Content-Type missing boundary parameter", partPath)
 	}
 
 	rmr := newRawMultipartReader(br, boundary)
-	bw := &boundaryWriter{dst: dst, boundary: boundary}
+	bw := &boundaryWriter{dst: dst, boundary: boundary, finalCRLF: topLevel}
 
 	for i := 1; ; i++ {
 		part, err := rmr.NextPart()
@@ -79,7 +88,7 @@ func (rw *rewriter) rewriteMultipart(br *bufio.Reader, dst io.Writer, boundary, 
 			if _, err := buf.Write(part.HeaderBytes); err != nil {
 				return fmt.Errorf("rewrite: part %q: write header: %w", childPath, err)
 			}
-			if err := rw.rewriteMultipart(bufio.NewReaderSize(part.Body, 32*1024), &buf, params["boundary"], childPath); err != nil {
+			if err := rw.rewriteMultipart(bufio.NewReaderSize(part.Body, 32*1024), &buf, params["boundary"], childPath, false); err != nil {
 				return err
 			}
 			if err := bw.writePart(buf.Bytes()); err != nil {
@@ -138,6 +147,35 @@ type boundaryWriter struct {
 	dst      io.Writer
 	boundary string
 	wroteAny bool
+
+	// finalCRLF controls whether writeClosing appends a trailing CRLF
+	// after the closing "--boundary--" delimiter it writes.
+	//
+	// This must be true only for a boundaryWriter whose output is
+	// written directly to Rewrite's final output — the truly
+	// outermost multipart structure of the entire rewritten message
+	// (rw.run's top-level rewriteMultipart call, topLevel=true) and
+	// rewriteTopLevelSinglePart's synthesized wrapper — matching every
+	// fixture in internal/core/message/testdata, which all end with a
+	// single trailing CRLF after the top-level closing delimiter.
+	//
+	// It must be false for every other boundaryWriter: a nested
+	// multipart/* child (rewriteMultipart's own recursion), a
+	// message/rfc822 envelope's own body (rewriteNestedMessage), or
+	// the synthesized attachra-block-* alternative part
+	// (appendFallbackAlternativePart). All of these write into a
+	// buffer that becomes the *body* of some enclosing part, written
+	// out via that enclosing boundaryWriter's own writePart. Per RFC
+	// 2046 §5.1, the CRLF that would follow such a closing delimiter
+	// is not this boundary's own to give — it is supplied by whatever
+	// comes next in the enclosing structure (the next sibling's own
+	// leading "\r\n--boundary" prefix, or, transitively, the outermost
+	// writeClosing's own final CRLF). Setting this true unconditionally
+	// duplicated that CRLF, corrupting every nested-multipart message
+	// with a spurious blank line before each nested closing delimiter
+	// — the exact defect ATR-235's round-trip corpus test
+	// (roundtrip_test.go) was written to catch, and did.
+	finalCRLF bool
 }
 
 // writePart writes the delimiter line for the next part slot (with a
@@ -158,13 +196,19 @@ func (bw *boundaryWriter) writePart(partBytes []byte) error {
 	return nil
 }
 
-// writeClosing writes the closing "--boundary--" delimiter.
+// writeClosing writes the closing "--boundary--" delimiter, followed
+// by a trailing CRLF only if bw.finalCRLF is set (see its doc
+// comment).
 func (bw *boundaryWriter) writeClosing() error {
 	prefix := "--"
 	if bw.wroteAny {
 		prefix = "\r\n--"
 	}
-	if _, err := fmt.Fprintf(bw.dst, "%s%s--\r\n", prefix, bw.boundary); err != nil {
+	suffix := ""
+	if bw.finalCRLF {
+		suffix = "\r\n"
+	}
+	if _, err := fmt.Fprintf(bw.dst, "%s%s--%s", prefix, bw.boundary, suffix); err != nil {
 		return fmt.Errorf("rewrite: write closing boundary: %w", err)
 	}
 	return nil
@@ -254,7 +298,15 @@ func (rw *rewriter) rewriteNestedMessage(body io.Reader, dst io.Writer, partPath
 	}
 
 	if strings.HasPrefix(mediaType, "multipart/") {
-		return rw.rewriteMultipart(br, dst, params["boundary"], partPath)
+		// The nested envelope's own multipart body is embedded as this
+		// leaf's content within the outer structure, not written
+		// directly to Rewrite's final output, so it must not own a
+		// final trailing CRLF either (see boundaryWriter.finalCRLF's
+		// doc comment; internal/core/message/testdata/nested_message_rfc822.eml
+		// confirms real messages have no blank line between a nested
+		// envelope's own closing delimiter and the outer envelope's
+		// next boundary).
+		return rw.rewriteMultipart(br, dst, params["boundary"], partPath, false)
 	}
 
 	// A non-multipart nested message: its single body is one leaf at

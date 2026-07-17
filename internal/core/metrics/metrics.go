@@ -49,12 +49,16 @@ type Metrics struct {
 
 	// AttachmentsDecided counts every attachment the policy engine
 	// evaluated, by decided action: "pass", "replace", or "block"
-	// (policy.Action's three values), plus two protective-downgrade
-	// labels recorded in addition to (not instead of) that same
-	// attachment's "pass" observation: "inline_protected" (ADR-016,
+	// (policy.Action's three values), plus protective-downgrade labels
+	// recorded in addition to (not instead of) that same attachment's
+	// "pass" observation: "inline_protected" (ADR-016,
 	// pipeline.protectInlineAssets — a presentation-inline asset under
-	// the configured size, downgraded from replace to pass) and
-	// "body_protected" (pipeline.protectStructuralBodies — the
+	// the configured size, downgraded from replace to pass),
+	// "inline_protected_unverified" (a subset of "inline_protected":
+	// the asset's cid: reference could not be verified — its text/html
+	// body was truncated beyond the scan bound or unreadable — so it was
+	// protected on ADR-016 phase-1 grounds alone; ATR-307, threat-model
+	// T2.8) and "body_protected" (pipeline.protectStructuralBodies — the
 	// message's own text/plain or text/html body, downgraded from
 	// replace to pass; ATR-306).
 	AttachmentsDecided *prometheus.CounterVec
@@ -86,7 +90,28 @@ type Metrics struct {
 	// "held_skipped" (expired but excluded because a link on it is
 	// under legal hold, ATR-259), or "error" (storage/metadata deletion
 	// failed for that attachment; the sweep continues with the rest).
+	// The total number of attachments a sweep pass scanned is the sum
+	// across all three labels — a separate "scanned" counter would only
+	// double the same count under a different name (ATR-295).
 	RetentionCleanups *prometheus.CounterVec
+
+	// RetentionExpiredLinks counts every Link row the background
+	// retention sweep (internal/core/retention, US-5.3/ATR-179) marks
+	// LinkStatusExpired via its ExpireStaleLinks step, each sweep pass
+	// (ATR-295). This is a distinct bookkeeping population from
+	// RetentionCleanups: a link can and typically does expire (its own
+	// ExpiresAt elapses) well before its underlying attachment's
+	// separate RetainUntil deadline is reached, so it is not derivable
+	// from RetentionCleanups' outcome counts.
+	RetentionExpiredLinks prometheus.Counter
+
+	// AuditEventsTruncated counts audit-log events removed by the
+	// background retention sweep's checkpoint truncation (ATR-308,
+	// ADR-017). It stays at zero while audit retention is disabled (the
+	// default). No labels: truncation has a single outcome (events
+	// removed), and the accompanying checkpoint audit event carries the
+	// detailed accounting (anchor seq/hash, cutoff, held-clamped).
+	AuditEventsTruncated prometheus.Counter
 
 	// APIAuthFailures counts every REST API request rejected by the
 	// auth middleware (US-8.1/T-8.1.2, ATR-196), by reason:
@@ -143,6 +168,16 @@ func New() *Metrics {
 			Name:      "retention_cleanups_total",
 			Help:      "Total number of attachments processed by the background retention sweep, by outcome.",
 		}, []string{"result"}),
+		RetentionExpiredLinks: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "retention_expired_links_total",
+			Help:      "Total number of link rows marked expired by the background retention sweep.",
+		}),
+		AuditEventsTruncated: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "audit_events_truncated_total",
+			Help:      "Total number of audit-log events removed by retention checkpoint truncation (0 while audit retention is disabled).",
+		}),
 		APIAuthFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "api_auth_failures_total",
@@ -158,6 +193,8 @@ func New() *Metrics {
 		m.Errors,
 		m.MessageProcessingSeconds,
 		m.RetentionCleanups,
+		m.RetentionExpiredLinks,
+		m.AuditEventsTruncated,
 		m.APIAuthFailures,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
@@ -220,6 +257,28 @@ func (m *Metrics) ObserveRetentionCleanup(result string) {
 		return
 	}
 	m.RetentionCleanups.WithLabelValues(result).Inc()
+}
+
+// ObserveRetentionExpiredLinks adds n to the count of link rows marked
+// expired by one Sweep call's ExpireStaleLinks step (see the
+// RetentionExpiredLinks field's doc comment). n may be 0, a harmless
+// no-op Add: callers are not required to skip the call when nothing
+// was expired.
+func (m *Metrics) ObserveRetentionExpiredLinks(n int) {
+	if m == nil {
+		return
+	}
+	m.RetentionExpiredLinks.Add(float64(n))
+}
+
+// ObserveAuditTruncation records that one audit checkpoint truncation
+// removed n events (ATR-308, ADR-017). n <= 0 is a no-op, so a pass that
+// truncated nothing does not perturb the counter.
+func (m *Metrics) ObserveAuditTruncation(n int64) {
+	if m == nil || n <= 0 {
+		return
+	}
+	m.AuditEventsTruncated.Add(float64(n))
 }
 
 // ObserveAPIAuthFailure records one REST API request rejected by the

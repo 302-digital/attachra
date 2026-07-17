@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/302-digital/attachra/internal/core/mail"
 	"github.com/302-digital/attachra/internal/core/store"
 )
 
@@ -24,9 +25,11 @@ const (
 //
 // Every filter in p is combined with AND into a single parameterized
 // query — message_id and status are exact matches, recipient is an
-// exact case-insensitive match, from/to bound created_at — with every
-// value bound as a placeholder argument, never interpolated into the
-// SQL text.
+// exact match against the mail.NormalizeAddress canonical form (the
+// argument is normalized in Go before binding, matching how every
+// write path already stores it, ATR-293), from/to bound created_at —
+// with every value bound as a placeholder argument, never interpolated
+// into the SQL text.
 func (s *Store) ListLinks(ctx context.Context, p store.LinkListParams) (store.LinkPage, error) {
 	limit := store.ClampLimit(p.Limit, defaultLinkPageSize, maxLinkPageSize)
 
@@ -38,8 +41,8 @@ func (s *Store) ListLinks(ctx context.Context, p store.LinkListParams) (store.Li
 		args = append(args, p.MessageID)
 	}
 	if p.Recipient != "" {
-		conds = append(conds, "LOWER(recipient) = LOWER(?)")
-		args = append(args, p.Recipient)
+		conds = append(conds, "recipient = ?")
+		args = append(args, mail.NormalizeAddress(p.Recipient))
 	}
 	if p.Status != "" {
 		conds = append(conds, "status = ?")

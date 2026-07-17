@@ -1,0 +1,7 @@
+-- 000007_normalize_addresses.up.sql is a lossy, one-way data cleanup:
+-- once the original casing and angle-bracket wrapping of an address
+-- have been discarded, there is no record left anywhere in the
+-- database of what they were, so there is nothing meaningful to
+-- restore here. A schema-reversing migration would DROP a column;
+-- this migration touched no schema, only row content, so its "down"
+-- is intentionally a no-op rather than a fabricated undo.

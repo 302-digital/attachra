@@ -10,17 +10,19 @@ import (
 // servePackagePage implements GET /p/<token>: step 1 of the two-step
 // download flow (SR-125-3, docs/architecture/package-page-decision.md
 // §4.1 item 3). It resolves token, lists every Link belonging to the
-// message, renders each as an available/unavailable row, and returns
-// without ever streaming attachment bytes or touching any Link's
-// download counter — a link-preview bot fetching this URL costs the
-// recipient nothing.
+// message and addressed to the token's own recipient (ATR-237: other
+// recipients' Link rows for the same message are never shown here),
+// renders each as an available/unavailable row, and returns without
+// ever streaming attachment bytes or touching any Link's download
+// counter — a link-preview bot fetching this URL costs the recipient
+// nothing.
 func (h *Handler) servePackagePage(w http.ResponseWriter, r *http.Request, token string) {
-	messageID, ok := h.resolvePackage(w, r, token)
+	messageID, recipient, ok := h.resolvePackage(w, r, token)
 	if !ok {
 		return
 	}
 
-	links, err := h.engine.ListPackageFiles(r.Context(), messageID)
+	links, err := h.engine.ListPackageFiles(r.Context(), messageID, recipient)
 	if err != nil {
 		h.notFound(w, r, "package_page_view", token, "list package files failed: "+err.Error())
 		return

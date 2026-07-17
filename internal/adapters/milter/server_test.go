@@ -283,6 +283,36 @@ func TestMilter_Accept(t *testing.T) {
 	}
 }
 
+// TestMilter_NormalizesSenderAndRecipientAddresses is the milter-side
+// regression for ATR-293 (closing the ATR-258 review's N1 finding): the
+// backend's MailFrom/RcptTo must hand the Core a normalized Envelope
+// even when the client sends the raw MAIL/RCPT command argument with
+// SMTP reverse/forward-path angle brackets and mixed case, and no
+// {mail_addr}/{rcpt_addr} macro to fall back to (dmilter.NewMacroBag()
+// starts empty, exercising exactly that fallback path in
+// backend.MailFrom/RcptTo) — otherwise a message recorded as
+// "<Alice@EXAMPLE.com>" would silently not be found by
+// `attachra link revoke --sender alice@example.com`.
+func TestMilter_NormalizesSenderAndRecipientAddresses(t *testing.T) {
+	proc := &fakeProcessor{verdict: &pipeline.Verdict{Action: pipeline.VerdictAccept}}
+	addr := startTestServer(t, proc, nil)
+
+	body := []byte("hello world\r\n")
+	_, act := runSession(t, addr, "<Alice@EXAMPLE.com>", "<Bob@EXAMPLE.com>", body)
+
+	requireAccept(t, act)
+
+	if !proc.called {
+		t.Fatal("expected Processor.Process to be called")
+	}
+	if proc.lastEnv.Sender != "alice@example.com" {
+		t.Errorf("Envelope.Sender = %q, want %q (normalized: trimmed, bracket-free, lower-cased)", proc.lastEnv.Sender, "alice@example.com")
+	}
+	if len(proc.lastEnv.Recipients) != 1 || proc.lastEnv.Recipients[0] != "bob@example.com" {
+		t.Errorf("Envelope.Recipients = %v, want [bob@example.com] (normalized)", proc.lastEnv.Recipients)
+	}
+}
+
 // TestMilter_FoldedHeaderPreservedThroughReassembly verifies that a
 // folded (multi-line, RFC 5322 §2.2.3 obs-fold) header value survives
 // backend.Header collection and reassembleMessage's reconstruction

@@ -39,7 +39,7 @@ type ObjectInfo struct {
 type Driver interface {
 	// Put stores size bytes read from r under key, streaming the
 	// data without buffering the whole payload in memory
-	// (CLAUDE.md invariant #4). It must not succeed partially: on
+	// (the streaming invariant). It must not succeed partially: on
 	// error, no object (or a truncated/partial one) must be left
 	// reachable under key.
 	Put(ctx context.Context, key string, r io.Reader, size int64) error

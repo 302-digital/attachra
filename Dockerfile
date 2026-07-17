@@ -4,6 +4,10 @@
 # See docs/Attachra_ADR.md (ADR-001: single static binary) and
 # .claude/agents/atr-devops.md (minimal, non-root, reproducible image).
 
+# Pinned digest resolves to golang:1.26.5-alpine (verified against the
+# Docker Hub registry API and by running `go version` inside the
+# image), matching go.mod's `go 1.26.5` toolchain requirement exactly
+# so the build never needs to download a newer toolchain at build time.
 FROM golang:1.26-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS builder
 
 WORKDIR /src
@@ -17,14 +21,6 @@ COPY . .
 ARG VERSION=dev
 ARG COMMIT=none
 ARG DATE=unknown
-
-# Serial package compilation and capped GC target: compiling
-# modernc.org/sqlite concurrently spikes memory and OOMKills the CI
-# runner (exit 137). Mirrors the internal CI build tuning.
-ENV GOFLAGS=-p=1 \
-    GOMAXPROCS=2 \
-    GOMEMLIMIT=1750MiB \
-    GOGC=50
 
 RUN CGO_ENABLED=0 go build \
     -ldflags "-s -w \

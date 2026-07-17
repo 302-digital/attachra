@@ -239,7 +239,7 @@ func (c *Client) delete(ctx context.Context, path string) ([]byte, error) {
 }
 
 // streamGet issues a GET request and copies the response body directly
-// to w without buffering it in memory (CLAUDE.md invariant #4). Used
+// to w without buffering it in memory (the streaming invariant). Used
 // only by GET /audit/export, whose response is itself an unbounded,
 // streamed newline-delimited JSON document (audit.ExportJSONL).
 func (c *Client) streamGet(ctx context.Context, path string, query url.Values, w io.Writer) error {

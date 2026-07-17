@@ -1,9 +1,11 @@
 package retention_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -550,6 +552,90 @@ func TestSweepStorageErrorLeavesMetadataAndObjectIntact(t *testing.T) {
 	}
 }
 
+// canceledDeleteStorage wraps a storage.Driver, failing Delete for one
+// specific key with an error wrapping context.Canceled — simulating a
+// ctx cancellation landing mid-call inside purgeOne's own storage
+// delete, independent of whether the ctx passed into Sweep is actually
+// canceled. This is the only reliable way to exercise
+// purgeAndRecord's context.Canceled/DeadlineExceeded branch from a
+// black-box test: the ctx-based interruption paths already covered by
+// cancelAfterNDeletesStorage below (and Sweep's own per-attachment/
+// per-chunk ctx.Err() checks) stop the pass *before* purgeAndRecord is
+// ever called for the next attachment, so they never reach that
+// branch themselves.
+type canceledDeleteStorage struct {
+	storage.Driver
+	failKey string
+}
+
+func (c *canceledDeleteStorage) Delete(ctx context.Context, key string) error {
+	if key == c.failKey {
+		return fmt.Errorf("delete %q: %w", key, context.Canceled)
+	}
+	return c.Driver.Delete(ctx, key)
+}
+
+// TestSweepSuppressesContextCanceledAsFailure covers ATR-295's N4: a
+// purge that fails specifically because of ctx cancellation (as
+// opposed to a genuine storage error, already covered by
+// TestSweepStorageErrorLeavesMetadataAndObjectIntact above) must not
+// be counted in Result.Failed nor recorded as an ok=false audit event
+// — purgeAndRecord's own doc comment already documents this
+// suppression as deliberate (a shutdown/timeout landing on one
+// attachment mid-pass is not a per-attachment failure, and treating it
+// as one would flood the audit log every time a sweep pass happens to
+// be interrupted); this test closes the gap that the suppression had
+// no dedicated regression coverage (the existing ctx-cancellation
+// test, TestSweepCtxCancellationSelfHealsOnNextPass, only asserts on
+// the end-state data-safety invariant, not on audit-log volume/
+// Result.Failed, by its own doc comment).
+func TestSweepSuppressesContextCanceledAsFailure(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := context.Background()
+
+	attachmentID, storageKey := seedExpiredAttachment(t, env, "msg-ctx-canceled", false)
+
+	canceledStorage := &canceledDeleteStorage{Driver: env.storage, failKey: storageKey}
+	sweeper, err := retention.New(retention.Params{Metadata: env.store, Storage: canceledStorage, AuditSink: env.store})
+	if err != nil {
+		t.Fatalf("retention.New() error = %v, want nil", err)
+	}
+
+	res, err := sweeper.Sweep(ctx)
+	if err != nil {
+		t.Fatalf("Sweep() error = %v, want nil", err)
+	}
+	if res.Failed != 0 {
+		t.Errorf("Sweep().Failed = %d, want 0 (a ctx-cancellation-caused purge failure must not be counted as a failure)", res.Failed)
+	}
+	if res.Deleted != 0 {
+		t.Errorf("Sweep().Deleted = %d, want 0", res.Deleted)
+	}
+	if res.HeldSkipped != 0 {
+		t.Errorf("Sweep().HeldSkipped = %d, want 0", res.HeldSkipped)
+	}
+
+	// The metadata row must survive untouched, exactly like the
+	// genuine-storage-error case: the next Sweep call (once the
+	// interruption is over) retries it normally.
+	if _, err := env.store.GetAttachment(ctx, attachmentID); err != nil {
+		t.Errorf("GetAttachment() after ctx-canceled purge error = %v, want nil (metadata must survive)", err)
+	}
+
+	var sawEventForAttachment bool
+	if err := env.store.StreamEvents(ctx, audit.Filter{Type: audit.TypeRetentionCleanup}, func(rec audit.Recorded) error {
+		if rec.Details["attachment_id"] == attachmentID {
+			sawEventForAttachment = true
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("StreamEvents() error = %v, want nil", err)
+	}
+	if sawEventForAttachment {
+		t.Error("a per-attachment audit event was recorded for a purge that failed only because of ctx cancellation; want none (N4)")
+	}
+}
+
 // cancelAfterNDeletesStorage wraps a storage.Driver, canceling ctx once
 // its Delete method has been called n times, simulating a shutdown/
 // timeout landing mid-pass.
@@ -621,5 +707,182 @@ func TestSweepCtxCancellationSelfHealsOnNextPass(t *testing.T) {
 		if !metaGone || !storGone {
 			t.Errorf("attachment %d not fully cleaned up after the recovery pass: metadata gone=%v, storage gone=%v (want both true, no permanent half-state)", i, metaGone, storGone)
 		}
+	}
+}
+
+// seedAuditEvent records an audit event with an explicit timestamp so a
+// Sweep-level test can control which events fall before the cutoff.
+func seedAuditEvent(t *testing.T, env testEnv, ts time.Time) {
+	t.Helper()
+	if _, err := env.store.Record(context.Background(), audit.Event{
+		Timestamp: ts,
+		Type:      audit.TypeMessageProcessed,
+		Actor:     "milter",
+		MessageID: "m",
+		Details:   map[string]any{"k": "v"},
+	}); err != nil {
+		t.Fatalf("Record() error = %v, want nil", err)
+	}
+}
+
+func countAuditRows(t *testing.T, env testEnv) int {
+	t.Helper()
+	var n int
+	if err := env.store.StreamEvents(context.Background(), audit.Filter{}, func(audit.Recorded) error {
+		n++
+		return nil
+	}); err != nil {
+		t.Fatalf("StreamEvents() error = %v, want nil", err)
+	}
+	return n
+}
+
+// TestSweepLeavesAuditUntouchedByDefault pins the opt-in default (ADR-017,
+// ATR-308): with no AuditTruncator/AuditRetention configured, a sweep pass
+// never touches the append-only audit log, however old its rows are.
+func TestSweepLeavesAuditUntouchedByDefault(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := context.Background()
+
+	for i := 0; i < 5; i++ {
+		seedAuditEvent(t, env, time.Now().Add(-100*24*time.Hour).Add(time.Duration(i)*time.Minute))
+	}
+	before := countAuditRows(t, env)
+
+	// Default Params: no AuditTruncator, no AuditRetention.
+	sweeper, err := retention.New(retention.Params{Metadata: env.store, Storage: env.storage, AuditSink: env.store})
+	if err != nil {
+		t.Fatalf("retention.New() error = %v, want nil", err)
+	}
+	res, err := sweeper.Sweep(ctx)
+	if err != nil {
+		t.Fatalf("Sweep() error = %v, want nil", err)
+	}
+	if res.AuditTruncated != 0 {
+		t.Errorf("AuditTruncated = %d, want 0 (retention disabled by default)", res.AuditTruncated)
+	}
+	if got := countAuditRows(t, env); got != before {
+		t.Errorf("audit rows = %d, want %d unchanged (append-only preserved)", got, before)
+	}
+}
+
+// TestSweepTruncatesAuditWhenConfigured covers the wired path: with a
+// Truncator and a positive retention window, a sweep pass truncates the
+// old audit prefix and reports the count.
+func TestSweepTruncatesAuditWhenConfigured(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := context.Background()
+
+	// 6 old events (~100 days ago) + 2 recent (now): with a 1h retention
+	// window the 6 old ones are eligible, the 2 recent survive.
+	for i := 0; i < 6; i++ {
+		seedAuditEvent(t, env, time.Now().Add(-100*24*time.Hour).Add(time.Duration(i)*time.Minute))
+	}
+	for i := 0; i < 2; i++ {
+		seedAuditEvent(t, env, time.Now())
+	}
+
+	sweeper, err := retention.New(retention.Params{
+		Metadata:       env.store,
+		Storage:        env.storage,
+		AuditSink:      env.store,
+		AuditTruncator: env.store,
+		AuditRetention: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("retention.New() error = %v, want nil", err)
+	}
+	res, err := sweeper.Sweep(ctx)
+	if err != nil {
+		t.Fatalf("Sweep() error = %v, want nil", err)
+	}
+	if res.AuditTruncated != 6 {
+		t.Errorf("AuditTruncated = %d, want 6", res.AuditTruncated)
+	}
+
+	// Exactly one checkpoint event now exists, and the two recent rows
+	// survive alongside it (2 data + 1 checkpoint = 3).
+	var checkpoints, total int
+	if err := env.store.StreamEvents(ctx, audit.Filter{}, func(rec audit.Recorded) error {
+		total++
+		if rec.Type == audit.TypeRetentionCheckpoint {
+			checkpoints++
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("StreamEvents() error = %v, want nil", err)
+	}
+	if checkpoints != 1 {
+		t.Errorf("checkpoint events = %d, want 1", checkpoints)
+	}
+	if total != 3 {
+		t.Errorf("surviving audit rows = %d, want 3 (2 recent + 1 checkpoint)", total)
+	}
+}
+
+// TestSweepFullyClampedAuditTruncationLogsWarn covers N1 (security
+// review, ATR-308): when legal hold clamps the truncation boundary all
+// the way down to nothing eligible (HeldClamped && !Truncated), the
+// sweep must not pass silently — an operator who enabled
+// audit_retention_seconds and sees no growth relief needs a signal why.
+func TestSweepFullyClampedAuditTruncationLogsWarn(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := context.Background()
+
+	// A held message: message + attachment + link + hold.
+	if err := env.store.CreateMessage(ctx, store.NewMessageParams{ID: "m-held", QueueID: "q-held", Sender: "a@example.com"}); err != nil {
+		t.Fatalf("CreateMessage() error = %v", err)
+	}
+	if err := env.store.CreateAttachment(ctx, store.NewAttachmentParams{
+		ID: "att-held", MessageID: "m-held", PartRef: "1", Filename: "f.bin",
+		DeclaredType: "application/octet-stream", DetectedType: "application/octet-stream",
+		Size: 10, StorageKey: "ab/held",
+	}); err != nil {
+		t.Fatalf("CreateAttachment() error = %v", err)
+	}
+	if err := env.store.CreateLink(ctx, store.NewLinkParams{ //nolint:gosec // test fixture placeholder hash, not a credential
+		ID: "link-held", MessageID: "m-held", AttachmentID: "att-held", Recipient: "r@example.com",
+		TokenHash: "hash-fully-clamped", ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano), MaxDownloads: 0,
+	}); err != nil {
+		t.Fatalf("CreateLink() error = %v", err)
+	}
+	if err := env.store.SetHold(ctx, "link-held", true, "officer@example.com", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("SetHold() error = %v", err)
+	}
+
+	// The ONLY old, otherwise-eligible event is tied to the held message,
+	// so the whole eligible prefix gets clamped away.
+	if _, err := env.store.Record(ctx, audit.Event{
+		Timestamp: time.Now().Add(-100 * 24 * time.Hour),
+		Type:      audit.TypePolicyDecision,
+		Actor:     "milter",
+		MessageID: "m-held",
+	}); err != nil {
+		t.Fatalf("Record() error = %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	sweeper, err := retention.New(retention.Params{
+		Metadata:       env.store,
+		Storage:        env.storage,
+		AuditSink:      env.store,
+		AuditTruncator: env.store,
+		AuditRetention: time.Hour,
+		Logger:         logger,
+	})
+	if err != nil {
+		t.Fatalf("retention.New() error = %v, want nil", err)
+	}
+	res, err := sweeper.Sweep(ctx)
+	if err != nil {
+		t.Fatalf("Sweep() error = %v, want nil", err)
+	}
+	if res.AuditTruncated != 0 {
+		t.Errorf("AuditTruncated = %d, want 0 (fully clamped, nothing removed)", res.AuditTruncated)
+	}
+	if !strings.Contains(logBuf.String(), "audit truncation fully blocked by legal hold") {
+		t.Errorf("log output = %q, want a Warn line about audit truncation fully blocked by legal hold", logBuf.String())
 	}
 }

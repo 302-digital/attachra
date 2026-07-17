@@ -18,7 +18,7 @@ const (
 // configured Limits. It is a distinct, typed error (SR-117-1) so
 // callers can distinguish "message too complex/large" from a
 // malformed-message parse error and route it to their configured
-// fail-open/fail-closed policy (CLAUDE.md invariant #3).
+// fail-open/fail-closed policy (the mail-must-never-be-lost invariant).
 type LimitError struct {
 	// Kind identifies which limit was exceeded.
 	Kind LimitKind

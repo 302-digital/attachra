@@ -14,17 +14,24 @@ import (
 // message that an adapter has collected and hands to the Core for
 // processing. Body is a streamed reader over the message so a
 // Processor can inspect and forward the message without requiring
-// the whole message to be buffered in memory (CLAUDE.md invariant
-// #4); adapters are responsible for choosing how Body is backed
-// (memory, temp file, etc.) on their side of the interface.
+// the whole message to be buffered in memory (the streaming invariant —
+// no full-message buffering); adapters are responsible for choosing
+// how Body is backed (memory, temp file, etc.) on their side of the
+// interface.
 type Envelope struct {
-	// Sender is the envelope-from address (SMTP MAIL FROM), without
-	// surrounding angle brackets.
+	// Sender is the envelope-from address (SMTP MAIL FROM), in the
+	// canonical form internal/core/mail.NormalizeAddress produces
+	// (trimmed, angle-bracket-free, lower-cased). Adapters are
+	// responsible for normalizing the raw transport value before
+	// constructing an Envelope (see the milter adapter's MailFrom,
+	// ATR-293) so every Core consumer of this field — policy matching,
+	// the audit trail, and the messages table a revoke-by-sender query
+	// later reads back — agrees on one form.
 	Sender string
 
-	// Recipients lists the envelope-to addresses (SMTP RCPT TO),
-	// without surrounding angle brackets. A message may have more
-	// than one recipient.
+	// Recipients lists the envelope-to addresses (SMTP RCPT TO), each
+	// already normalized the same way as Sender (see its doc comment).
+	// A message may have more than one recipient.
 	Recipients []string
 
 	// QueueID is the mail transport's identifier for this message

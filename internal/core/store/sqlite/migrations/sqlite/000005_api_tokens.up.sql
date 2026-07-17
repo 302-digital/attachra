@@ -1,7 +1,7 @@
 -- API tokens (ATR-201, US-8.1/T-8.1.7, SR-130-2).
 --
 -- token_hash holds the hex-encoded SHA-256 of the bearer secret; the
--- raw secret is never stored (CLAUDE.md invariant #5), mirroring the
+-- raw secret is never stored (SR-130-2), mirroring the
 -- links.token_hash discipline from 000001_init.up.sql. The UNIQUE index
 -- on token_hash makes the authentication lookup a single indexed
 -- equality (no linear scan, no timing side-channel from the query

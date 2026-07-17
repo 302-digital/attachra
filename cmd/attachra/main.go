@@ -175,7 +175,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			MaxDownloads: cfg.Links.DefaultMaxDownloads,
 			TokenBytes:   cfg.Links.TokenBytes,
 			Retention:    time.Duration(cfg.Links.DefaultRetentionSeconds) * time.Second,
-		}, metadataStore)
+		}, metadataStore, nil) // nil logger: this short-circuited subcommand only holds/unholds/revokes, never calls CreateLinks, so there is no retention clamp to log (ATR-294).
 		if err != nil {
 			fmt.Fprintf(stderr, "attachra: link engine init failed: %v\n", err) //nolint:errcheck // best-effort diagnostic on stderr
 			return 1
@@ -236,7 +236,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		MaxDownloads: cfg.Links.DefaultMaxDownloads,
 		TokenBytes:   cfg.Links.TokenBytes,
 		Retention:    time.Duration(cfg.Links.DefaultRetentionSeconds) * time.Second,
-	}, metadataStore)
+	}, metadataStore, logger)
 	if err != nil {
 		logger.Error("link engine init failed", "error", err.Error())
 		return 1
@@ -289,9 +289,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 			Metadata:  metadataStore,
 			Storage:   drv,
 			AuditSink: metadataStore,
-			Metrics:   appMetrics,
-			Logger:    logger,
-			ChunkSize: cfg.Retention.ChunkSize,
+			// Audit-log retention (ATR-308, ADR-017): opt-in, off by
+			// default (audit_retention_seconds == 0 leaves AuditRetention
+			// zero, which disables truncation regardless of the
+			// Truncator). Wired only alongside the storage sweep, so it
+			// also requires retention.enabled.
+			AuditTruncator: metadataStore,
+			AuditRetention: time.Duration(cfg.Retention.AuditRetentionSeconds) * time.Second,
+			Metrics:        appMetrics,
+			Logger:         logger,
+			ChunkSize:      cfg.Retention.ChunkSize,
 		})
 		if err != nil {
 			logger.Error("retention sweeper init failed", "error", err.Error())
@@ -332,6 +339,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			Logger:            logger,
 			AuditSink:         metadataStore,
 			Metrics:           appMetrics,
+			SpoolDir:          cfg.Spool.Dir,
 		})
 		if err != nil {
 			logger.Error("attachment processor init failed", "error", err.Error())
@@ -347,6 +355,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		SessionTimeout:  time.Duration(cfg.Limits.MilterTimeout) * time.Second,
 		MaxMessageSize:  cfg.Limits.MaxMessageSize,
 		ShutdownTimeout: 30 * time.Second,
+		SpoolDir:        cfg.Spool.Dir,
 	}, processor, logger, appMetrics)
 
 	// readinessChecks backs GET /readyz (US-7.2/T-7.2.3, ATR-194):
@@ -408,9 +417,26 @@ func run(args []string, stdout, stderr io.Writer) int {
 		TrustedProxies: trustedProxies,
 	})
 
+	// adminListen translates config.AdminConfig's explicit,
+	// two-field opt-out (ATR-292 security review) into
+	// adapterhttp.Config's simpler "empty means fold" contract: the
+	// ONLY way to produce an empty adminListen here is
+	// cfg.Admin.FoldIntoHTTP being true — config.Load already
+	// guarantees cfg.Admin.Listen itself is never silently empty
+	// (an empty value from any source, absent explicit
+	// fold_into_http, is normalized back to the safe default before
+	// Load returns). NewServer logs loudly whenever it receives an
+	// empty AdminListen, so this fold is never silent at runtime
+	// either.
+	adminListen := cfg.Admin.Listen
+	if cfg.Admin.FoldIntoHTTP {
+		adminListen = ""
+	}
+
 	httpTimeout := time.Duration(cfg.Limits.HTTPTimeout) * time.Second
 	downloadServer := adapterhttp.NewServer(adapterhttp.Config{
 		Listen:          cfg.HTTP.Listen,
+		AdminListen:     adminListen,
 		ReadTimeout:     httpTimeout,
 		WriteTimeout:    httpTimeout,
 		IdleTimeout:     httpTimeout,

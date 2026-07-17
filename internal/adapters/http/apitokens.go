@@ -14,10 +14,10 @@ import (
 
 // apiTokenDTO is the JSON shape of an API token's metadata (api/openapi.yaml,
 // schema ApiToken). It deliberately never carries the token secret or its
-// hash — only issuance metadata (invariant #5, SR-130-2). last_used_at is
-// a pointer so it renders as JSON null (not an empty string) for a token
-// that has never authenticated a request, matching the contract's
-// nullable field.
+// hash — only issuance metadata (the token-hygiene invariant, SR-130-2).
+// last_used_at is a pointer so it renders as JSON null (not an empty
+// string) for a token that has never authenticated a request, matching
+// the contract's nullable field.
 type apiTokenDTO struct {
 	ID         string  `json:"id"`
 	Name       string  `json:"name"`
@@ -43,8 +43,8 @@ type apiTokenCreateRequestDTO struct {
 
 // apiTokenCreateResponseDTO is the create response (schema
 // ApiTokenCreateResponse): the token metadata plus the one-time secret,
-// the only place the raw bearer value is ever returned (invariant #5,
-// SR-130-2).
+// the only place the raw bearer value is ever returned (the
+// token-hygiene invariant, SR-130-2).
 type apiTokenCreateResponseDTO struct {
 	apiTokenDTO
 	Secret string `json:"secret"`
@@ -95,7 +95,7 @@ func (h *APIHandler) handleAPITokenItem(w http.ResponseWriter, r *http.Request) 
 }
 
 // listAPITokens implements GET /api/v1/api-tokens (admin): a cursor-paginated
-// page of token metadata, never any secret (SR-130-5, invariant #5).
+// page of token metadata, never any secret (SR-130-5, the token-hygiene invariant).
 func (h *APIHandler) listAPITokens(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.authorize(w, r, store.RoleAdmin); !ok {
 		return
@@ -134,7 +134,8 @@ func (h *APIHandler) listAPITokens(w http.ResponseWriter, r *http.Request) {
 }
 
 // createAPIToken implements POST /api/v1/api-tokens (admin): mint a new
-// token, returning its secret exactly once (invariant #5, SR-130-2).
+// token, returning its secret exactly once (the token-hygiene invariant,
+// SR-130-2).
 func (h *APIHandler) createAPIToken(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.authorize(w, r, store.RoleAdmin); !ok {
 		return
@@ -243,8 +244,9 @@ func (h *APIHandler) revokeAPIToken(w http.ResponseWriter, r *http.Request) {
 
 	// Reload the revoked token's non-secret metadata (name, role) for the
 	// audit event below, best-effort: a reload failure must not turn an
-	// already-successful revocation into an error response (CLAUDE.md
-	// invariant #3's spirit applied to this control-plane path), it just
+	// already-successful revocation into an error response (the
+	// mail-must-never-be-lost invariant's spirit applied to this
+	// control-plane path), it just
 	// means the event carries less context.
 	var name, role string
 	if tok, err := h.tokens.GetAPIToken(r.Context(), id); err != nil {
@@ -265,7 +267,7 @@ func (h *APIHandler) revokeAPIToken(w http.ResponseWriter, r *http.Request) {
 // still recorded with whatever non-secret context is available, since
 // token_id and actor alone are enough to correlate it with the store's
 // own token row. It never carries the token's secret or hash
-// (invariant #5). Recording is best-effort, mirroring
+// (the token-hygiene invariant). Recording is best-effort, mirroring
 // internal/core/link.Engine.recordAudit: a sink failure is logged but
 // must never change the HTTP response already decided by the caller.
 func (h *APIHandler) recordTokenAuditEvent(ctx context.Context, action, actor, tokenID, name, role string) {

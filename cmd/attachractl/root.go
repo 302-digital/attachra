@@ -53,6 +53,9 @@ func newRootCmd(stdout, stderr io.Writer) (*cobra.Command, *appEnv) {
 			if cfg.Insecure {
 				fmt.Fprintln(stderr, "attachractl: WARNING: TLS certificate verification is disabled (--insecure); do not use this against an untrusted network") //nolint:errcheck // best-effort warning
 			}
+			for _, w := range cfg.Warnings {
+				fmt.Fprintln(stderr, "attachractl: WARNING:", w) //nolint:errcheck // best-effort warning
+			}
 
 			client, err := newClient(cfg)
 			if err != nil {

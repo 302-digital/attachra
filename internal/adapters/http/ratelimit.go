@@ -7,10 +7,9 @@ import (
 
 // tokenBucket is a minimal, dependency-free token-bucket rate limiter
 // (SR-125-7). It is reimplemented here rather than pulling in
-// golang.org/x/time/rate, mirroring the same trade-off the milter
-// adapter already made for limitListener (internal/adapters/milter/
-// limitlistener.go: "reimplemented here to avoid adding a dependency
-// for a handful of lines").
+// golang.org/x/time/rate, mirroring the same trade-off
+// internal/adapters/netutil.LimitListener already made ("reimplemented
+// here to avoid adding a dependency for a handful of lines").
 //
 // Safe for concurrent use by multiple goroutines.
 type tokenBucket struct {
@@ -77,29 +76,47 @@ func (b *tokenBucket) allow() bool {
 // perIPLimiter tracks one tokenBucket per client IP for the general
 // request rate (SR-125-7) and, separately, one tokenBucket per IP for
 // the tighter not-found budget that drives the enumeration tarpit
-// (T1.1). Entries are created lazily and never actively evicted within
-// the process lifetime; this is an accepted MVP bound (a long-running
-// process facing a very large number of distinct source IPs grows this
-// map unbounded) rather than a correctness issue — see the package doc
-// comment on limiter for the sizing note.
+// (T1.1). Entries are created lazily; each map is an evictingBucketMap
+// (ATR-297), so a distributed attacker spraying requests across many
+// source IPs cannot grow either map without bound — see
+// evictingBucketMap's doc comment for the eviction policy and why it is
+// safe against throttle-reset abuse.
 type perIPLimiter struct {
-	mu sync.Mutex
-
 	requestRatePerMinute  int
 	requestBurst          int
 	notFoundRatePerMinute int
 
-	requests  map[string]*tokenBucket
-	notFounds map[string]*tokenBucket
+	requests  *evictingBucketMap
+	notFounds *evictingBucketMap
 }
 
+// newPerIPLimiter returns a perIPLimiter whose eviction bounds are the
+// package defaults (defaultBucketMapMaxEntries/defaultBucketMapTTL).
+// Most callers, including every existing test, want this; NewHandler
+// uses newPerIPLimiterWithBounds directly so RateLimitConfig can override
+// the bounds per deployment.
 func newPerIPLimiter(requestRatePerMinute, requestBurst, notFoundRatePerMinute int) *perIPLimiter {
+	return newPerIPLimiterWithBounds(requestRatePerMinute, requestBurst, notFoundRatePerMinute, 0, 0)
+}
+
+// newPerIPLimiterWithBounds is newPerIPLimiter with explicit eviction
+// bounds (ATR-297): maxEntries <= 0 and/or ttl <= 0 fall back to the
+// package defaults, so a caller (or an unnormalized RateLimitConfig
+// zero value) always gets a bounded map, never an accidentally
+// unbounded one.
+func newPerIPLimiterWithBounds(requestRatePerMinute, requestBurst, notFoundRatePerMinute, maxEntries int, ttl time.Duration) *perIPLimiter {
+	if maxEntries <= 0 {
+		maxEntries = defaultBucketMapMaxEntries
+	}
+	if ttl <= 0 {
+		ttl = defaultBucketMapTTL
+	}
 	return &perIPLimiter{
 		requestRatePerMinute:  requestRatePerMinute,
 		requestBurst:          requestBurst,
 		notFoundRatePerMinute: notFoundRatePerMinute,
-		requests:              make(map[string]*tokenBucket),
-		notFounds:             make(map[string]*tokenBucket),
+		requests:              newEvictingBucketMap(maxEntries, ttl),
+		notFounds:             newEvictingBucketMap(maxEntries, ttl),
 	}
 }
 
@@ -109,7 +126,9 @@ func (l *perIPLimiter) allowRequest(ip string) bool {
 	if l.requestRatePerMinute <= 0 {
 		return true
 	}
-	return l.bucketFor(l.requests, ip, l.requestRatePerMinute, l.requestBurst).allow()
+	rate, burst := l.requestRatePerMinute, l.requestBurst
+	b := l.requests.getOrCreate(ip, func() *tokenBucket { return newTokenBucket(rate, burst) })
+	return b.allow()
 }
 
 // allowNotFound reports whether ip may receive another generic
@@ -120,17 +139,7 @@ func (l *perIPLimiter) allowNotFound(ip string) bool {
 	if l.notFoundRatePerMinute <= 0 {
 		return true
 	}
-	return l.bucketFor(l.notFounds, ip, l.notFoundRatePerMinute, l.notFoundRatePerMinute).allow()
-}
-
-func (l *perIPLimiter) bucketFor(set map[string]*tokenBucket, ip string, ratePerMinute, burst int) *tokenBucket {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	b, ok := set[ip]
-	if !ok {
-		b = newTokenBucket(ratePerMinute, burst)
-		set[ip] = b
-	}
-	return b
+	rate := l.notFoundRatePerMinute
+	b := l.notFounds.getOrCreate(ip, func() *tokenBucket { return newTokenBucket(rate, rate) })
+	return b.allow()
 }

@@ -8,8 +8,8 @@ package message
 //
 // Exceeding any limit aborts parsing with a *LimitError, which callers
 // resolve into their configured fail-open/fail-closed policy (see
-// CLAUDE.md invariant #3 and ADR-116 SR-116-1) rather than the parser
-// deciding that policy itself.
+// the mail-must-never-be-lost invariant and ADR-116 SR-116-1) rather
+// than the parser deciding that policy itself.
 type Limits struct {
 	// MaxDepth is the maximum nesting depth of multipart and
 	// message/rfc822 parts. The top-level message body is depth 0;

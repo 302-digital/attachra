@@ -8,6 +8,7 @@ import (
 
 	dmilter "github.com/d--j/go-milter"
 
+	"github.com/302-digital/attachra/internal/adapters/netutil"
 	"github.com/302-digital/attachra/internal/core/metrics"
 	"github.com/302-digital/attachra/internal/core/pipeline"
 )
@@ -40,7 +41,13 @@ func NewServer(cfg Config, processor pipeline.Processor, logger *slog.Logger, m 
 		dmilter.WithDynamicMilter(func(_ uint32, _ dmilter.OptAction, _ dmilter.OptProtocol, _ dmilter.DataSize) dmilter.Milter {
 			return newBackend(cfg, processor, logger, m)
 		}),
-		dmilter.WithAction(dmilter.OptAddHeader|dmilter.OptChangeBody),
+		// OptChangeHeader is required to update (or delete) a header the
+		// MTA already holds, which the rewrite promotion path needs to
+		// change the top-level Content-Type in place and drop the
+		// promoted single part's stale content headers (ATR-290).
+		// OptAddHeader covers appending new headers; OptChangeBody
+		// covers ReplaceBody.
+		dmilter.WithAction(dmilter.OptAddHeader|dmilter.OptChangeHeader|dmilter.OptChangeBody),
 		dmilter.WithMacroRequest(dmilter.StageMail, []dmilter.MacroName{dmilter.MacroMailAddr}),
 		dmilter.WithMacroRequest(dmilter.StageRcpt, []dmilter.MacroName{dmilter.MacroRcptAddr}),
 		dmilter.WithMacroRequest(dmilter.StageEOM, []dmilter.MacroName{dmilter.MacroQueueId}),
@@ -67,7 +74,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	s.listener = newLimitListener(ln, s.cfg.MaxConnections, s.cfg.SessionTimeout)
+	s.listener = netutil.NewLimitListener(ln, s.cfg.MaxConnections, s.cfg.SessionTimeout)
 
 	s.logger.Info("milter: listening", "addr", s.cfg.Listen, "failure_mode", string(s.cfg.FailureMode))
 

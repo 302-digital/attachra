@@ -22,7 +22,7 @@
 //
 // Compute streams every matching event exactly once and
 // ComputeDeliverability pages through every matching link exactly once
-// (CLAUDE.md invariant #4): each function's running totals are bounded
+// (the streaming invariant): each function's running totals are bounded
 // by the number of distinct days/actions/policy names/domains in the
 // window, never by the number of events or links themselves.
 package stats
@@ -115,7 +115,7 @@ type Summary struct {
 
 // Compute streams every event in q's window from src exactly once via
 // audit.Reader.StreamEvents, aggregating counts into small,
-// label-cardinality-bounded running totals (CLAUDE.md invariant #4:
+// label-cardinality-bounded running totals (the streaming invariant:
 // the full set of matching events is never held in memory at once).
 func Compute(ctx context.Context, src audit.Reader, q Query) (Summary, error) {
 	if err := q.validate(); err != nil {

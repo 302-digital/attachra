@@ -1,4 +1,4 @@
-.TH ATTACHRA.YAML 5 "2026-07-15" "attachra" "Attachra Manual"
+.TH ATTACHRA.YAML 5 "2026-07-16" "attachra" "Attachra Manual"
 .SH NAME
 attachra.yaml \- configuration file for the attachra attachment policy engine
 .SH SYNOPSIS
@@ -138,6 +138,46 @@ Artificial delay, in seconds (may be fractional, e.g. 0.5), added to a
 not\-found\-shaped response once an IP has exceeded
 .BR not_found_per_ip_per_minute .
 Default: 1.0.
+.SS "admin"
+Admin/operational HTTP surface: GET /metrics (Prometheus text
+exposition format) and the dependency\-detailed GET /readyz. Kept off
+the public download listener so a deployment that ever exposes
+.B http.listen
+publicly does not also leak build/runtime fingerprinting data or
+internal dependency names. GET /healthz (liveness only, no dependency
+detail) stays on
+.B http.listen
+as well, for existing container/orchestrator probes.
+.TP
+.B admin.listen
+TCP address the admin server binds to, e.g.
+.RI \(dq 127.0.0.1:18090 \(dq .
+Not 9090: that is Prometheus's own default listen port, the most
+likely co\-located neighbor on the same host. An empty value here is
+.B NOT
+an opt\-out — it is normalized back to the default on every load
+unless
+.B admin.fold_into_http
+is also set (see below); this is deliberate, so that a merely unset or
+accidentally\-empty environment override can never silently disable
+the separate admin listener. Default:
+.RI \(dq 127.0.0.1:18090 \(dq .
+.TP
+.B admin.fold_into_http
+The
+.B only
+supported way to disable the separate admin listener: when
+.BR true ", "
+GET /metrics and GET /readyz are mounted on
+.B http.listen
+instead, reproducing the single\-listener behavior from before this
+field existed, and
+.B admin.listen
+is ignored. Logged loudly (WARN, or ERROR if
+.B http.listen
+does not look loopback\-only) on every startup, so this can never
+silently degrade a deployment's security posture. Default:
+.BR false .
 .SS "limits"
 Global resource limits enforced across milter session handling, MIME
 parsing and HTTP serving. All fields below must be positive.
@@ -345,6 +385,54 @@ enabled. Default: 3600 (hourly).
 Maximum number of expired attachments fetched per database round trip
 within a single sweep pass. Must be positive when enabled. Default:
 200.
+.TP
+.B retention.audit_retention_seconds
+How long tamper\-evident audit\-log events are kept before the sweep
+truncates them, in seconds (ADR\-017). Default:
+.B 0
+\(em DISABLED: the audit log stays append\-only forever. Opt\-in and
+separate from
+.BR links.default_retention_seconds .
+When set, truncation preserves hash\-chain verifiability via a
+checkpoint anchor and never removes an event tied to a message under
+legal hold; it runs inside this same sweep, so it also requires
+.BR retention.enabled .
+Must not be negative.
+.RS
+.IP \(bu 2
+Verification of the surviving chain only proves nothing changed
+.I since
+the anchor, not that the anchor itself is legitimate; an operator with
+direct database write access could forge one (see ADR\-017
+"Limitations: what verification does not prove").
+.IP \(bu 2
+Recommended: set this value noticeably larger than your audit\-export
+cadence, and take an offsite/WORM export (\fBGET /audit/export\fR, or
+\fBattachractl audit export\fR) before enabling truncation for the
+first time \(em the export is the only artifact that survives both a
+forged anchor and a later pass truncating an old checkpoint row itself.
+.RE
+.SS "spool"
+Directory temporary spool files (message bodies and rewritten MIME
+output that exceed the in\-memory threshold) are created in.
+.TP
+.B spool.dir
+Empty (the default) uses the OS default temporary directory
+.RI ( $TMPDIR " / " os.TempDir() ).
+When set, the directory must already exist and be writable by the
+Attachra process \(em checked at startup, not deferred to the first
+message. Under the packaged systemd unit
+.RB ( PrivateTmp=yes ),
+the default already gives Attachra a private, writable
+.I /tmp
+isolated from the host's, so this rarely needs to be set; if you do
+set it to a path outside that private
+.IR /tmp ,
+also add it to the unit's
+.B ReadWritePaths=
+or writes will be rejected by
+.B ProtectSystem=strict
+regardless of on\-disk permissions. Default: empty.
 .SS "public_base_url"
 .TP
 .B public_base_url
@@ -379,6 +467,8 @@ ATTACHRA_LOG_FORMAT
 ATTACHRA_MILTER_LISTEN
 ATTACHRA_MILTER_FAILURE_MODE
 ATTACHRA_HTTP_LISTEN
+ATTACHRA_ADMIN_LISTEN
+ATTACHRA_ADMIN_FOLD_INTO_HTTP
 ATTACHRA_HTTP_RATE_LIMIT_PER_IP_PER_MINUTE
 ATTACHRA_HTTP_RATE_LIMIT_GLOBAL_PER_MINUTE
 ATTACHRA_PUBLIC_BASE_URL
@@ -396,7 +486,9 @@ ATTACHRA_DATABASE_PATH
 .EE
 .RE
 .B ATTACHRA_POLICY_DRY_RUN
-accepts
+and
+.B ATTACHRA_ADMIN_FOLD_INTO_HTTP
+accept
 .RB \(dq true \(dq
 (case\-insensitive) or
 .RB \(dq 1 \(dq ;
@@ -416,6 +508,9 @@ http:
   listen: "127.0.0.1:8080"
   trusted_proxies:
     - "127.0.0.1/32"
+
+admin:
+  listen: "127.0.0.1:18090"
 
 public_base_url: "https://mail.example.com"
 

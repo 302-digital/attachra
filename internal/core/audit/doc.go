@@ -4,19 +4,27 @@
 // not depend on any adapter-specific code (e.g. Postfix milter) — see
 // ADR-002.
 //
-// The log is append-only (SR-128-1): AuditSink exposes only Record,
-// never update or delete. Every Recorded event carries a Seq and
-// PrevHash, the hook this package lays down for future tamper-evidence
-// verification: an implementation computes PrevHash as a hash of the
-// previous row's content at write time (see
-// internal/core/store/sqlite's AuditSink implementation), so a later
-// verifier can walk the chain and detect any row that was altered or
-// removed after the fact. Actually *verifying* the chain end-to-end
-// (a `attachractl audit verify` style command, or an on-read check) is
-// intentionally out of scope for ATR-189/190/191: only the structural
-// hook (Seq + PrevHash present and consistent at write time) is
-// delivered here. This is a deliberate, documented scope cut, not an
-// oversight — see this task's final report for the rationale.
+// The log is append-only for event producers (SR-128-1): AuditSink
+// exposes only Record, never update or delete. The one controlled
+// exception is retention truncation (ADR-017), exposed through the
+// separate Truncator interface — not AuditSink — so producers cannot
+// reach it: it removes an old, contiguous, hold-respecting seq-prefix
+// and appends a TypeRetentionCheckpoint anchoring the survivors, so the
+// removal is itself tamper-evident. It is opt-in and off by default
+// (see internal/core/retention and ADR-017 for the mechanism). Every
+// Recorded event carries a Seq and PrevHash: the store computes PrevHash
+// as HashRecord of the previous row at write time (see
+// internal/core/store/sqlite's AuditSink implementation and HashRecord in
+// this package), so the chain can be walked and any altered, removed, or
+// reordered row detected. HashRecord is the single canonical row hash,
+// used both at write time and by the verifier. Verify and VerifyJSONL
+// (ATR-240) implement that walk: Verify checks the live log through a
+// Reader, VerifyJSONL an offline segment previously written by
+// ExportJSONL. Both are strictly read-only — verifying records nothing
+// (an appended event would perturb the very chain it checks). A clean
+// verdict covers the surviving chain from its earliest trusted anchor
+// forward; it does not prove a truncation anchor's own legitimacy
+// (ADR-017 "Limitations: what verification does not prove").
 //
 // Untrusted, mail-derived values (recipient addresses, filenames,
 // error text) must always cross this package's boundary as

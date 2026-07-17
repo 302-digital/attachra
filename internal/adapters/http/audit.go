@@ -61,8 +61,9 @@ func auditType(denied bool) audit.Type {
 //
 // Recording to sink is best-effort: a failure to append the audit
 // event is logged but never changes the HTTP response already decided
-// by the caller (CLAUDE.md invariant #3 extends here — a download or
-// page view must not be blocked or altered by an audit-sink outage).
+// by the caller (the mail-must-never-be-lost invariant extends here —
+// a download or page view must not be blocked or altered by an
+// audit-sink outage).
 func recordAudit(ctx context.Context, sink audit.AuditSink, logger *slog.Logger, ev auditEvent) {
 	if ev.At.IsZero() {
 		ev.At = time.Now().UTC()

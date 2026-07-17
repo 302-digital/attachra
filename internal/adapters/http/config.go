@@ -15,6 +15,22 @@ type Config struct {
 	// "127.0.0.1:8080").
 	Listen string
 
+	// AdminListen is the TCP address the admin server (GET /metrics,
+	// the dependency-detailed GET /readyz) binds to (ATR-292, e.g.
+	// "127.0.0.1:18090"). Empty folds the admin routes onto Listen
+	// instead, reproducing the pre-ATR-292 single-listener behavior —
+	// NewServer logs this loudly at startup, since it is a deliberate
+	// hardening downgrade (see its own doc comment). The caller
+	// (cmd/attachra) is responsible for only ever passing an empty
+	// value here when the operator explicitly opted in via
+	// internal/config.AdminConfig.FoldIntoHTTP: this package's own
+	// "empty means fold" contract does not itself distinguish an
+	// intentional opt-out from an accidental one — that guarantee
+	// lives in internal/config.Load's normalization instead (a merely
+	// absent or empty admin.listen, from YAML or an env override, is
+	// never enough to reach this field as empty).
+	AdminListen string
+
 	// ReadTimeout, WriteTimeout and IdleTimeout bound how long a single
 	// connection may take at each phase (T1.2/SR-125-1). Zero disables
 	// the corresponding timeout (not recommended).
@@ -23,8 +39,9 @@ type Config struct {
 	IdleTimeout  time.Duration
 
 	// MaxConnections bounds the number of concurrent connections the
-	// server will accept (SR-115-2 reuses the milter adapter's
-	// limitListener pattern). A value <= 0 disables the limit.
+	// server will accept (SR-115-2, via the shared
+	// internal/adapters/netutil.LimitListener the milter adapter also
+	// uses). A value <= 0 disables the limit.
 	MaxConnections int
 
 	// ShutdownTimeout bounds how long Shutdown waits for in-flight
@@ -82,6 +99,20 @@ type RateLimitConfig struct {
 	// disables the delay (the request is still rate-limited/rejected
 	// once the harder limit is hit).
 	TarpitDelay time.Duration
+
+	// EvictionMaxEntries bounds the number of distinct client IPs each
+	// per-IP bucket map (the general request budget and the
+	// not-found/tarpit budget) tracks at once (ATR-297): once exceeded,
+	// the least-recently-used entries are evicted first, giving a hard
+	// ceiling on memory under a distributed attack. A value <= 0
+	// defaults to defaultBucketMapMaxEntries.
+	EvictionMaxEntries int
+
+	// EvictionTTL evicts a per-IP bucket entry once it has been idle
+	// this long (ATR-297), keeping steady-state memory well under
+	// EvictionMaxEntries rather than only bounding the worst case. A
+	// value <= 0 defaults to defaultBucketMapTTL.
+	EvictionTTL time.Duration
 }
 
 // normalized returns a copy of c with defaulted fields filled in,
@@ -95,6 +126,12 @@ func (c Config) normalized() Config {
 	}
 	if c.RateLimit.GlobalBurst <= 0 {
 		c.RateLimit.GlobalBurst = c.RateLimit.GlobalRequestsPerMinute
+	}
+	if c.RateLimit.EvictionMaxEntries <= 0 {
+		c.RateLimit.EvictionMaxEntries = defaultBucketMapMaxEntries
+	}
+	if c.RateLimit.EvictionTTL <= 0 {
+		c.RateLimit.EvictionTTL = defaultBucketMapTTL
 	}
 	return c
 }

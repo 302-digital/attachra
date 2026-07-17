@@ -196,8 +196,7 @@ func checkNoExistingConfig(configDir string) error {
 // is not a sufficient test, so this uses an actual isatty(3) ioctl
 // probe). github.com/mattn/go-isatty was already an indirect
 // dependency (pulled in transitively) before this change, so using it
-// directly here adds no new third-party code to the build (CLAUDE.md
-// invariant #6 / minimal dependencies).
+// directly here adds no new third-party code to the build.
 func isTerminal(f *os.File) bool {
 	return isatty.IsTerminal(f.Fd())
 }
@@ -643,8 +642,8 @@ func printSetupNextSteps(stdout io.Writer, configDir, attachraPath, policyPath s
 		fmt.Fprintln(stdout, "     touch — see docs/integrations/postfix.md for wiring Attachra into a containerized")  //nolint:errcheck // best-effort diagnostic on stdout
 		fmt.Fprintln(stdout, "     Postfix instead.")                                                                   //nolint:errcheck // best-effort diagnostic on stdout
 	}
-	fmt.Fprintln(stdout, "  4. Publish the package/download page (ONLY the /p/ path, never /api/v1 or") //nolint:errcheck // best-effort diagnostic on stdout
-	fmt.Fprintln(stdout, "     /metrics) through a reverse proxy")                                      //nolint:errcheck // best-effort diagnostic on stdout
+	fmt.Fprintln(stdout, "  4. Publish the package/download page (ONLY the /p/ path, never /api/v1)") //nolint:errcheck // best-effort diagnostic on stdout
+	fmt.Fprintln(stdout, "     through a reverse proxy")                                              //nolint:errcheck // best-effort diagnostic on stdout
 	if env == mailEnvGrommunio {
 		fmt.Fprintln(stdout, "     — see /usr/share/attachra/examples/nginx-grommunio.conf and") //nolint:errcheck // best-effort diagnostic on stdout
 		fmt.Fprintln(stdout, "     docs/deploy/grommunio-debian.md.")                            //nolint:errcheck // best-effort diagnostic on stdout
@@ -656,7 +655,9 @@ func printSetupNextSteps(stdout io.Writer, configDir, attachraPath, policyPath s
 	fmt.Fprintln(stdout, "     instead of the real client.")                                                        //nolint:errcheck // best-effort diagnostic on stdout
 	fmt.Fprintf(stdout, "  5. Validate the policy any time you edit it: attachra policy validate %s\n", policyPath) //nolint:errcheck // best-effort diagnostic on stdout
 	fmt.Fprintln(stdout, "  6. Run `attachra doctor` for a one-shot health check across these steps; or use")       //nolint:errcheck // best-effort diagnostic on stdout
-	fmt.Fprintln(stdout, "     GET /healthz and GET /readyz on the http.listen address directly.")                  //nolint:errcheck // best-effort diagnostic on stdout
+	fmt.Fprintln(stdout, "     GET /healthz on the http.listen address, and GET /readyz / GET /metrics on the")     //nolint:errcheck // best-effort diagnostic on stdout
+	fmt.Fprintln(stdout, "     admin.listen address (default 127.0.0.1:18090, loopback-only — never expose it")     //nolint:errcheck // best-effort diagnostic on stdout
+	fmt.Fprintln(stdout, "     publicly; see admin.listen in internal/config/config.go if you need to change it).") //nolint:errcheck // best-effort diagnostic on stdout
 	fmt.Fprintln(stdout)                                                                                            //nolint:errcheck // best-effort diagnostic on stdout
 
 	switch env {

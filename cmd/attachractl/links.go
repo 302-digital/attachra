@@ -237,7 +237,7 @@ func newLinksRevokeCmd(env *appEnv) *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&messageID, "message-id", "", "revoke every link belonging to this message")
-	cmd.Flags().StringVar(&sender, "sender", "", "revoke every link belonging to every message from this sender")
+	cmd.Flags().StringVar(&sender, "sender", "", "revoke every link belonging to every message from this sender (matched case-insensitively, angle brackets ignored — ATR-293)")
 
 	return cmd
 }

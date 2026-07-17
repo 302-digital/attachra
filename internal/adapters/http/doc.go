@@ -15,7 +15,7 @@
 //     why the package token, not a second bearer token, is what
 //     authorizes this step) and streams the object from
 //     storage.Driver without buffering the whole payload in memory
-//     (CLAUDE.md invariant #4).
+//     (the streaming invariant).
 //
 // This package depends only on internal/core (link, store, storage);
 // it must never be imported by internal/core (ADR-002), matching the

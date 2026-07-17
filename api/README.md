@@ -75,7 +75,7 @@ response.
 This is a separate Makefile target, not part of `make check`: `make check`
 (the Go test+lint gate every task's Definition of Done requires) must stay
 usable on a Go-only toolchain with no Node/npm installed. CI runs
-`openapi-lint` as its own job (`.gitlab-ci.yml`), independent of the Go
+`openapi-lint` as its own job, independent of the Go
 build/test/lint jobs, so a spec regression is still caught on every
 pipeline without coupling the two toolchains together.
 
@@ -101,7 +101,11 @@ already exist in `internal/adapters/http`:
   root (`internal/adapters/http/server.go`), not under `/api/v1`; listing
   them as `paths` in a document whose `servers` entry is `/api/v1` would
   misrepresent their real mount point as part of this contract, so they
-  are named here instead of documented as operations.
+  are named here instead of documented as operations. `GET /healthz` is
+  served on both the public download listener (`http.listen`) and the
+  admin listener; `GET /metrics` and `GET /readyz` are served on the
+  admin listener only (`admin.listen`) — see `Server`'s doc
+  comment in `internal/adapters/http/server.go` for the full route map.
 
 All three remain unauthenticated per SR-130-1's explicit exception (health
 and download), unaffected by anything in this contract.

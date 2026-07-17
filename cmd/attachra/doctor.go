@@ -242,8 +242,8 @@ func formatConfigDetail(path string, cfg config.Config) string {
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "loaded from %s | log.level=%s log.format=%s milter.listen=%s milter.failure_mode=%s http.listen=%s storage.driver=%s database.path=%s policy.path=%s policy.dry_run=%t public_base_url=%s",
-		src, cfg.Log.Level, cfg.Log.Format, cfg.Milter.Listen, cfg.Milter.FailureMode, cfg.HTTP.Listen, cfg.Storage.Driver, cfg.Database.Path, orNone(cfg.Policy.Path), cfg.Policy.DryRun, orNone(cfg.PublicBaseURL))
+	fmt.Fprintf(&b, "loaded from %s | log.level=%s log.format=%s milter.listen=%s milter.failure_mode=%s http.listen=%s admin.listen=%s storage.driver=%s database.path=%s policy.path=%s policy.dry_run=%t public_base_url=%s",
+		src, cfg.Log.Level, cfg.Log.Format, cfg.Milter.Listen, cfg.Milter.FailureMode, cfg.HTTP.Listen, orNone(cfg.Admin.Listen), cfg.Storage.Driver, cfg.Database.Path, orNone(cfg.Policy.Path), cfg.Policy.DryRun, orNone(cfg.PublicBaseURL))
 
 	switch cfg.Storage.Driver {
 	case "fs":
@@ -350,22 +350,14 @@ func checkStorageDir(cfg config.Config) []checkResult {
 }
 
 // checkDatabaseDir implements the database-directory half of check #3.
-// Unlike storage.fs.base_dir, the sqlite driver does NOT currently
-// create its containing directory (ATR-310, open as of this writing):
-// a missing directory here is a FAIL, since the service will
-// crash-loop on SQLITE_CANTOPEN rather than recover on its own.
-//
-// autoCreated=false is that ATR-310 gap encoded as a doctor check, not
-// a permanent design choice: whoever fixes ATR-310 (making the sqlite
-// store create its parent directory, mirroring the fs storage driver's
-// own ATR-309 fix) MUST flip this to true in the same change, or this
-// check will keep reporting a FAIL for a condition the service itself
-// no longer treats as fatal. TestCheckDatabaseDir_FailsWhileSqliteDoesNotAutoCreate
-// (doctor_test.go) exists specifically to make that discrepancy
-// impossible to miss - its own doc comment repeats this instruction.
+// Like storage.fs.base_dir, the sqlite driver creates its containing
+// directory itself if missing (ATR-310, mirroring the fs storage
+// driver's own ATR-309 fix): a missing directory here is only a WARN,
+// since the service recovers on its own rather than crash-looping on
+// SQLITE_CANTOPEN.
 func checkDatabaseDir(cfg config.Config) []checkResult {
 	dir := filepath.Dir(cfg.Database.Path)
-	return []checkResult{checkDirWritable("database_dir", dir, false)}
+	return []checkResult{checkDirWritable("database_dir", dir, true)}
 }
 
 // checkDirWritable is the shared implementation behind checkStorageDir
@@ -576,6 +568,16 @@ func portStatusResult(check, network, address string, deps doctorDeps) checkResu
 // checkHTTPService implements check #5: if /healthz responds, attachra
 // is up (and /readyz is checked too, distinguishing "up" from "up but
 // not ready"); otherwise, is the configured port free or occupied.
+//
+// /readyz is probed against cfg.Admin.Listen (ATR-292: it moved off the
+// public download listener onto the admin one, along with /metrics, so
+// it does not leak internal dependency names to the internet-facing
+// surface). cfg.Admin.FoldIntoHTTP true is the only opt-out (see
+// internal/adapters/http.Server's doc comment) — cfg.Admin.Listen
+// itself is never empty by the time config.Load returns unless
+// FoldIntoHTTP is set. /readyz falls back onto cfg.HTTP.Listen exactly
+// when cfg.Admin.Listen is empty, matching where the running process
+// actually serves it in that mode.
 func checkHTTPService(ctx context.Context, cfg config.Config, deps doctorDeps) []checkResult {
 	addr := cfg.HTTP.Listen
 
@@ -589,8 +591,13 @@ func checkHTTPService(ctx context.Context, cfg config.Config, deps doctorDeps) [
 
 	results := []checkResult{{Check: "http_port", Status: statusPass, Detail: fmt.Sprintf("attachra is running and healthy at http://%s (healthz 200)", addr)}}
 
+	readyAddr := cfg.Admin.Listen
+	if readyAddr == "" {
+		readyAddr = addr
+	}
+
 	rctx, rcancel := context.WithTimeout(ctx, doctorNetTimeout)
-	rstatus, rbody, rerr := deps.httpGet(rctx, "http://"+addr+"/readyz")
+	rstatus, rbody, rerr := deps.httpGet(rctx, "http://"+readyAddr+"/readyz")
 	rcancel()
 
 	switch {

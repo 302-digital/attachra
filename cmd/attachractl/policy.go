@@ -233,7 +233,8 @@ func newPolicyDryRunCmd(env *appEnv) *cobra.Command {
 		Use:   "dry-run",
 		Short: "Evaluate the active policy against a hypothetical message",
 		Long: "Calls POST /policies/dry-run: a pure, side-effect-free simulation of what the active policy would decide, without creating a message, attachment, link or audit event.\n\n" +
-			"Either pass --file/-f pointing at a JSON document matching the DryRunRequest schema (api/openapi.yaml) — use \"-\" for stdin — or build the request from flags: --sender, one or more --recipient, and one or more --attachment in \"filename:size[:mime_type[:detected_type]]\" form (mime_type is used as both declared_type and detected_type unless a fourth field overrides detected_type).",
+			"Either pass --file/-f pointing at a JSON document matching the DryRunRequest schema (api/openapi.yaml) — use \"-\" for stdin — or build the request from flags: --sender, one or more --recipient, and one or more --attachment in \"filename:size[:mime_type[:detected_type]]\" form (mime_type is used as both declared_type and detected_type unless a fourth field overrides detected_type).\n\n" +
+			"A filename containing a colon cannot be expressed in --attachment's \":\"-delimited form; use --file with a JSON document instead (its \"filename\" field takes any string verbatim).",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			req, err := buildDryRunRequest(file, sender, recipients, attachments)
@@ -266,7 +267,7 @@ func newPolicyDryRunCmd(env *appEnv) *cobra.Command {
 
 	cmd.Flags().StringVar(&sender, "sender", "", "envelope sender address")
 	cmd.Flags().StringArrayVar(&recipients, "recipient", nil, "recipient address (repeatable)")
-	cmd.Flags().StringArrayVar(&attachments, "attachment", nil, `attachment in "filename:size[:mime_type[:detected_type]]" form (repeatable)`)
+	cmd.Flags().StringArrayVar(&attachments, "attachment", nil, `attachment in "filename:size[:mime_type[:detected_type]]" form (repeatable); a filename containing ":" is not expressible here, use --file instead`)
 	cmd.Flags().StringVarP(&file, "file", "f", "", `read the full DryRunRequest JSON body from this file, or "-" for stdin, instead of --sender/--recipient/--attachment`)
 
 	return cmd

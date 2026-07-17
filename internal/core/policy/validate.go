@@ -85,11 +85,21 @@ func validateRule(i int, r Rule) (errs, warnings []*ValidationError) {
 
 // validateActionBlock enforces the `then`/`default` consistency rules
 // in §2.4: ttl/max_downloads/retention/link only apply to `replace`;
-// reason only applies to `block`. It also implements the §3.5
-// warning: a `replace` action with an explicit `ttl` but no
-// `retention` is valid (retention falls back to the global config,
-// US-5.3) but worth flagging so the author knows the object outlives
-// the link by an implicit amount.
+// reason only applies to `block`. It also implements two §3.5
+// warnings for `replace`:
+//   - an explicit `ttl` but no `retention` is valid (retention falls
+//     back to the global config, US-5.3) but worth flagging so the
+//     author knows the object outlives the link by an implicit
+//     amount;
+//   - an explicit `retention` shorter than an explicit `ttl` is also
+//     valid — link.Engine.CreateLinks silently raises it to match ttl
+//     at runtime (T-5.3.1/ATR-178: a link must never outlive the
+//     object it points to) — but this is exactly the case where the
+//     policy's literal `retention:` value diverges from what storage
+//     actually keeps, worth catching here with the rule name attached
+//     rather than only learning about it from the runtime clamp
+//     warning link.Engine.CreateLinks logs (ATR-294), which has no
+//     rule-name context by the time it runs.
 func validateActionBlock(path, ruleName string, a ActionSpec) (errs, warnings []*ValidationError) {
 	switch a.Action {
 	case ActionPass, ActionReplace, ActionBlock:
@@ -117,6 +127,12 @@ func validateActionBlock(path, ruleName string, a ActionSpec) (errs, warnings []
 			Path:     path,
 			RuleName: ruleName,
 			Message:  "replace has an explicit ttl but no retention; retention will fall back to the global config default",
+		})
+	} else if a.TTL != nil && a.Retention != nil && a.Retention.Duration() < a.TTL.Duration() {
+		warnings = append(warnings, &ValidationError{
+			Path:     path,
+			RuleName: ruleName,
+			Message:  fmt.Sprintf("retention (%s) is shorter than ttl (%s); retention will be raised to match ttl at run time (a link must never outlive the object it points to)", a.Retention.Duration(), a.TTL.Duration()),
 		})
 	}
 

@@ -13,6 +13,7 @@ package main
 
 import (
 	"crypto/rand"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"io"
@@ -142,8 +143,20 @@ func buildMessage(from, to, subject string, attachments []string) ([]byte, error
 }
 
 // attachFile streams the file at path into the multipart writer as a
-// base64-free binary attachment part (SMTP transport encoding, if
-// needed, is left to the sending MTA in this dev utility).
+// base64 attachment part (RFC 2045 §6.8's standard Content-Transfer-
+// Encoding for binary MIME parts).
+//
+// ATR-342: a prior version sent attachments with
+// "Content-Transfer-Encoding: binary" and raw bytes. net/smtp's
+// underlying textproto dotWriter canonicalizes the wire format by
+// turning every bare LF that is not already preceded by a CR into
+// CRLF, which silently corrupts any binary payload that happens to
+// contain a 0x0A byte not part of a CRLF pair (a 627-byte LF-only PDF
+// was observed arriving as 658 bytes, i.e. every LF doubled to CRLF).
+// Base64-encoding the attachment first means the bytes placed on the
+// wire are themselves plain ASCII with our own explicit CRLF line
+// breaks, so dotWriter's canonicalization is a no-op and the decoded
+// attachment is byte-identical end to end.
 func attachFile(writer *multipart.Writer, path string) error {
 	f, err := os.Open(path) //nolint:gosec // path is an operator-supplied CLI flag, not untrusted input
 	if err != nil {
@@ -159,7 +172,7 @@ func attachFile(writer *multipart.Writer, path string) error {
 
 	header := textproto.MIMEHeader{
 		"Content-Type":              {contentType},
-		"Content-Transfer-Encoding": {"binary"},
+		"Content-Transfer-Encoding": {"base64"},
 		"Content-Disposition":       {fmt.Sprintf("attachment; filename=%q", name)},
 	}
 
@@ -168,9 +181,59 @@ func attachFile(writer *multipart.Writer, path string) error {
 		return fmt.Errorf("create part: %w", err)
 	}
 
-	if _, err := io.Copy(part, f); err != nil {
+	lw := &base64LineWriter{w: part}
+	enc := base64.NewEncoder(base64.StdEncoding, lw)
+	if _, err := io.Copy(enc, f); err != nil {
 		return fmt.Errorf("copy contents: %w", err)
+	}
+	if err := enc.Close(); err != nil {
+		return fmt.Errorf("close base64 encoder: %w", err)
+	}
+	if lw.lineLen > 0 {
+		if _, err := lw.w.Write([]byte("\r\n")); err != nil {
+			return fmt.Errorf("write trailing line break: %w", err)
+		}
 	}
 
 	return nil
+}
+
+// base64EncodedLineLength is the maximum number of base64-encoded
+// characters per line, matching RFC 2045 §6.8's 76-character limit for
+// base64 MIME body content.
+const base64EncodedLineLength = 76
+
+// base64LineWriter wraps an underlying writer, inserting a CRLF line
+// break every base64EncodedLineLength bytes written to it. It is used
+// to stream a base64.Encoder's continuous output into properly
+// line-wrapped MIME body content without buffering the whole encoded
+// attachment in memory.
+type base64LineWriter struct {
+	w       io.Writer
+	lineLen int
+}
+
+func (lw *base64LineWriter) Write(p []byte) (int, error) {
+	total := 0
+	for len(p) > 0 {
+		remaining := base64EncodedLineLength - lw.lineLen
+		n := remaining
+		if n > len(p) {
+			n = len(p)
+		}
+		if _, err := lw.w.Write(p[:n]); err != nil {
+			return total, err
+		}
+		total += n
+		lw.lineLen += n
+		p = p[n:]
+
+		if lw.lineLen == base64EncodedLineLength {
+			if _, err := lw.w.Write([]byte("\r\n")); err != nil {
+				return total, err
+			}
+			lw.lineLen = 0
+		}
+	}
+	return total, nil
 }

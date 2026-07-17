@@ -22,12 +22,14 @@ type Config struct {
 	Log           LogConfig       `yaml:"log"`
 	Milter        MilterConfig    `yaml:"milter"`
 	HTTP          HTTPConfig      `yaml:"http"`
+	Admin         AdminConfig     `yaml:"admin"`
 	Limits        LimitsConfig    `yaml:"limits"`
 	Storage       StorageConfig   `yaml:"storage"`
 	Database      DatabaseConfig  `yaml:"database"`
 	Links         LinksConfig     `yaml:"links"`
 	Policy        PolicyConfig    `yaml:"policy"`
 	Retention     RetentionConfig `yaml:"retention"`
+	Spool         SpoolConfig     `yaml:"spool"`
 	PublicBaseURL string          `yaml:"public_base_url"`
 }
 
@@ -49,8 +51,8 @@ type MilterConfig struct {
 	// FailureMode selects how the milter adapter resolves any error
 	// or panic encountered while processing a message (SR-116-1):
 	// "open" accepts the message unmodified, "closed" temp-fails it
-	// (SMTP 4xx) so the sending MTA retries later. See CLAUDE.md
-	// invariant #3. Default: "open".
+	// (SMTP 4xx) so the sending MTA retries later. Per the
+	// mail-must-never-be-lost invariant. Default: "open".
 	FailureMode string `yaml:"failure_mode"`
 }
 
@@ -78,6 +80,51 @@ type HTTPConfig struct {
 	// here, or every download/audit/rate-limit decision will key off the
 	// proxy's own loopback address instead of the real client.
 	TrustedProxies []string `yaml:"trusted_proxies"`
+}
+
+// AdminConfig holds settings for the admin/operational HTTP surface
+// (internal/adapters/http, ATR-292): GET /metrics and the dependency-
+// detailed GET /readyz, kept off the internet-facing download listener
+// (http.listen) so a deployment that ever exposes http.listen publicly
+// does not also leak build/runtime fingerprinting data (Go version,
+// goroutine counts, memory stats) or the names of internal dependencies.
+// GET /healthz (liveness only — a static "ok", no dependency detail) is
+// intentionally still mounted on http.listen too, matching the existing
+// operational convention (systemd/container health probes and
+// `attachra doctor` hit the same port they already know about) — see
+// internal/adapters/http.Server's own doc comment for the full route
+// map.
+//
+// Security review of the first ATR-292 version (2026-07-16) flagged
+// that treating an empty Listen as "fold admin routes onto http.listen"
+// let a merely-*present*-but-empty ATTACHRA_ADMIN_LISTEN env var (or an
+// explicit `listen: ""` in YAML) silently disable the hardening with no
+// log line — env vars are frequently exported empty by tooling/CI by
+// accident, so "absent" and "empty" must not be conflated with "opt
+// out". Load() now normalizes Listen back to Default()'s safe loopback
+// value whenever it comes out empty from ANY source (missing YAML key,
+// explicit `listen: ""`, empty env override) and FoldIntoHTTP is not
+// set; FoldIntoHTTP is the only way to opt into folding, and doing so
+// is logged loudly by internal/adapters/http.NewServer at startup (see
+// its doc comment).
+type AdminConfig struct {
+	// Listen is the TCP address the admin server binds to (e.g.
+	// "127.0.0.1:18090"). Defaults to loopback-only, matching
+	// http.listen's own default posture (Default()). Ignored entirely
+	// when FoldIntoHTTP is true. An empty value here, from any source,
+	// is NOT an opt-out (see the type doc comment) — Load() resets it
+	// to the safe default unless FoldIntoHTTP is also set.
+	Listen string `yaml:"listen"`
+
+	// FoldIntoHTTP, when true, is the explicit, auditable opt-out from
+	// the separate admin listener: /metrics and /readyz are mounted on
+	// http.listen instead (reproducing the pre-ATR-292 single-listener
+	// behavior), and Listen's value is ignored. Default: false (the
+	// hardened, separated-surface posture). Setting this to true is
+	// logged at Error or Warn level on every startup by
+	// internal/adapters/http.NewServer, so it can never silently
+	// degrade a deployment's security posture unnoticed.
+	FoldIntoHTTP bool `yaml:"fold_into_http"`
 }
 
 // HTTPRateLimitConfig configures the download adapter's rate limiting
@@ -266,8 +313,9 @@ type DatabaseConfig struct {
 	Driver string `yaml:"driver"`
 
 	// Path is the filesystem path to the SQLite database file. The
-	// containing directory must exist and be writable; the file
-	// itself is created on first run if missing.
+	// containing directory is created automatically on first start if
+	// missing (mode 0700, ATR-310); the file itself is created on
+	// first run.
 	Path string `yaml:"path"`
 }
 
@@ -286,8 +334,8 @@ type LinksConfig struct {
 	DefaultMaxDownloads int `yaml:"default_max_downloads"`
 
 	// TokenBytes is the number of crypto/rand bytes used to generate
-	// each link token. Must be >= 16 (128 bits, CLAUDE.md invariant
-	// #5 / SR-124-1).
+	// each link token. Must be >= 16 (128 bits, the token-hygiene
+	// invariant / SR-124-1).
 	TokenBytes int `yaml:"token_bytes"`
 
 	// DefaultRetentionSeconds is the storage retention used when a
@@ -318,6 +366,79 @@ type RetentionConfig struct {
 	// "chunked DELETE" guidance; see retention.Params.ChunkSize). Must
 	// be positive when Enabled. Default: 200.
 	ChunkSize int `yaml:"chunk_size"`
+
+	// AuditRetentionSeconds is how long audit-log events are kept before
+	// the sweep truncates them (ATR-308, ADR-017). Default: 0 =
+	// DISABLED: the tamper-evident audit log stays append-only forever,
+	// byte-for-byte the historical behavior. This is opt-in and separate
+	// from the file/link retention (links.default_retention_seconds);
+	// truncation preserves hash-chain verifiability via a checkpoint
+	// anchor and respects legal hold (see ADR-017). When > 0 it runs
+	// inside this same sweep, so it also requires Enabled = true. Must
+	// not be negative.
+	AuditRetentionSeconds int64 `yaml:"audit_retention_seconds"`
+}
+
+// SpoolConfig configures where temporary spool files are created:
+// message bodies staged by the milter adapter and the core pipeline,
+// and rewritten MIME output staged by internal/core/rewrite, once a
+// stream exceeds spoolutil.SpoolMemThreshold (ATR-262).
+type SpoolConfig struct {
+	// Dir is the directory os.CreateTemp writes spool files into.
+	// Empty (the default) means "use the OS default temporary
+	// directory" ($TMPDIR / os.TempDir()), preserving pre-ATR-262
+	// behavior.
+	//
+	// When set, Dir must already exist and be writable by the Attachra
+	// process; Validate checks both at startup (fail fast), rather
+	// than deferring the failure to the first message that needs to
+	// spill to disk.
+	//
+	// Deployments packaged with systemd's PrivateTmp=true (Attachra's
+	// own deb unit is, see deploy/deb/systemd/attachra.service) already
+	// give the process a private, writable /tmp isolated from the
+	// host's — Dir does not need to be set in that case. Dir exists
+	// for deployments that lock down or quota /tmp itself (e.g.
+	// noexec/nosuid mounts, a size-limited tmpfs, or a shared host
+	// without PrivateTmp) and need spool files to land somewhere else
+	// entirely. If Dir is set under a systemd unit with
+	// ProtectSystem=strict (as the packaged unit has), it must also be
+	// listed in that unit's ReadWritePaths=, or writes to it will be
+	// rejected by the sandbox regardless of filesystem permissions.
+	Dir string `yaml:"dir"`
+}
+
+// validate checks the spool directory configuration, returning a
+// slice of field-specific error strings. An empty Dir is always valid
+// (it means "use the OS default temporary directory"); Validate never
+// creates a configured Dir on the caller's behalf, unlike
+// storage.fs.Driver's handling of base_dir — an operator-specified
+// spool directory failing to exist is treated as a configuration
+// mistake to fail fast on, not something to paper over.
+func (s SpoolConfig) validate() []string {
+	if strings.TrimSpace(s.Dir) == "" {
+		return nil
+	}
+
+	info, err := os.Stat(s.Dir)
+	if err != nil {
+		return []string{fmt.Sprintf("spool.dir: %v", err)}
+	}
+	if !info.IsDir() {
+		return []string{fmt.Sprintf("spool.dir: %q is not a directory", s.Dir)}
+	}
+
+	probe, err := os.CreateTemp(s.Dir, ".attachra-spool-probe-*")
+	if err != nil {
+		return []string{fmt.Sprintf("spool.dir: %q is not writable: %v", s.Dir, err)}
+	}
+	name := probe.Name()
+	_ = probe.Close()
+	if err := os.Remove(name); err != nil {
+		return []string{fmt.Sprintf("spool.dir: failed to clean up write probe in %q: %v", s.Dir, err)}
+	}
+
+	return nil
 }
 
 // Default returns a Config populated with sane defaults.
@@ -341,6 +462,17 @@ func Default() Config {
 				NotFoundPerIPPerMinute: 20,
 				TarpitDelaySeconds:     1.0,
 			},
+		},
+		Admin: AdminConfig{
+			// 18090, not 9090: 9090 is Prometheus's OWN default listen
+			// port, the single most likely co-located neighbor on a
+			// host running Attachra — binding it here would collide
+			// with a local Prometheus server (which typically binds
+			// 0.0.0.0, covering this loopback address too) more often
+			// than not (ATR-292 security review). 18090 pairs with the
+			// deb package's http.listen override of 18080 (see
+			// deploy/deb/etc/attachra.yaml).
+			Listen: "127.0.0.1:18090",
 		},
 		Limits: LimitsConfig{
 			MaxMessageSize:       100 * 1024 * 1024, // 100 MiB
@@ -396,7 +528,9 @@ const envPrefix = "ATTACHRA_"
 //
 // Environment variables use the form ATTACHRA_<SECTION>_<FIELD>, e.g.
 // ATTACHRA_LOG_LEVEL, ATTACHRA_LOG_FORMAT, ATTACHRA_MILTER_LISTEN,
-// ATTACHRA_HTTP_LISTEN, ATTACHRA_POLICY_PATH, ATTACHRA_POLICY_DRY_RUN.
+// ATTACHRA_HTTP_LISTEN, ATTACHRA_ADMIN_LISTEN,
+// ATTACHRA_ADMIN_FOLD_INTO_HTTP, ATTACHRA_POLICY_PATH,
+// ATTACHRA_POLICY_DRY_RUN.
 func Load(path string) (Config, error) {
 	cfg := Default()
 
@@ -412,6 +546,16 @@ func Load(path string) (Config, error) {
 	}
 
 	applyEnvOverrides(&cfg)
+
+	// admin.listen empty (YAML key absent, an explicit `listen: ""`, or
+	// an empty-but-present ATTACHRA_ADMIN_LISTEN) is never treated as
+	// an opt-out: it always resolves to the safe default loopback
+	// address unless admin.fold_into_http explicitly requested folding
+	// (ATR-292 security review — see AdminConfig's doc comment for
+	// why "absent" and "opt out" must not be conflated).
+	if !cfg.Admin.FoldIntoHTTP && strings.TrimSpace(cfg.Admin.Listen) == "" {
+		cfg.Admin.Listen = Default().Admin.Listen
+	}
 
 	if err := cfg.Validate(); err != nil {
 		return Config{}, fmt.Errorf("config: validate: %w", err)
@@ -437,6 +581,12 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v, ok := lookupEnv("HTTP_LISTEN"); ok {
 		cfg.HTTP.Listen = v
+	}
+	if v, ok := lookupEnv("ADMIN_LISTEN"); ok {
+		cfg.Admin.Listen = v
+	}
+	if v, ok := lookupEnv("ADMIN_FOLD_INTO_HTTP"); ok {
+		cfg.Admin.FoldIntoHTTP = strings.EqualFold(v, "true") || v == "1"
 	}
 	if v, ok := lookupEnvInt("HTTP_RATE_LIMIT_PER_IP_PER_MINUTE"); ok {
 		cfg.HTTP.RateLimit.PerIPPerMinute = v
@@ -479,6 +629,9 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v, ok := lookupEnv("DATABASE_PATH"); ok {
 		cfg.Database.Path = v
+	}
+	if v, ok := lookupEnv("SPOOL_DIR"); ok {
+		cfg.Spool.Dir = v
 	}
 }
 
@@ -547,11 +700,22 @@ func (c Config) Validate() error {
 	errs = append(errs, c.HTTP.RateLimit.validate()...)
 	errs = append(errs, c.HTTP.validateTrustedProxies()...)
 
+	// Defense in depth for AdminConfig's "empty is never an opt-out"
+	// contract (ATR-292 security review): Load() already normalizes an
+	// empty admin.listen back to the safe default before calling
+	// Validate, so this only ever fires for a Config built directly
+	// (bypassing Load) — fail closed rather than let it silently reach
+	// internal/adapters/http as an implicit fold.
+	if !c.Admin.FoldIntoHTTP && strings.TrimSpace(c.Admin.Listen) == "" {
+		errs = append(errs, "admin.listen: must not be empty unless admin.fold_into_http is true")
+	}
+
 	errs = append(errs, c.Limits.validate()...)
 	errs = append(errs, c.Storage.validate()...)
 	errs = append(errs, c.Database.validate()...)
 	errs = append(errs, c.Links.validate()...)
 	errs = append(errs, c.Retention.validate()...)
+	errs = append(errs, c.Spool.validate()...)
 
 	if c.PublicBaseURL != "" {
 		if err := validatePublicBaseURL(c.PublicBaseURL); err != nil {
@@ -703,6 +867,13 @@ func (l LinksConfig) validate() []string {
 // tuning values are inert.
 func (r RetentionConfig) validate() []string {
 	var errs []string
+
+	// A negative audit retention is always a misconfiguration, even when
+	// the job is disabled (a disabled job's inert tuning values may stay
+	// unvalidated, but a negative duration is never a meaningful value).
+	if r.AuditRetentionSeconds < 0 {
+		errs = append(errs, fmt.Sprintf("retention.audit_retention_seconds: must not be negative, got %d", r.AuditRetentionSeconds))
+	}
 
 	if !r.Enabled {
 		return errs

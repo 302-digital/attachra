@@ -5,8 +5,8 @@ import "time"
 // FailureMode selects how the adapter resolves any error or panic
 // raised while processing a message (SR-116-1): whether the message
 // is passed through unmodified (fail-open) or temporarily rejected so
-// the sending MTA retries later (fail-closed). See CLAUDE.md
-// invariant #3.
+// the sending MTA retries later (fail-closed). Per the
+// mail-must-never-be-lost invariant.
 type FailureMode string
 
 // Recognized FailureMode values.
@@ -73,6 +73,14 @@ type Config struct {
 	// ShutdownTimeout bounds how long Server.Shutdown waits for
 	// in-flight sessions to finish before forcibly closing them.
 	ShutdownTimeout time.Duration
+
+	// SpoolDir selects the directory a session's message-body spool
+	// spills to once it exceeds spoolutil.SpoolMemThreshold
+	// (ATR-262). It is expected to be config.SpoolConfig.Dir; the
+	// empty string (the default) uses the OS default temporary
+	// directory ($TMPDIR / os.TempDir()), preserving pre-ATR-262
+	// behavior.
+	SpoolDir string
 }
 
 // normalized returns a copy of c with defaulted fields filled in.

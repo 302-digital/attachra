@@ -7,8 +7,8 @@ import (
 )
 
 // keyRandomBytes is the number of random bytes used to build an
-// object key, giving 128 bits of entropy — matching CLAUDE.md
-// invariant #5's minimum bar for unguessable identifiers, even though
+// object key, giving 128 bits of entropy — matching the token-hygiene
+// invariant's minimum bar for unguessable identifiers, even though
 // object keys (unlike link tokens) are never exposed to end users.
 const keyRandomBytes = 16
 

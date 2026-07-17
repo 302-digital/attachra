@@ -44,6 +44,14 @@ UMask=0027
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
+# PrivateTmp=yes already gives this unit its own private, writable
+# /tmp isolated from the host's, so spool.dir (internal/config's
+# SpoolConfig.Dir, ATR-262) does not need to be set for this
+# packaging: the default (os.TempDir(), i.e. this private /tmp) is
+# fine. If you DO set spool.dir in attachra.yaml to a path outside
+# that private /tmp, add it to ReadWritePaths= below too — under
+# ProtectSystem=strict, writes anywhere not listed there are rejected
+# by the sandbox regardless of on-disk permissions.
 # StateDirectory=attachra is automatically writable under
 # ProtectSystem=strict; database.path and storage.fs.base_dir in
 # attachra.yaml both point under /var/lib/attachra to match.

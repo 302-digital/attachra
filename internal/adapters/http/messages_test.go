@@ -141,7 +141,7 @@ func TestMessagesGetByID(t *testing.T) {
 		t.Fatalf("read GET message body: %v", err)
 	}
 	if strings.Contains(string(bodyBytes), "storage_key") || strings.Contains(string(bodyBytes), "token_hash") {
-		t.Errorf("GET message body leaks storage_key/token_hash, want neither present (SR-121-3/CLAUDE.md invariant #5): %s", bodyBytes)
+		t.Errorf("GET message body leaks storage_key/token_hash, want neither present (SR-121-3, the token-hygiene invariant): %s", bodyBytes)
 	}
 
 	var got messageWireDTO

@@ -10,12 +10,13 @@ import (
 	"testing"
 
 	"github.com/302-digital/attachra/internal/core/message"
+	"github.com/302-digital/attachra/internal/core/spoolutil"
 )
 
 // buildLargeMessage builds a synthetic multipart/mixed message with
 // one large base64-encoded "attachment" part big enough to force
 // rewrite's stageToFile to spill to a temporary file
-// (spoolMemThreshold is 256 KiB), plus a small text/plain body.
+// (spoolutil.SpoolMemThreshold is 256 KiB), plus a small text/plain body.
 func buildLargeMessage(t *testing.T, payloadSize int) (raw []byte, atts []message.Attachment) {
 	t.Helper()
 
@@ -68,9 +69,9 @@ func buildLargeMessage(t *testing.T, payloadSize int) (raw []byte, atts []messag
 }
 
 func TestRewrite_LargeMessage_SpoolsToDisk_PassThrough(t *testing.T) {
-	// payload comfortably larger than spoolMemThreshold (256 KiB) so
-	// stageToFile must spill to a temporary file.
-	raw, atts := buildLargeMessage(t, spoolMemThreshold*2)
+	// payload comfortably larger than spoolutil.SpoolMemThreshold (256
+	// KiB) so stageToFile must spill to a temporary file.
+	raw, atts := buildLargeMessage(t, spoolutil.SpoolMemThreshold*2)
 
 	// Replace nothing (pass the big attachment through) — this
 	// exercises the byte-for-byte streaming copy path for a large
@@ -94,7 +95,7 @@ func TestRewrite_LargeMessage_SpoolsToDisk_PassThrough(t *testing.T) {
 }
 
 func TestRewrite_LargeMessage_SpoolsToDisk_ReplacedAndCleanedUp(t *testing.T) {
-	raw, atts := buildLargeMessage(t, spoolMemThreshold*2)
+	raw, atts := buildLargeMessage(t, spoolutil.SpoolMemThreshold*2)
 
 	var replacePath string
 	for _, a := range atts {
@@ -150,6 +151,60 @@ func TestRewrite_LargeMessage_SpoolsToDisk_ReplacedAndCleanedUp(t *testing.T) {
 	// documented on spoolFile.Close.
 	if err := closer.Close(); err != nil {
 		t.Errorf("second Close should be safe, got: %v", err)
+	}
+}
+
+// TestRewrite_LargeMessage_SpoolsToConfiguredDir verifies that
+// Input.SpoolDir (ATR-262) is actually honored: the spill file
+// stageToFile creates once the rewritten output exceeds
+// spoolutil.SpoolMemThreshold must land inside the configured
+// directory, not the OS default temporary directory.
+func TestRewrite_LargeMessage_SpoolsToConfiguredDir(t *testing.T) {
+	dir := t.TempDir()
+	raw, atts := buildLargeMessage(t, spoolutil.SpoolMemThreshold*2)
+
+	// At least one attachment must actually be replaced: Rewrite
+	// returns the untouched original message (no staging, hence no
+	// io.Closer Result.Body) when the decision has no ActionReplace at
+	// all, as TestRewrite_LargeMessage_SpoolsToDisk_PassThrough above
+	// exercises deliberately.
+	var replacePath string
+	for _, a := range atts {
+		if a.Filename == "small.txt" {
+			replacePath = a.PartPath
+		}
+	}
+	if replacePath == "" {
+		t.Fatal("test setup: small.txt attachment not found")
+	}
+	decision := decisionReplacingAttachments(atts, replacePath)
+
+	result, err := Rewrite(Input{
+		Message:     bytes.NewReader(raw),
+		Attachments: atts,
+		Decision:    decision,
+		PackageURL:  "https://dl.example.com/p/token",
+		SpoolDir:    dir,
+	}, testTemplates(t))
+	if err != nil {
+		t.Fatalf("Rewrite: %v", err)
+	}
+
+	closer, ok := result.Body.(io.Closer)
+	if !ok {
+		t.Fatal("expected spooled result.Body to implement io.Closer")
+	}
+	defer func() { _ = closer.Close() }()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read spool dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected exactly one spilled file in configured spool dir, got %d", len(entries))
+	}
+	if got := entries[0].Name(); !bytes.HasPrefix([]byte(got), []byte("attachra-rewrite-body-")) {
+		t.Errorf("spilled file name = %q, want attachra-rewrite-body-* prefix", got)
 	}
 }
 

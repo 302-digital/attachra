@@ -86,9 +86,9 @@ check: test lint
 # openapi-lint validates api/openapi.yaml (ATR-195) with Redocly CLI via
 # npx, pinned to an exact version so local runs and CI agree. Deliberately
 # not a dependency of `check`: `check` must stay usable on a Go-only
-# toolchain with no Node/npm installed (CLAUDE.md's "make check green"
-# Definition of Done applies to every task, most of which touch no YAML).
-# CI validates this spec in its own job instead (see .gitlab-ci.yml).
+# toolchain with no Node/npm installed (the project's "make check green"
+# Definition of Done applies to every change, most of which touch no YAML).
+# CI validates this spec in its own job instead.
 .PHONY: openapi-lint
 openapi-lint:
 	npx -y @redocly/cli@1.25.11 lint api/openapi.yaml --config api/redocly.yaml
@@ -127,7 +127,7 @@ DEB_VERSION  := $(shell echo $(VERSION) | sed -e 's/^v//' -e 's/-/+/g')
 # print-deb-version exposes DEB_VERSION to the CI publish step (ATR-301) so
 # the generic-package-registry URL and SHA256SUMS live at the exact same
 # version string `build-deb-%` used for dist/attachra_<version>_<arch>.deb —
-# without this, .gitlab-ci.yml would have to re-derive DEB_VERSION with its
+# without this, the CI pipeline config would have to re-derive DEB_VERSION with its
 # own copy of the sed logic above, which is exactly the kind of drift ATR-302
 # was written to eliminate.
 .PHONY: print-deb-version

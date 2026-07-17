@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/netip"
+	"time"
 
 	"github.com/302-digital/attachra/internal/core/audit"
 	"github.com/302-digital/attachra/internal/core/link"
@@ -45,6 +46,27 @@ type APIConfig struct {
 	// nil (the default) means no proxy is trusted: every request's
 	// client identity is RemoteAddr, ignoring both headers.
 	TrustedProxies []netip.Prefix
+
+	// EvictionMaxEntries bounds the number of distinct client IPs the
+	// auth-failure throttle tracks at once (ATR-297): once exceeded, the
+	// least-recently-used entries are evicted first, giving a hard
+	// ceiling on memory under a distributed brute-force attempt. A value
+	// <= 0 defaults to defaultBucketMapMaxEntries.
+	EvictionMaxEntries int
+
+	// EvictionTTL evicts an auth-failure throttle entry once it has been
+	// idle this long (ATR-297). A value <= 0 defaults to
+	// defaultBucketMapTTL.
+	EvictionTTL time.Duration
+
+	// MaxConcurrentHeavyRequests bounds how many of the API's
+	// unpaginated/full-window-scan endpoints (GET /audit/export, GET
+	// /stats/summary, GET /stats/deliverability) may run at once, across
+	// every caller combined (ATR-298: a single low-privilege token's
+	// blast radius should stay small — ADR-015's rationale for the
+	// viewer/auditor roles in the first place). A value <= 0 defaults to
+	// defaultMaxConcurrentHeavyRequests.
+	MaxConcurrentHeavyRequests int
 }
 
 const (
@@ -60,6 +82,17 @@ const (
 	// token while cutting off a brute-force sweep quickly.
 	defaultAuthFailuresPerMinute = 10
 	defaultAuthFailuresBurst     = 10
+
+	// defaultMaxConcurrentHeavyRequests bounds concurrent audit-export/
+	// stats-aggregation requests (ATR-298). internal/core/store/sqlite's
+	// reader pool is intentionally left unbounded by database/sql
+	// (WAL-mode readers don't block the writer — see
+	// internal/core/store/sqlite/conn.go), so nothing else caps how many
+	// full-window scans can run in parallel; 4 is a conservative default
+	// that still lets a small operator's automation (a dashboard plus an
+	// ad hoc export, say) run without contention, while keeping a single
+	// token from opening an unbounded number of expensive scans at once.
+	defaultMaxConcurrentHeavyRequests = 4
 )
 
 // normalized returns a copy of c with defaulted fields filled in.
@@ -72,6 +105,15 @@ func (c APIConfig) normalized() APIConfig {
 	}
 	if c.AuthFailuresBurst <= 0 {
 		c.AuthFailuresBurst = defaultAuthFailuresPerMinute
+	}
+	if c.EvictionMaxEntries <= 0 {
+		c.EvictionMaxEntries = defaultBucketMapMaxEntries
+	}
+	if c.EvictionTTL <= 0 {
+		c.EvictionTTL = defaultBucketMapTTL
+	}
+	if c.MaxConcurrentHeavyRequests <= 0 {
+		c.MaxConcurrentHeavyRequests = defaultMaxConcurrentHeavyRequests
 	}
 	return c
 }
@@ -87,16 +129,17 @@ func (c APIConfig) normalized() APIConfig {
 // their resources by registering more patterns on the same mux — no
 // change to the middleware chain, auth, error model or mount wiring.
 type APIHandler struct {
-	tokens      store.APITokenStore
-	metadata    store.MetadataStore
-	links       *link.Engine
-	policies    *policy.Store
-	logger      *slog.Logger
-	audit       audit.AuditSink
-	auditReader audit.ReaderLister
-	metrics     *metrics.Metrics
-	throttle    *authThrottle
-	cfg         APIConfig
+	tokens       store.APITokenStore
+	metadata     store.MetadataStore
+	links        *link.Engine
+	policies     *policy.Store
+	logger       *slog.Logger
+	audit        audit.AuditSink
+	auditReader  audit.ReaderLister
+	metrics      *metrics.Metrics
+	throttle     *authThrottle
+	heavyLimiter *heavyRequestLimiter
+	cfg          APIConfig
 
 	mux *http.ServeMux
 }
@@ -132,16 +175,17 @@ type APIHandler struct {
 func NewAPIHandler(tokens store.APITokenStore, metadata store.MetadataStore, links *link.Engine, policies *policy.Store, logger *slog.Logger, sink audit.AuditSink, auditReader audit.ReaderLister, m *metrics.Metrics, cfg APIConfig) *APIHandler {
 	cfg = cfg.normalized()
 	h := &APIHandler{
-		tokens:      tokens,
-		metadata:    metadata,
-		links:       links,
-		policies:    policies,
-		logger:      logger,
-		audit:       auditSinkOrNop(sink),
-		auditReader: auditReader,
-		metrics:     m,
-		throttle:    newAuthThrottle(cfg.AuthFailuresPerMinute, cfg.AuthFailuresBurst),
-		cfg:         cfg,
+		tokens:       tokens,
+		metadata:     metadata,
+		links:        links,
+		policies:     policies,
+		logger:       logger,
+		audit:        auditSinkOrNop(sink),
+		auditReader:  auditReader,
+		metrics:      m,
+		throttle:     newAuthThrottleWithBounds(cfg.AuthFailuresPerMinute, cfg.AuthFailuresBurst, cfg.EvictionMaxEntries, cfg.EvictionTTL),
+		heavyLimiter: newHeavyRequestLimiter(cfg.MaxConcurrentHeavyRequests),
+		cfg:          cfg,
 	}
 	h.mux = h.newMux()
 	return h
@@ -187,10 +231,10 @@ func (h *APIHandler) routes() []apiRoute {
 		{apiPrefix + "policies/validate", h.handlePoliciesValidate},
 		{apiPrefix + "policies/reload", h.handlePoliciesReload},
 		{apiPrefix + "policies/dry-run", h.handlePoliciesDryRun},
-		{apiPrefix + "stats/summary", h.handleStatsSummary},
-		{apiPrefix + "stats/deliverability", h.handleStatsDeliverability},
+		{apiPrefix + "stats/summary", h.heavyLimitMiddleware(h.handleStatsSummary)},
+		{apiPrefix + "stats/deliverability", h.heavyLimitMiddleware(h.handleStatsDeliverability)},
 		{apiPrefix + "audit", h.handleAuditCollection},
-		{apiPrefix + "audit/export", h.handleAuditExport},
+		{apiPrefix + "audit/export", h.heavyLimitMiddleware(h.handleAuditExport)},
 	}
 }
 

@@ -1,6 +1,6 @@
 module github.com/302-digital/attachra
 
-go 1.26.2
+go 1.26.5
 
 require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.30

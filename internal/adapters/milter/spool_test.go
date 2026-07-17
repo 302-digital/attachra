@@ -6,10 +6,12 @@ import (
 	"io"
 	"os"
 	"testing"
+
+	"github.com/302-digital/attachra/internal/core/spoolutil"
 )
 
 func TestSpool_SmallBodyStaysInMemory(t *testing.T) {
-	s := newSpool(0)
+	s := newSpool(0, "")
 	data := []byte("hello world")
 
 	if _, err := s.Write(data); err != nil {
@@ -37,11 +39,11 @@ func TestSpool_SmallBodyStaysInMemory(t *testing.T) {
 }
 
 func TestSpool_LargeBodySpillsToDisk(t *testing.T) {
-	s := newSpool(0)
+	s := newSpool(0, "")
 
 	chunk := bytes.Repeat([]byte("x"), 4096)
 	total := 0
-	for total < spoolMemThreshold+1 {
+	for total < spoolutil.SpoolMemThreshold+1 {
 		if _, err := s.Write(chunk); err != nil {
 			t.Fatalf("Write: %v", err)
 		}
@@ -78,7 +80,7 @@ func TestSpool_LargeBodySpillsToDisk(t *testing.T) {
 }
 
 func TestSpool_EnforcesMaxSize(t *testing.T) {
-	s := newSpool(10)
+	s := newSpool(10, "")
 
 	if _, err := s.Write([]byte("0123456789")); err != nil {
 		t.Fatalf("Write within limit: %v", err)
@@ -98,8 +100,8 @@ func TestSpool_EnforcesMaxSize(t *testing.T) {
 }
 
 func TestSpool_CloseIsIdempotent(t *testing.T) {
-	s := newSpool(0)
-	chunk := bytes.Repeat([]byte("y"), spoolMemThreshold+1)
+	s := newSpool(0, "")
+	chunk := bytes.Repeat([]byte("y"), spoolutil.SpoolMemThreshold+1)
 	if _, err := s.Write(chunk); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
@@ -112,8 +114,38 @@ func TestSpool_CloseIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestSpool_SpillsToConfiguredDir verifies that newSpool's dir
+// argument (ATR-262) is honored: the temp file it spills to once
+// the in-memory threshold is crossed must land inside the configured
+// directory, not the OS default temporary directory.
+func TestSpool_SpillsToConfiguredDir(t *testing.T) {
+	dir := t.TempDir()
+	s := newSpool(0, dir)
+
+	chunk := bytes.Repeat([]byte("z"), 4096)
+	total := 0
+	for total < spoolutil.SpoolMemThreshold+1 {
+		if _, err := s.Write(chunk); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		total += len(chunk)
+	}
+
+	if s.file == nil {
+		t.Fatal("expected body larger than threshold to spill to disk")
+	}
+	gotDir := s.file.Name()[:len(dir)]
+	if gotDir != dir {
+		t.Errorf("spool temp file %q was not created inside configured dir %q", s.file.Name(), dir)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
 func TestSpool_Len(t *testing.T) {
-	s := newSpool(0)
+	s := newSpool(0, "")
 	if _, err := s.Write([]byte("abc")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}

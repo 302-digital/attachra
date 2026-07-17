@@ -3,6 +3,8 @@ package message
 import (
 	"strings"
 	"testing"
+
+	"github.com/302-digital/attachra/internal/core/spoolutil"
 )
 
 func TestDetectType(t *testing.T) {
@@ -104,7 +106,7 @@ func TestDetectType(t *testing.T) {
 }
 
 func TestDetectType_TruncatesToSniffLen(t *testing.T) {
-	data := make([]byte, sniffLen+1000)
+	data := make([]byte, spoolutil.SniffLen+1000)
 	copy(data, []byte("%PDF-1.4\n"))
 	if got := DetectType(data); got != "application/pdf" {
 		t.Errorf("DetectType with oversized input = %q, want application/pdf", got)

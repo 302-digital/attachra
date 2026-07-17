@@ -225,8 +225,8 @@ type AttachmentPage struct {
 //
 // All methods must be safe for concurrent use by multiple goroutines.
 // Implementations must never receive or return a bearer token: only
-// pre-hashed TokenHash values cross this boundary (CLAUDE.md invariant
-// #5, SR-124-2).
+// pre-hashed TokenHash values cross this boundary (the token-hygiene
+// invariant, SR-124-2).
 type MetadataStore interface {
 	// CreateMessage inserts a new Message row.
 	CreateMessage(ctx context.Context, p NewMessageParams) error
@@ -344,8 +344,8 @@ type MetadataStore interface {
 	// (docs/architecture/package-page-decision.md §4.1 items 3-4): a
 	// recipient reaches the download form by presenting the
 	// package-page token, never a per-attachment bearer token (the raw
-	// per-attachment token is never persisted anywhere, CLAUDE.md
-	// invariant #5, so it cannot be presented again here). id is a
+	// per-attachment token is never persisted anywhere (the token-hygiene
+	// invariant), so it cannot be presented again here). id is a
 	// non-secret row identifier, never a bearer token; the caller
 	// (internal/core/link.Engine) is responsible for verifying id
 	// belongs to the message the presented package token resolves to
@@ -482,6 +482,41 @@ type MetadataStore interface {
 	// DeleteAttachment's guarded DELETE, not this method, is the
 	// authoritative check for the metadata half of a deletion.
 	IsAttachmentHeld(ctx context.Context, id string) (bool, error)
+
+	// DeleteMessage permanently removes the Message row identified by id
+	// together with every Attachment, Link and MessageLink row belonging
+	// to it, in a single transaction (ATR-239: closing the gap left by
+	// pipeline.AttachmentProcessor.Process's storage-vs-metadata rollback
+	// asymmetry when link.Engine.CreateLinks succeeds but a later step,
+	// e.g. rewrite.Rewrite, fails). Unlike DeleteAttachment, callers of
+	// this method are not expected to have already deleted anything —
+	// the pipeline's rollback deletes storage objects first and then
+	// calls this method, mirroring DeleteAttachment's own storage-then-
+	// metadata ordering for the same crash-safety reason (a crash between
+	// the two leaves an orphaned metadata row pointing at nothing, never
+	// an orphaned storage object with no metadata ever pointing back to
+	// it).
+	//
+	// DeleteMessage is a guarded, all-or-nothing delete, exactly
+	// mirroring DeleteAttachment's own TOCTOU-safe construction (ATR-259):
+	// only links with Hold unset are removed first; if any held link
+	// still references the message afterward, the whole call refuses
+	// with a wrapped ErrHeld and — because nothing is committed — leaves
+	// every row (message, attachments, links, message_links) completely
+	// untouched, never a partial prune. This exists purely as a defensive
+	// backstop: a hold requires a separate, deliberate operator action
+	// against a link that, from the operator's point of view, was only
+	// just created moments earlier by the still-in-flight Process call
+	// this method's caller is unwinding, so this refusal path is expected
+	// to be effectively unreachable in practice, not a normal outcome to
+	// design around.
+	//
+	// If no Message exists for id, DeleteMessage returns an error
+	// wrapping ErrNotFound; a caller retrying after a previous partial
+	// run (e.g. the transaction committed but the caller crashed before
+	// observing success) should treat that specifically as "already
+	// deleted", the same idempotency contract DeleteAttachment documents.
+	DeleteMessage(ctx context.Context, id string) error
 
 	// ExpireStaleLinks marks every Link currently LinkStatusActive whose
 	// ExpiresAt is strictly before now as LinkStatusExpired, in a single

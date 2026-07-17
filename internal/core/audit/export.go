@@ -29,7 +29,7 @@ type Reader interface {
 	// StreamEvents calls fn once per Recorded event matching filter, in
 	// ascending Seq order, stopping and returning fn's error immediately
 	// if fn returns one. Implementations must not buffer the full
-	// result set in memory (CLAUDE.md invariant #4): each row is
+	// result set in memory (the streaming invariant): each row is
 	// streamed from the underlying store as it is scanned. Used by
 	// ExportJSONL (unbounded, filter-only) and by
 	// internal/core/stats.Compute.
@@ -81,8 +81,8 @@ type jsonlRecord struct {
 // Seq order, for ingestion into an external immutable
 // store/SIEM (SR-128-3). It never buffers the full result set: each
 // row read from src is encoded and written before the next is
-// fetched, so export scales independently of memory (CLAUDE.md
-// invariant #4).
+// fetched, so export scales independently of memory (the streaming
+// invariant).
 //
 // ExportJSONL returns the first error encountered from either src or
 // from writing to w. A partial write to w may already have occurred

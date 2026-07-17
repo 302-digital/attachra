@@ -62,7 +62,7 @@ const (
 	// outcome; Details' "action" field ("create" or "revoke")
 	// distinguishes them. Details carries only non-secret token
 	// metadata (token_id, name, role) — the secret and its hash never
-	// enter an Event (invariant #5). Unlike TypeHold/TypeRevoke, a
+	// enter an Event (the token-hygiene invariant). Unlike TypeHold/TypeRevoke, a
 	// failed create/revoke attempt is not separately recorded here:
 	// those requests are rejected before any store change happens (bad
 	// input, unknown role, unknown token id), so there is no state
@@ -73,6 +73,33 @@ const (
 	// policy, storage, link creation, rewrite) that could not be
 	// classified under a more specific Type above.
 	TypeError Type = "error"
+	// TypeCompensation records a best-effort compensating deletion the
+	// pipeline performs when link.Engine.CreateLinks has already
+	// durably written a message's Message/Attachment/Link/MessageLink
+	// rows but a later step (e.g. rewrite.Rewrite) fails before Process
+	// can return a Verdict (ATR-239): since no token from those rows was
+	// ever exposed to a recipient in that case (fail-open delivers the
+	// original, untouched message; fail-closed temp-fails it — see
+	// pipeline.AttachmentProcessor.Process's own doc comment), the rows
+	// are safe to delete outright rather than merely left as orphaned
+	// metadata. Details' "ok" field records whether the compensating
+	// delete itself succeeded — it can legitimately fail (e.g. a link
+	// was placed under legal hold in the narrow window between creation
+	// and this attempt), in which case the rows are deliberately left in
+	// place rather than partially pruned, and this event's Details
+	// records why via the "reason" field, mirroring TypeHold/TypeRevoke's
+	// own ok/reason shape.
+	TypeCompensation Type = "compensation"
+	// TypeRetentionCheckpoint records one audit-log retention truncation
+	// (ATR-308, ADR-017): the store removed every event up to and
+	// including a boundary seq and appended this event to anchor the
+	// survivors. Details carries anchor_seq, anchor_hash (the recomputed
+	// hash of the last truncated row — the trusted continuation point for
+	// the surviving chain), truncated_count, cutoff and held_clamped (see
+	// the Detail* constants in retention.go). Being a normal chained row,
+	// this event is itself tamper-evident, so the act of truncating is
+	// covered by the same hash chain it prunes.
+	TypeRetentionCheckpoint Type = "retention_checkpoint"
 )
 
 // Valid reports whether t is one of the recognized Type values above
@@ -83,7 +110,8 @@ const (
 func (t Type) Valid() bool {
 	switch t {
 	case TypeMessageProcessed, TypePolicyDecision, TypeAttachmentStored, TypeLinksCreated,
-		TypeDownload, TypeRevoke, TypeHold, TypeRetentionCleanup, TypeTokenChange, TypeError:
+		TypeDownload, TypeRevoke, TypeHold, TypeRetentionCleanup, TypeTokenChange, TypeError,
+		TypeCompensation, TypeRetentionCheckpoint:
 		return true
 	default:
 		return false
@@ -135,6 +163,17 @@ type Event struct {
 	// than ad hoc typed columns keeps the schema stable as new event
 	// producers are added, while still keeping untrusted values out of
 	// any concatenated string (SR-128-2).
+	//
+	// Trust-boundary convention (token-hygiene invariant, reviewed ATR-200/
+	// ATR-295, docs/security/threat-model.md T5.2): Details is read by
+	// trusted roles only (admin/auditor, via the /audit API resource and
+	// the JSON-lines export) and must never carry a bearer token, an API
+	// token secret/hash, or storage-backend credentials. A
+	// storage.Driver object key (e.g. retention's "storage_key" field)
+	// is not covered by this restriction — it is not itself a secret,
+	// since reading the object it names still requires the storage
+	// backend's own credentials, and the key encodes no plaintext
+	// object metadata.
 	Details map[string]any
 }
 
@@ -150,18 +189,16 @@ type Recorded struct {
 	// Seq is the monotonically increasing sequence number of this
 	// event within the append-only log, assigned by the AuditSink in
 	// insertion order. Seq (together with PrevHash) is the hook
-	// SR-128-1 requires for tamper-evidence: a verifier can walk the
-	// log in Seq order and confirm each row's PrevHash matches the
-	// previous row's hash. Full chain verification is not implemented
-	// by this task (see package doc comment); Seq/PrevHash are laid
-	// down now so that verification can be added later without a
-	// schema migration.
+	// SR-128-1 requires for tamper-evidence: the verifier (Verify/
+	// VerifyJSONL, ATR-240) walks the log in Seq order and confirms each
+	// row's PrevHash matches HashRecord of the previous row.
 	Seq int64
 
 	// PrevHash is the hash of the previous record in the chain (the
 	// record with Seq-1), or empty for the very first record. Computing
 	// and storing this value is the tamper-evidence hook mandated by
-	// SR-128-1; verifying the chain end-to-end is intentionally out of
-	// scope for this task (see package doc comment).
+	// SR-128-1; Verify/VerifyJSONL (ATR-240) walk the chain end-to-end,
+	// recomputing HashRecord for each row and comparing it to the next
+	// row's PrevHash.
 	PrevHash string
 }

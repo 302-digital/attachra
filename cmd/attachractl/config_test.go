@@ -152,8 +152,86 @@ func TestReadTokenFile_Empty(t *testing.T) {
 	if err := os.WriteFile(path, []byte("   \n"), 0o600); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
-	if _, err := readTokenFile(path); err == nil {
+	if _, _, err := readTokenFile(path); err == nil {
 		t.Fatal("readTokenFile() error = nil, want an error for an empty (whitespace-only) file")
+	}
+}
+
+func TestReadTokenFile_WarnsOnGroupWorldReadablePerms(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token.txt")
+	if err := os.WriteFile(path, []byte("secret-token"), 0o644); err != nil { //nolint:gosec // deliberately unsafe perms: this test exercises the warning for exactly this case
+		t.Fatalf("write file: %v", err)
+	}
+	// os.WriteFile's mode is subject to the process umask; chmod
+	// explicitly afterwards so this assertion does not depend on the
+	// umask of whatever environment runs the test.
+	if err := os.Chmod(path, 0o644); err != nil { //nolint:gosec // deliberately unsafe perms: this test exercises the warning for exactly this case
+		t.Fatalf("chmod file: %v", err)
+	}
+	token, warning, err := readTokenFile(path)
+	if err != nil {
+		t.Fatalf("readTokenFile() error = %v, want nil", err)
+	}
+	if token != "secret-token" {
+		t.Errorf("token = %q, want %q", token, "secret-token")
+	}
+	if warning == "" {
+		t.Error("warning = \"\", want a warning about group/other-readable permissions")
+	}
+}
+
+func TestReadTokenFile_NoWarningOnOwnerOnlyPerms(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token.txt")
+	if err := os.WriteFile(path, []byte("secret-token"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	_, warning, err := readTokenFile(path)
+	if err != nil {
+		t.Fatalf("readTokenFile() error = %v, want nil", err)
+	}
+	if warning != "" {
+		t.Errorf("warning = %q, want none for an owner-only-readable file", warning)
+	}
+}
+
+func TestResolveConnectConfig_WarnsOnUnsafeTokenFilePerms(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "token.txt")
+	if err := os.WriteFile(tokenPath, []byte("flag-token"), 0o644); err != nil { //nolint:gosec // deliberately unsafe perms: this test exercises the warning for exactly this case
+		t.Fatalf("write token file: %v", err)
+	}
+	if err := os.Chmod(tokenPath, 0o644); err != nil { //nolint:gosec // deliberately unsafe perms: this test exercises the warning for exactly this case
+		t.Fatalf("chmod token file: %v", err)
+	}
+
+	cfg, err := resolveConnectConfig(connectFlags{
+		configPath: filepath.Join(dir, "does-not-exist.yaml"),
+		url:        "https://example.com",
+		tokenFile:  tokenPath,
+	}, fakeEnv(nil))
+	if err != nil {
+		t.Fatalf("resolveConnectConfig() error = %v, want nil", err)
+	}
+	if len(cfg.Warnings) != 1 {
+		t.Fatalf("Warnings = %v, want exactly one warning about the token file's permissions", cfg.Warnings)
+	}
+}
+
+func TestResolveConnectConfig_WarnsOnUnsafeInlineConfigTokenPerms(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte("url: https://file.example.com\ntoken: file-token\n"), 0o644); err != nil { //nolint:gosec // deliberately unsafe perms: this test exercises the warning for exactly this case
+		t.Fatalf("write config file: %v", err)
+	}
+	if err := os.Chmod(configPath, 0o644); err != nil { //nolint:gosec // deliberately unsafe perms: this test exercises the warning for exactly this case
+		t.Fatalf("chmod config file: %v", err)
+	}
+
+	cfg, err := resolveConnectConfig(connectFlags{configPath: configPath}, fakeEnv(nil))
+	if err != nil {
+		t.Fatalf("resolveConnectConfig() error = %v, want nil", err)
+	}
+	if len(cfg.Warnings) != 1 {
+		t.Fatalf("Warnings = %v, want exactly one warning about the config file's permissions", cfg.Warnings)
 	}
 }
 

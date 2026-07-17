@@ -19,7 +19,7 @@ import (
 // that Link (SR-125-6) after confirming it belongs to the message the
 // package token resolves to, then this handler streams the object
 // straight from storage.Driver to the response without buffering the
-// whole payload in memory (SR-125-1, CLAUDE.md invariant #4).
+// whole payload in memory (SR-125-1, the streaming invariant).
 func (h *Handler) serveDownload(w http.ResponseWriter, r *http.Request, token, linkID string) {
 	registeredLink, err := h.engine.RegisterPackageDownload(r.Context(), token, linkID)
 	if err != nil {
@@ -57,8 +57,21 @@ func (h *Handler) serveDownload(w http.ResponseWriter, r *http.Request, token, l
 	w.Header().Set("Content-Disposition", contentDisposition(att.Filename))
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Security-Policy", pageCSP)
-	if att.Size > 0 {
-		w.Header().Set("Content-Length", strconv.FormatInt(att.Size, 10))
+	// Content-Length must reflect the object actually being streamed,
+	// not the metadata DB's att.Size: the two can drift (e.g. a
+	// storage object replaced or re-uploaded out of band), and a
+	// Content-Length that promises more or fewer bytes than io.Copy
+	// below actually writes produces a truncated/hanging response for
+	// the client rather than a clean error (ATR-238 minor-4). h.storage
+	// is asked for the object's own size via Stat (a metadata-only
+	// call, not a second read of the payload) and that value is
+	// trusted instead. If Stat fails for any reason, the response
+	// simply omits Content-Length and net/http falls back to chunked
+	// transfer encoding, which is always correct regardless of size.
+	if info, err := h.storage.Stat(r.Context(), att.StorageKey); err == nil && info.Size > 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
+	} else if err != nil {
+		h.logger.Warn("download content-length stat failed, streaming without Content-Length", "token_ref", tokenRef(token), "error", err.Error())
 	}
 	w.WriteHeader(http.StatusOK)
 
@@ -72,7 +85,7 @@ func (h *Handler) serveDownload(w http.ResponseWriter, r *http.Request, token, l
 
 	// io.Copy streams directly from the storage backend to the
 	// response writer: neither side is ever fully buffered in memory
-	// (SR-125-1, CLAUDE.md invariant #4). A copy error after headers
+	// (SR-125-1, the streaming invariant). A copy error after headers
 	// are already sent cannot be surfaced as a different status code
 	// (the response is committed), so it is only logged.
 	if _, err := io.Copy(w, rc); err != nil {

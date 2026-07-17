@@ -2,14 +2,12 @@
 // component (message parsing, policy evaluation, storage upload, link
 // generation and MIME rewrite) into the first end-to-end mail path
 // (ATR-167). See doc comments below for the exact sequencing and how
-// each step resolves into CLAUDE.md invariant #3 (a message can never
-// be silently lost).
+// each step resolves into the mail-must-never-be-lost invariant (a
+// message can never be silently lost).
 package pipeline
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -22,6 +20,7 @@ import (
 	"github.com/302-digital/attachra/internal/core/metrics"
 	"github.com/302-digital/attachra/internal/core/policy"
 	"github.com/302-digital/attachra/internal/core/rewrite"
+	"github.com/302-digital/attachra/internal/core/spoolutil"
 	"github.com/302-digital/attachra/internal/core/storage"
 )
 
@@ -97,9 +96,19 @@ type AttachmentProcessorParams struct {
 	// attachment/policy decisions and processing duration (US-7.2/
 	// T-7.2.1, ATR-192). A nil Metrics is valid: every metrics.Metrics
 	// method is nil-safe, matching Logger/AuditSink's optional-by-design
-	// posture, so recording metrics never affects delivery (CLAUDE.md
-	// invariant #3).
+	// posture, so recording metrics never affects delivery (per the
+	// mail-must-never-be-lost invariant).
 	Metrics *metrics.Metrics
+
+	// SpoolDir selects the directory temporary spool files (the
+	// captured message body, buffered attachment content, and
+	// rewrite.Rewrite's staged output) are created in once a stream
+	// exceeds spoolutil.SpoolMemThreshold (ATR-262). It is
+	// expected to be config.SpoolConfig.Dir; the empty string (the
+	// default) uses the OS default temporary directory ($TMPDIR /
+	// os.TempDir()), matching os.CreateTemp's own documented behavior
+	// for an empty dir argument and preserving pre-ATR-262 behavior.
+	SpoolDir string
 }
 
 // AttachmentProcessor is the real pipeline.Processor implementation
@@ -185,10 +194,11 @@ const pipelineActor = "milter"
 // returning) any failure. Audit recording is deliberately
 // best-effort and out of Process's own success/failure path: a message
 // must never be lost, rejected, or delayed because the audit log
-// could not be written (CLAUDE.md invariant #3) — the audit trail is a
-// secondary, observability concern layered onto an already-decided
-// mail-delivery outcome, not a precondition for it. Every call site
-// below therefore ignores this method's (absent) return value.
+// could not be written (the mail-must-never-be-lost invariant) — the
+// audit trail is a secondary, observability concern layered onto an
+// already-decided mail-delivery outcome, not a precondition for it.
+// Every call site below therefore ignores this method's (absent)
+// return value.
 func (p *AttachmentProcessor) recordAudit(ctx context.Context, ev audit.Event) {
 	ev.Actor = pipelineActor
 	if _, err := p.auditSink().Record(ctx, ev); err != nil {
@@ -199,7 +209,7 @@ func (p *AttachmentProcessor) recordAudit(ctx context.Context, ev audit.Event) {
 // Process implements Processor. See the package doc comment and the
 // step-by-step comments below for the full sequencing.
 //
-// Error handling (CLAUDE.md invariant #3): every error returned by
+// Error handling (mail-must-never-be-lost invariant): every error returned by
 // Process — from message parsing, storage, the metadata store, or
 // rewrite — is returned as a plain error, never as a Verdict and never
 // via panic. The milter adapter (internal/adapters/milter's backend)
@@ -213,35 +223,47 @@ func (p *AttachmentProcessor) recordAudit(ctx context.Context, ev audit.Event) {
 // as an error and the whole message is handled by the configured
 // failure policy instead.
 //
-// Storage-vs-metadata rollback asymmetry: if link.Engine.CreateLinks
-// succeeds but a later step (packageURLFor, rewrite.Rewrite) fails,
-// the storage objects already uploaded for this message are rolled
-// back (deleted, see the defer around uploadReplaced below), but the
-// message/attachment/link rows CreateLinks already wrote to the
-// metadata store are not — store.MetadataStore exposes no delete
-// operation for them (only RevokeLink/RevokeLinksByMessage, which mark
-// a row revoked rather than remove it). Such a failure therefore
-// leaves behind active-status rows that reference storage keys which
-// no longer exist. This is safe with respect to CLAUDE.md invariant #3
-// and the recipient-facing contract: no token for those rows was ever
+// Storage-and-metadata rollback (ATR-239): if link.Engine.CreateLinks
+// succeeds but a later step (packageURLFor, rewrite.Rewrite) fails, the
+// storage objects already uploaded for this message are rolled back
+// (deleted, see the defer around uploadReplaced below), and so is the
+// metadata CreateLinks already wrote: the same deferred cleanup calls
+// LinkEngine.PurgeMessage to delete the Message/Attachment/Link/
+// MessageLink rows outright, mirroring the storage rollback's own
+// "already happened, undo it synchronously before Process returns"
+// shape rather than deferring the cleanup to a background job — the
+// window this compensation needs to close is milliseconds wide (the
+// remainder of one Process call), not worth the added complexity of a
+// queue/goroutine with its own ownership and shutdown story. This is
+// safe with respect to the mail-must-never-be-lost invariant and the
+// recipient-facing contract: no token for those rows was ever
 // generated into a delivered message (Process returns an error before
-// any Verdict reaches the adapter, so fail-open delivers the original,
-// untouched message and fail-closed temp-fails it), so nothing
-// resolvable was ever exposed. It is, however, discoverable metadata
-// debris an operator/future cleanup job should be aware of; a
-// metadata-side rollback is not implemented here because
-// store.MetadataStore has no delete-by-id operations to perform it
-// with (a gap to close alongside a broader retention/cleanup story,
-// not something to grow ad hoc in this Processor).
+// any Verdict reaches the
+// adapter, so fail-open delivers the original, untouched message and
+// fail-closed temp-fails it), so nothing resolvable was ever exposed —
+// deleting the rows removes discoverable metadata debris rather than
+// anything a recipient could still reach.
+//
+// The compensation itself is best-effort and never allowed to change
+// what Process returns: PurgeMessage can itself fail (most plausibly
+// ErrHeld, if a link was placed under legal hold in the vanishingly
+// narrow window between its creation and this call — see PurgeMessage's
+// own doc comment), in which case the rows are left in place exactly as
+// they were before this compensation attempt (store.MetadataStore.
+// DeleteMessage's own all-or-nothing guard, ATR-259's precedent) and a
+// warning is logged; the original error from the step that actually
+// failed (rewrite, packageURLFor, ...) is always what Process returns,
+// never a compensation failure.
 //
 // Audit coverage (US-7.1, ATR-190): Process records a TypeError event
 // for every early error return, a TypePolicyDecision event once the
 // policy engine has decided, a TypeAttachmentStored event per
 // successfully uploaded attachment, a TypeLinksCreated event once
-// links are minted, and a single TypeMessageProcessed event on every
-// exit path (accept/reject/rewrite/error) via the deferred recorder
-// below. Recording is always best-effort: see recordAudit's doc
-// comment for why an audit-sink failure never changes Process's
+// links are minted, a TypeCompensation event (via PurgeMessage) whenever
+// the rollback above runs, and a single TypeMessageProcessed event on
+// every exit path (accept/reject/rewrite/error) via the deferred
+// recorder below. Recording is always best-effort: see recordAudit's
+// doc comment for why an audit-sink failure never changes Process's
 // returned Verdict/error.
 func (p *AttachmentProcessor) Process(ctx context.Context, env *Envelope) (verdict *Verdict, procErr error) {
 	// finalOutcome records exactly one TypeMessageProcessed event
@@ -281,7 +303,7 @@ func (p *AttachmentProcessor) Process(ctx context.Context, env *Envelope) (verdi
 	// message.Parse (step a) and, later, rewrite.Rewrite (step f):
 	// Envelope.Body is documented as a single-read stream, but this
 	// pipeline needs to walk it twice.
-	body, err := spoolReader(env.Body)
+	body, err := spoolReader(env.Body, p.params.SpoolDir)
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: spool message body: %w", err)
 	}
@@ -335,10 +357,33 @@ func (p *AttachmentProcessor) Process(ctx context.Context, env *Envelope) (verdi
 	// see protectInlineAssets/protectStructuralBodies doc comments for
 	// why these must never silently skip evaluation (that would itself
 	// be an enforcement bypass, not a protection).
-	decision, inlineProtectedPaths := protectInlineAssets(atts, decision, p.inlineMaxSize())
+	// Phase 2 of ADR-016 (ATR-307): before applying the inline protective
+	// downgrade, learn which Content-IDs the message's text/html bodies
+	// actually embed via cid:, so a Content-ID part nobody references is
+	// no longer protected for nothing (it replaces normally like any
+	// other attachment). collectHTMLCIDRefs reuses the already-spooled
+	// HTML bodies and never aborts processing on a scan error (invariant
+	// #3). It is gated behind hasInlineCandidate (security review, B2):
+	// an ordinary message with no InlineAsset candidate at all never
+	// pays for a spool re-read or a cid: scan of its own html body.
+	var htmlCIDs []htmlCIDRefs
+	if hasInlineCandidate(atts, p.inlineMaxSize()) {
+		htmlCIDs = p.collectHTMLCIDRefs(atts, bodies)
+	} else {
+		// Debug-level, not Warn: skipping the scan is the expected,
+		// common case for a message with no inline-asset candidate, not
+		// a problem. Logged (rather than silent) so the gate itself is
+		// directly observable/testable (security review, B2) without
+		// needing to instrument the spool layer.
+		p.logger().Debug("pipeline: cid scan: skipped (no inline-asset candidate)", "queue_id", env.QueueID)
+	}
+	decision, inlineProtectedPaths, inlineUnverifiedPaths := protectInlineAssets(atts, decision, p.inlineMaxSize(), htmlCIDs)
 	decision, bodyProtectedPaths := protectStructuralBodies(atts, decision)
 	for range inlineProtectedPaths {
 		p.metrics().ObserveAttachmentAction("inline_protected")
+	}
+	for range inlineUnverifiedPaths {
+		p.metrics().ObserveAttachmentAction("inline_protected_unverified")
 	}
 	for range bodyProtectedPaths {
 		p.metrics().ObserveAttachmentAction("body_protected")
@@ -357,6 +402,15 @@ func (p *AttachmentProcessor) Process(ctx context.Context, env *Envelope) (verdi
 	}
 	if len(inlineProtectedPaths) > 0 {
 		policyDecisionDetails["inline_protected"] = inlineProtectedPaths
+	}
+	// inline_protected_unverified is the subset of inline_protected whose
+	// cid: reference could NOT be verified (ADR-016 phase 2 / ATR-307
+	// fail-safe: the text/html body was truncated beyond the scan bound
+	// or unreadable), so the part was protected on phase-1 grounds alone.
+	// It surfaces the residual (threat-model T2.8) to operators; an empty
+	// slice is omitted so the common, fully-verified path stays quiet.
+	if len(inlineUnverifiedPaths) > 0 {
+		policyDecisionDetails["inline_protected_unverified"] = inlineUnverifiedPaths
 	}
 	if len(bodyProtectedPaths) > 0 {
 		policyDecisionDetails["body_protected"] = bodyProtectedPaths
@@ -396,7 +450,7 @@ func (p *AttachmentProcessor) Process(ctx context.Context, env *Envelope) (verdi
 	// event from this point on (including per-attachment
 	// TypeAttachmentStored below) can already carry it; it is the same
 	// ID later passed to LinkEngine.CreateLinks as link.MessageInput.ID.
-	messageID, err = newRandomID()
+	messageID, err = spoolutil.NewRandomID()
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: generate message id: %w", err)
 	}
@@ -406,12 +460,23 @@ func (p *AttachmentProcessor) Process(ctx context.Context, env *Envelope) (verdi
 	// whatever succeeded even if uploadReplaced itself returns early
 	// on a later attachment's failure, so the rollback deferred right
 	// below covers a partial upload failure too, not just failures in
-	// the steps after uploadReplaced returns. This rollback only
-	// covers storage objects, not metadata rows written later by
-	// CreateLinks — see the storage-vs-metadata rollback asymmetry
-	// note on Process's own doc comment above.
+	// the steps after uploadReplaced returns.
+	//
+	// compensateMetadata gates the metadata half of the rollback below:
+	// it is flipped to true right before the CreateLinks call, so it
+	// covers both a CreateLinks call that itself fails partway through
+	// (which, per CreateLinks' own doc comment, is not fully
+	// transactional and can leave a Message row and some Attachment
+	// rows behind) and every later step's failure (packageURLFor,
+	// rewrite.Rewrite) once CreateLinks has fully succeeded. It stays
+	// false for a plain upload failure, where messageID exists as a
+	// local variable but no Message row was ever written, so there is
+	// nothing yet for LinkEngine.PurgeMessage to do (see PurgeMessage's
+	// own idempotent-on-ErrNotFound contract for why calling it in that
+	// case would be harmless but pointless, not incorrect).
 	uploaded, err := p.uploadReplaced(ctx, atts, bodies, decision)
 	uploadedOK := false
+	compensateMetadata := false
 	defer func() {
 		if uploadedOK {
 			return
@@ -421,6 +486,24 @@ func (p *AttachmentProcessor) Process(ctx context.Context, env *Envelope) (verdi
 				p.logger().Warn("pipeline: failed to roll back uploaded attachment after later failure",
 					"queue_id", env.QueueID, "storage_key", u.storageKey, "error", derr)
 			}
+		}
+		if !compensateMetadata {
+			return
+		}
+		// Run synchronously, in the same deferred cleanup as the storage
+		// rollback above rather than handed off to a background
+		// goroutine: this is a single local metadata-store transaction
+		// (typically sub-millisecond), far cheaper than the storage
+		// deletes it runs alongside, and Process's caller (the milter
+		// adapter) already waits for this whole deferred cleanup to
+		// finish before Process returns — adding one more bounded, fast
+		// call here does not meaningfully change that latency, while a
+		// background goroutine would need its own lifecycle/shutdown
+		// ownership (the every-goroutine-has-an-owner rule) for a
+		// cleanup this cheap to justify.
+		if perr := p.params.LinkEngine.PurgeMessage(context.Background(), pipelineActor, messageID); perr != nil {
+			p.logger().Warn("pipeline: failed to compensate message metadata after later failure",
+				"queue_id", env.QueueID, "message_id", messageID, "error", perr)
 		}
 	}()
 	if err != nil {
@@ -440,6 +523,7 @@ func (p *AttachmentProcessor) Process(ctx context.Context, env *Envelope) (verdi
 		})
 	}
 
+	compensateMetadata = true
 	created, err := p.params.LinkEngine.CreateLinks(ctx, link.CreateLinksParams{
 		Message: link.MessageInput{
 			ID:      messageID,
@@ -494,6 +578,7 @@ func (p *AttachmentProcessor) Process(ctx context.Context, env *Envelope) (verdi
 		PackageURL:  packageURL,
 		ExpiresAt:   expiresAt,
 		SenderName:  env.Sender,
+		SpoolDir:    p.params.SpoolDir,
 	}, p.params.Templates)
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: rewrite message: %w", err)
@@ -567,7 +652,7 @@ func isStructuralBodyPart(att message.Attachment) bool {
 // Buffering is bounded per attachment (message.Limits.MaxPartSize,
 // already enforced by message.Parse itself, and, in addition,
 // AttachmentProcessorParams.MaxAttachmentSize if configured), so this
-// does not violate CLAUDE.md invariant #4: each attachment's content
+// does not violate the streaming invariant: each attachment's content
 // is captured through the same bounded spool used for the whole
 // message body, never an unbounded single allocation.
 func (p *AttachmentProcessor) parseMessage(r io.Reader) ([]message.Attachment, []*spool, error) {
@@ -582,7 +667,7 @@ func (p *AttachmentProcessor) parseMessage(r io.Reader) ([]message.Attachment, [
 			limited = &limitedReader{r: partBody, remaining: p.params.MaxAttachmentSize}
 		}
 
-		s, err := spoolReader(limited)
+		s, err := spoolReader(limited, p.params.SpoolDir)
 		if err != nil {
 			return fmt.Errorf("buffer attachment part %q: %w", att.PartPath, err)
 		}
@@ -645,23 +730,16 @@ func rewriteInput(atts []message.Attachment, decision policy.MessageDecision) ([
 	}
 }
 
-// sniffLen mirrors internal/core/message's own unexported sniffLen
-// constant (the WHATWG MIME Sniffing window DetectType considers);
-// duplicated here since message does not export it, but the value
-// itself is a documented, stable contract of DetectType's doc comment
-// ("callers should pass at least sniffLen bytes when available").
-const sniffLen = 512
-
-// readSniffPrefix returns up to sniffLen bytes from the start of s's
-// captured content, for message.DetectType, without consuming s's
-// reusable Reader for later callers (a fresh io.Reader is opened and
-// discarded here).
+// readSniffPrefix returns up to spoolutil.SniffLen bytes from the
+// start of s's captured content, for message.DetectType, without
+// consuming s's reusable Reader for later callers (a fresh io.Reader
+// is opened and discarded here).
 func readSniffPrefix(s *spool) ([]byte, error) {
 	r, err := s.Reader()
 	if err != nil {
 		return nil, err
 	}
-	buf := make([]byte, sniffLen)
+	buf := make([]byte, spoolutil.SniffLen)
 	n, err := io.ReadFull(r, buf)
 	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
 		return nil, err
@@ -714,15 +792,32 @@ const inlineImageTypePrefix = "image/"
 // normally. ActionBlock is never downgraded: blocking is a stronger,
 // deliberate policy outcome ADR-016 does not soften.
 //
+// Phase 2 (ADR-016 / ATR-307): the structural signal above is no longer
+// sufficient on its own. The asset is protected only if its Content-ID
+// is actually referenced via a `cid:` URL from a text/html body of the
+// same multipart/related container (cidReferenced against htmls, keyed
+// on the container path parentPath(att.PartPath)). An InlineAsset whose
+// Content-ID nothing embeds now replaces normally, narrowing the
+// residual bypass threat-model T2.8 documents. When the reference cannot
+// be verified (the relevant HTML body was truncated beyond the scan
+// bound or unreadable), cidReferenced returns a fail-safe positive: the
+// asset is still protected (phase-1 behavior — never break a message we
+// cannot fully verify) and its PartPath is also returned in the second,
+// "unverified" slice for the caller's audit/metrics.
+//
 // atts and m.Attachments must be the same length and index-aligned
 // (policy.Evaluate's own documented contract, which parseMessage/
 // Process already preserve). protectInlineAssets returns the
 // (possibly modified) decision, with the message-level Action
-// re-aggregated to reflect any downgrades, and the PartPath of every
-// downgraded attachment (nil if none), for the caller's audit/metrics
-// reporting.
-func protectInlineAssets(atts []message.Attachment, m policy.MessageDecision, inlineMaxSize int64) (policy.MessageDecision, []string) {
-	var protectedPaths []string
+// re-aggregated to reflect any downgrades, the PartPath of every
+// downgraded attachment (nil if none), and the subset of those whose
+// cid: reference could not be verified (nil if none), for the caller's
+// audit/metrics reporting.
+func protectInlineAssets(atts []message.Attachment, m policy.MessageDecision, inlineMaxSize int64, htmls []htmlCIDRefs) (policy.MessageDecision, []string, []string) {
+	var (
+		protectedPaths  []string
+		unverifiedPaths []string
+	)
 
 	out := policy.MessageDecision{Attachments: make([]policy.AttachmentDecision, len(m.Attachments))}
 	copy(out.Attachments, m.Attachments)
@@ -741,13 +836,20 @@ func protectInlineAssets(atts []message.Attachment, m policy.MessageDecision, in
 		if att.Size > inlineMaxSize {
 			continue
 		}
+		referenced, failsafe := cidReferenced(htmls, parentPath(att.PartPath), att.ContentID)
+		if !referenced {
+			continue
+		}
 
 		out.Attachments[i].Action = policy.ActionPass
 		protectedPaths = append(protectedPaths, att.PartPath)
+		if failsafe {
+			unverifiedPaths = append(unverifiedPaths, att.PartPath)
+		}
 	}
 
 	out.Action, out.Reason = aggregateMessageAction(out.Attachments)
-	return out, protectedPaths
+	return out, protectedPaths, unverifiedPaths
 }
 
 // protectStructuralBodies applies the ATR-306 fix's protective layer:
@@ -791,22 +893,36 @@ func protectStructuralBodies(atts []message.Attachment, m policy.MessageDecision
 	return out, protectedPaths
 }
 
+// messageActionRank ranks policy.Action by severity so
+// aggregateMessageAction can pick the strongest action across
+// attachments (pass < replace < block), mirroring policy.Evaluate's own
+// worst-case aggregation rule (§3.1). It is duplicated (in miniature)
+// here rather than calling into policy directly because the ranking
+// helper (actionStrength) policy.Evaluate itself uses is unexported.
+//
+// LATCH (ATR-307 review note): this map, and the rewriteInput/
+// aggregateMessageAction machinery that depends on it, enumerate the
+// closed set of policy.Action values. If policy gains a fourth Action,
+// an unranked value here would silently aggregate as weaker than pass
+// (rank 0) — a correctness hole. TestMessageActionRankIsExhaustive pins
+// the expected value count so adding an Action forces a deliberate
+// update here.
+var messageActionRank = map[policy.Action]int{
+	policy.ActionPass:    1,
+	policy.ActionReplace: 2,
+	policy.ActionBlock:   3,
+}
+
 // aggregateMessageAction re-derives the message-level Action/Reason
 // from per-attachment decisions, mirroring policy.Evaluate's own
 // worst-case aggregation rule (§3.1: the strongest action across
-// attachments wins). It is duplicated (in miniature) here rather than
-// calling into policy directly because the ranking helper
-// (actionStrength) policy.Evaluate itself uses is unexported; the
-// three-value ranking (pass < replace < block) is stable and simple
-// enough that this small duplication is preferable to exporting an
-// internal ranking function purely for this one call site.
+// attachments wins).
 func aggregateMessageAction(decisions []policy.AttachmentDecision) (policy.Action, string) {
 	action := policy.ActionPass
 	reason := ""
-	rank := map[policy.Action]int{policy.ActionPass: 1, policy.ActionReplace: 2, policy.ActionBlock: 3}
 
 	for _, d := range decisions {
-		if rank[d.Action] > rank[action] {
+		if messageActionRank[d.Action] > messageActionRank[action] {
 			action = d.Action
 			reason = d.Reason
 		}
@@ -868,7 +984,7 @@ func (p *AttachmentProcessor) uploadReplaced(ctx context.Context, atts []message
 			return uploaded, fmt.Errorf("upload attachment %q: %w", atts[i].PartPath, err)
 		}
 
-		id, err := newRandomID()
+		id, err := spoolutil.NewRandomID()
 		if err != nil {
 			return uploaded, fmt.Errorf("generate attachment id for %q: %w", atts[i].PartPath, err)
 		}
@@ -974,17 +1090,4 @@ func (l *limitedReader) Read(p []byte) (int, error) {
 	n, err := l.r.Read(p)
 	l.remaining -= int64(n)
 	return n, err
-}
-
-// newRandomID generates a new opaque, hex-encoded identifier for a
-// store.Message/store.Attachment row, using the same 128-bit
-// crypto/rand scheme as internal/core/link's own unexported newID
-// (duplicated rather than imported since it is a private helper of
-// that package). It never derives from message content (SR-121-3).
-func newRandomID() (string, error) {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", fmt.Errorf("generate id: %w", err)
-	}
-	return hex.EncodeToString(b[:]), nil
 }

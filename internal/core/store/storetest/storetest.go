@@ -41,6 +41,8 @@ func Run(t *testing.T, st store.MetadataStore) {
 	t.Run("ListExpiredAttachmentsRespectsLimit", func(t *testing.T) { testListExpiredAttachmentsLimit(t, st) })
 	t.Run("DeleteAttachmentCascadesLinksAndIsIdempotent", func(t *testing.T) { testDeleteAttachment(t, st) })
 	t.Run("DeleteAttachmentRefusesHeldAttachment", func(t *testing.T) { testDeleteAttachmentRefusesHeld(t, st) })
+	t.Run("DeleteMessageCascadesAttachmentsLinksAndIsIdempotent", func(t *testing.T) { testDeleteMessage(t, st) })
+	t.Run("DeleteMessageRefusesHeldLink", func(t *testing.T) { testDeleteMessageRefusesHeld(t, st) })
 	t.Run("IsAttachmentHeld", func(t *testing.T) { testIsAttachmentHeld(t, st) })
 	t.Run("ExpireStaleLinksMarksPastExpiry", func(t *testing.T) { testExpireStaleLinks(t, st) })
 }
@@ -301,8 +303,8 @@ func testRegisterDownloadByIDLimit(t *testing.T, st store.MetadataStore) {
 // budget from many goroutines at once, asserting the guarded atomic
 // UPDATE (not a read-then-write race) is what enforces MaxDownloads:
 // exactly MaxDownloads calls must succeed regardless of how many race
-// to increment concurrently. Run with -race (CLAUDE.md invariant on
-// critical counters).
+// to increment concurrently. Run with -race (critical counters must be
+// race-safe).
 func testRegisterDownloadByIDConcurrent(t *testing.T, st store.MetadataStore) {
 	ctx := context.Background()
 	messageID, attachmentID := seedMessage(t, ctx, st, "msg-dl-id-concurrent")
@@ -528,6 +530,39 @@ func testListMessagesBySender(t *testing.T, st store.MetadataStore) {
 	if len(none) != 0 {
 		t.Errorf("ListMessagesBySender(unknown sender) = %+v, want empty", none)
 	}
+
+	// ATR-293 (closing the ATR-258 review's N1 finding): every write
+	// path now stores the sender in mail.NormalizeAddress's canonical
+	// form (milter ingest normalizes it; see
+	// internal/adapters/milter/backend.go's MailFrom), so a message
+	// recorded exactly like that — lower-case, bracket-free, as
+	// "alice-bysender@example.com" below — must still be found by a
+	// revoke-by-sender query typed with different case and/or SMTP
+	// angle brackets (an operator pasting an address straight out of a
+	// raw mail log). ListMessagesBySender normalizes its own argument
+	// via mail.NormalizeAddress before matching, which is what makes
+	// this work. (Legacy rows written before this fix, in the raw
+	// unnormalized shape itself, are covered separately by migration
+	// 000007 — see TestMigration000007NormalizesExistingAddresses in
+	// package sqlite, which seeds exactly that shape and asserts the
+	// migration cleans it up.)
+	canonicalSender := "alice-bysender@example.com"
+	if err := st.CreateMessage(ctx, store.NewMessageParams{
+		ID:      "msg-bysender-canonical",
+		QueueID: "queue-msg-bysender-canonical",
+		Sender:  canonicalSender,
+	}); err != nil {
+		t.Fatalf("CreateMessage(canonical sender) error = %v, want nil", err)
+	}
+
+	byBracketedQuery, err := st.ListMessagesBySender(ctx, "<Alice-Bysender@EXAMPLE.com>")
+	if err != nil {
+		t.Fatalf("ListMessagesBySender(bracketed, mixed-case query) error = %v, want nil", err)
+	}
+	if len(byBracketedQuery) != 1 || byBracketedQuery[0].ID != "msg-bysender-canonical" {
+		t.Fatalf("ListMessagesBySender(bracketed, mixed-case query) = %+v, want exactly [msg-bysender-canonical] (stored as %q)",
+			byBracketedQuery, canonicalSender)
+	}
 }
 
 // testListLinks verifies ListLinks' filters (message_id, recipient,
@@ -741,7 +776,7 @@ func testListExpiredAttachments(t *testing.T, st store.MetadataStore) {
 // testListExpiredAttachmentsLimit verifies limit is honored, so a
 // caller (internal/core/retention) can safely chunk a large sweep
 // (ADR-011's "chunked DELETE" guidance) without ever loading every
-// expired attachment at once (CLAUDE.md invariant #4).
+// expired attachment at once (the streaming invariant).
 func testListExpiredAttachmentsLimit(t *testing.T, st store.MetadataStore) {
 	ctx := context.Background()
 	past := time.Now().Add(-1 * time.Hour).UTC().Format(time.RFC3339Nano)
@@ -845,6 +880,120 @@ func testDeleteAttachmentRefusesHeld(t *testing.T, st store.MetadataStore) {
 	}
 	if _, err := st.GetLinkByTokenHash(ctx, "hash-delete-att-held"); err != nil {
 		t.Errorf("GetLinkByTokenHash() after refused delete error = %v, want nil (held link must survive)", err)
+	}
+}
+
+// testDeleteMessage covers ATR-239's core contract: deleting a Message
+// also removes every Attachment, Link and MessageLink row belonging to
+// it (the message_id foreign keys on all three have no ON DELETE
+// behavior, so a caller must never be able to observe one without the
+// other), and is idempotent (a retry after the row is already gone
+// returns ErrNotFound rather than succeeding silently a second time or
+// erroring in some other way).
+func testDeleteMessage(t *testing.T, st store.MetadataStore) {
+	ctx := context.Background()
+	messageID, attachmentID := seedMessage(t, ctx, st, "msg-delete-msg")
+
+	expiresAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339Nano)
+	if err := st.CreateLink(ctx, store.NewLinkParams{ //nolint:gosec // test fixture placeholder hash, not a credential
+		ID:           "link-delete-msg",
+		MessageID:    messageID,
+		AttachmentID: attachmentID,
+		Recipient:    "recipient@example.com",
+		TokenHash:    "hash-delete-msg",
+		ExpiresAt:    expiresAt,
+		MaxDownloads: 0,
+	}); err != nil {
+		t.Fatalf("CreateLink() error = %v, want nil", err)
+	}
+	if err := st.CreateMessageLink(ctx, store.NewMessageLinkParams{ //nolint:gosec // test fixture placeholder hash, not a credential
+		TokenHash: "msg-token-delete-msg",
+		MessageID: messageID,
+		Recipient: "recipient@example.com",
+		ExpiresAt: expiresAt,
+	}); err != nil {
+		t.Fatalf("CreateMessageLink() error = %v, want nil", err)
+	}
+
+	if err := st.DeleteMessage(ctx, messageID); err != nil {
+		t.Fatalf("DeleteMessage() error = %v, want nil", err)
+	}
+
+	if _, err := st.GetMessage(ctx, messageID); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("GetMessage() after delete error = %v, want wrapping ErrNotFound", err)
+	}
+	if _, err := st.GetAttachment(ctx, attachmentID); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("GetAttachment() after message delete error = %v, want wrapping ErrNotFound (cascade)", err)
+	}
+	if _, err := st.GetLinkByTokenHash(ctx, "hash-delete-msg"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("GetLinkByTokenHash() after message delete error = %v, want wrapping ErrNotFound (cascade)", err)
+	}
+	if _, err := st.GetMessageLinkByTokenHash(ctx, "msg-token-delete-msg"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("GetMessageLinkByTokenHash() after message delete error = %v, want wrapping ErrNotFound (cascade)", err)
+	}
+
+	if err := st.DeleteMessage(ctx, messageID); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("second DeleteMessage() (idempotent retry) error = %v, want wrapping ErrNotFound", err)
+	}
+}
+
+// testDeleteMessageRefusesHeld covers the ATR-239 hold guard, mirroring
+// testDeleteAttachmentRefusesHeld: DeleteMessage's guarded DELETE must
+// refuse to remove a message that has a held link, returning a wrapped
+// ErrHeld, and must leave the message row, EVERY one of its links (held
+// or not), its attachments and its message_links completely untouched
+// — never partially pruning the non-held links of a message that has at
+// least one held one.
+func testDeleteMessageRefusesHeld(t *testing.T, st store.MetadataStore) {
+	ctx := context.Background()
+	messageID, attachmentID := seedMessage(t, ctx, st, "msg-delete-msg-held")
+
+	expiresAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339Nano)
+	if err := st.CreateLink(ctx, store.NewLinkParams{ //nolint:gosec // test fixture placeholder hash, not a credential
+		ID:           "link-delete-msg-held",
+		MessageID:    messageID,
+		AttachmentID: attachmentID,
+		Recipient:    "recipient@example.com",
+		TokenHash:    "hash-delete-msg-held",
+		ExpiresAt:    expiresAt,
+		MaxDownloads: 0,
+	}); err != nil {
+		t.Fatalf("CreateLink() error = %v, want nil", err)
+	}
+	// A second, non-held link on the same message, so the test can
+	// confirm it survives too (not just the held one) — a refused
+	// DeleteMessage must be a true no-op, not a partial prune of the
+	// non-held links alongside a refusal to remove the held one.
+	if err := st.CreateLink(ctx, store.NewLinkParams{ //nolint:gosec // test fixture placeholder hash, not a credential
+		ID:           "link-delete-msg-not-held",
+		MessageID:    messageID,
+		AttachmentID: attachmentID,
+		Recipient:    "recipient2@example.com",
+		TokenHash:    "hash-delete-msg-not-held",
+		ExpiresAt:    expiresAt,
+		MaxDownloads: 0,
+	}); err != nil {
+		t.Fatalf("CreateLink(second) error = %v, want nil", err)
+	}
+	if err := st.SetHold(ctx, "link-delete-msg-held", true, "compliance-officer", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("SetHold() error = %v, want nil", err)
+	}
+
+	if err := st.DeleteMessage(ctx, messageID); !errors.Is(err, store.ErrHeld) {
+		t.Errorf("DeleteMessage(held) error = %v, want wrapping ErrHeld", err)
+	}
+
+	if _, err := st.GetMessage(ctx, messageID); err != nil {
+		t.Errorf("GetMessage() after refused delete error = %v, want nil (message must survive)", err)
+	}
+	if _, err := st.GetAttachment(ctx, attachmentID); err != nil {
+		t.Errorf("GetAttachment() after refused delete error = %v, want nil (attachment must survive)", err)
+	}
+	if _, err := st.GetLinkByTokenHash(ctx, "hash-delete-msg-held"); err != nil {
+		t.Errorf("GetLinkByTokenHash(held) after refused delete error = %v, want nil (held link must survive)", err)
+	}
+	if _, err := st.GetLinkByTokenHash(ctx, "hash-delete-msg-not-held"); err != nil {
+		t.Errorf("GetLinkByTokenHash(not held) after refused delete error = %v, want nil (non-held link must also survive: refusal is all-or-nothing)", err)
 	}
 }
 

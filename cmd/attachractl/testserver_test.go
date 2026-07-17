@@ -77,7 +77,7 @@ func newTestServer(t *testing.T) *testServer {
 		TTL:          72 * time.Hour,
 		MaxDownloads: 0,
 		TokenBytes:   link.MinTokenBytes,
-	}, st)
+	}, st, nil)
 	if err != nil {
 		t.Fatalf("link.NewEngine() error = %v", err)
 	}

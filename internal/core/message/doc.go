@@ -7,5 +7,5 @@
 // milter) — see ADR-002. The parser never buffers the whole message
 // in memory: parts are read and their content walked as streams, and
 // callers control how much of each part's body is read via Attachment
-// (see ATR-117 / US-3.1 and CLAUDE.md invariant #4).
+// (see ATR-117 / US-3.1 and the streaming invariant).
 package message

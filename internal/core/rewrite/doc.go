@@ -10,7 +10,7 @@
 // §4.1); it does not embed a link per attachment. The rewriter never
 // buffers the whole message in memory: parts are copied as streams,
 // spilling to a temporary file only when the configured in-memory
-// threshold is exceeded (CLAUDE.md invariant #4), mirroring the
+// threshold is exceeded (the streaming invariant), mirroring the
 // approach used by internal/adapters/milter's spool.
 //
 // # SR-118-2 (RFC 5987) scope

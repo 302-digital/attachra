@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/302-digital/attachra/internal/core/mail"
 	"github.com/302-digital/attachra/internal/core/store"
 )
 
@@ -30,7 +31,10 @@ const (
 // the ones satisfying the filter).
 //
 // Every filter in p is combined with AND into a single parameterized
-// query — sender is an exact case-insensitive match, status is an
+// query — sender and recipient are exact matches against the
+// mail.NormalizeAddress canonical form (each argument is normalized
+// in Go before binding, matching how every write path already stores
+// it — see ListMessagesBySender's doc comment, ATR-293), status is an
 // exact match, from/to bound created_at — with every value bound as a
 // placeholder argument, never interpolated into the SQL text.
 func (s *Store) ListMessages(ctx context.Context, p store.MessageListParams) (store.MessagePage, error) {
@@ -40,16 +44,16 @@ func (s *Store) ListMessages(ctx context.Context, p store.MessageListParams) (st
 	var args []any
 
 	if p.Sender != "" {
-		conds = append(conds, "LOWER(sender) = LOWER(?)")
-		args = append(args, p.Sender)
+		conds = append(conds, "sender = ?")
+		args = append(args, mail.NormalizeAddress(p.Sender))
 	}
 	if p.Status != "" {
 		conds = append(conds, "status = ?")
 		args = append(args, string(p.Status))
 	}
 	if p.Recipient != "" {
-		conds = append(conds, "EXISTS (SELECT 1 FROM links l WHERE l.message_id = messages.id AND LOWER(l.recipient) = LOWER(?))")
-		args = append(args, p.Recipient)
+		conds = append(conds, "EXISTS (SELECT 1 FROM links l WHERE l.message_id = messages.id AND l.recipient = ?)")
+		args = append(args, mail.NormalizeAddress(p.Recipient))
 	}
 	if !p.From.IsZero() {
 		conds = append(conds, "created_at >= ?")

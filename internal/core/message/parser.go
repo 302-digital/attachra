@@ -24,8 +24,8 @@ import (
 // a prefix of it) themselves and call DetectType; Parse does not read
 // leaf bodies itself for detection, so callers fully control how much
 // of a part they buffer for that purpose, keeping the walk itself
-// allocation-free with respect to attachment content (CLAUDE.md
-// invariant #4). After the callback returns, Parse drains any
+// allocation-free with respect to attachment content (the streaming
+// invariant). After the callback returns, Parse drains any
 // remaining unread bytes of body (so the underlying multipart reader
 // can advance to the next part) and sets att.Size to the total number
 // of body bytes observed, whether read by the callback or drained
@@ -51,13 +51,13 @@ type walkState struct {
 // limits.MaxDepth (SR-117-3). It never buffers the message body as a
 // whole: the top-level message is read via net/mail (which itself
 // streams), and nested multipart bodies are walked incrementally via
-// mime/multipart.Reader (CLAUDE.md invariant #4).
+// mime/multipart.Reader (the streaming invariant).
 //
 // Zero-valued fields in limits fall back to DefaultLimits (see
 // Limits.normalized). Exceeding any configured limit returns a
 // *LimitError; callers resolve that into their configured
-// fail-open/fail-closed policy (CLAUDE.md invariant #3) rather than
-// Parse deciding that policy itself.
+// fail-open/fail-closed policy (the mail-must-never-be-lost invariant)
+// rather than Parse deciding that policy itself.
 func Parse(r io.Reader, limits Limits, fn PartFunc) error {
 	limits = limits.normalized()
 
@@ -252,7 +252,7 @@ func (st *walkState) emitLeaf(body io.Reader, mediaType, rawContentType, disposi
 // mime/multipart.Part.Read and is passed through unchanged here;
 // "7bit", "8bit", "binary" and an absent/unrecognized value need no
 // transformation. Decoding is itself streaming (base64.NewDecoder
-// wraps body without buffering it), preserving CLAUDE.md invariant #4.
+// wraps body without buffering it), preserving the streaming invariant.
 func decodeTransferEncoding(body io.Reader, transferEncoding string) io.Reader {
 	switch strings.ToLower(strings.TrimSpace(transferEncoding)) {
 	case "base64":

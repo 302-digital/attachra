@@ -237,6 +237,134 @@ func TestEngineSetHoldRecordsAuditEvent(t *testing.T) {
 	}
 }
 
+// TestEnginePurgeMessageRecordsAuditEvent verifies a successful
+// PurgeMessage (ATR-239) records a TypeCompensation event attributed to
+// the given actor, with Details[ok]=true.
+func TestEnginePurgeMessageRecordsAuditEvent(t *testing.T) {
+	e, st := newTestEngine(t, defaultTestDefaults())
+	ctx := context.Background()
+
+	if _, err := e.CreateLinks(ctx, CreateLinksParams{
+		Message:     MessageInput{ID: "msg-audit-purge", QueueID: "Q-purge-audit", Sender: "s@example.com"},
+		Attachments: []AttachmentInput{{ID: "att-audit-purge", PartRef: "1", Filename: "f", DeclaredType: "x", DetectedType: "x", Size: 1, StorageKey: "k"}},
+		Recipients:  []string{"r@example.com"},
+	}); err != nil {
+		t.Fatalf("CreateLinks() error = %v, want nil", err)
+	}
+
+	if err := e.PurgeMessage(ctx, "milter", "msg-audit-purge"); err != nil {
+		t.Fatalf("PurgeMessage() error = %v, want nil", err)
+	}
+
+	got := streamEvents(t, ctx, st)
+	var found bool
+	for _, ev := range got {
+		if ev.Type != audit.TypeCompensation || ev.MessageID != "msg-audit-purge" {
+			continue
+		}
+		found = true
+		if ev.Actor != "milter" {
+			t.Errorf("compensation event Actor = %q, want %q", ev.Actor, "milter")
+		}
+		if ev.Details["ok"] != true {
+			t.Errorf("compensation event Details[ok] = %v, want true", ev.Details["ok"])
+		}
+	}
+	if !found {
+		t.Fatal("no TypeCompensation event found for msg-audit-purge")
+	}
+}
+
+// TestEnginePurgeMessageHeldRecordsFailedAuditEvent verifies a
+// PurgeMessage refused because a link is under legal hold still records
+// a TypeCompensation event (Details[ok]=false) and leaves every row
+// (message, attachment, links) untouched.
+func TestEnginePurgeMessageHeldRecordsFailedAuditEvent(t *testing.T) {
+	e, st := newTestEngine(t, defaultTestDefaults())
+	ctx := context.Background()
+
+	created, err := e.CreateLinks(ctx, CreateLinksParams{
+		Message:     MessageInput{ID: "msg-audit-purge-held", QueueID: "Q-purge-held", Sender: "s@example.com"},
+		Attachments: []AttachmentInput{{ID: "att-purge-held", PartRef: "1", Filename: "f", DeclaredType: "x", DetectedType: "x", Size: 1, StorageKey: "k"}},
+		Recipients:  []string{"r@example.com"},
+	})
+	if err != nil {
+		t.Fatalf("CreateLinks() error = %v, want nil", err)
+	}
+
+	var tok string
+	for _, c := range created {
+		if c.AttachmentID != "" {
+			tok = c.Token
+		}
+	}
+	l, err := e.Resolve(ctx, tok)
+	if err != nil {
+		t.Fatalf("Resolve() error = %v, want nil", err)
+	}
+	if err := st.SetHold(ctx, l.ID, true, "officer@example.com", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("SetHold() error = %v, want nil", err)
+	}
+
+	if err := e.PurgeMessage(ctx, "milter", "msg-audit-purge-held"); !errors.Is(err, ErrHeld) {
+		t.Fatalf("PurgeMessage() on message with a held link error = %v, want wrapping ErrHeld", err)
+	}
+
+	// The message, attachment and link must all survive: a refused
+	// PurgeMessage is a no-op, never a partial prune.
+	if _, err := st.GetMessage(ctx, "msg-audit-purge-held"); err != nil {
+		t.Errorf("GetMessage() after refused purge error = %v, want nil (message must survive)", err)
+	}
+	if _, err := e.Resolve(ctx, tok); err != nil {
+		t.Errorf("Resolve() after refused purge error = %v, want nil (link must remain active)", err)
+	}
+
+	got := streamEvents(t, ctx, st)
+	var found bool
+	for _, ev := range got {
+		if ev.Type == audit.TypeCompensation && ev.MessageID == "msg-audit-purge-held" {
+			found = true
+			if ev.Details["ok"] != false {
+				t.Errorf("compensation event Details[ok] = %v, want false (refused due to hold)", ev.Details["ok"])
+			}
+			if ev.Details["reason"] == "" || ev.Details["reason"] == nil {
+				t.Error("compensation event Details[reason] is empty, want the hold refusal reason")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no TypeCompensation event found for msg-audit-purge-held")
+	}
+}
+
+// TestEnginePurgeMessageNotFoundIsIdempotent verifies PurgeMessage
+// against an already-gone (or never-created) message returns a wrapped
+// ErrNotFound rather than panicking, so a pipeline caller retrying
+// after an earlier successful compensation (or racing a duplicate
+// compensation attempt) never crashes.
+func TestEnginePurgeMessageNotFoundIsIdempotent(t *testing.T) {
+	e, st := newTestEngine(t, defaultTestDefaults())
+	ctx := context.Background()
+
+	if err := e.PurgeMessage(ctx, "milter", "does-not-exist"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("PurgeMessage() on unknown message error = %v, want wrapping ErrNotFound", err)
+	}
+
+	got := streamEvents(t, ctx, st)
+	var found bool
+	for _, ev := range got {
+		if ev.Type == audit.TypeCompensation && ev.MessageID == "does-not-exist" {
+			found = true
+			if ev.Details["ok"] != false {
+				t.Errorf("compensation event Details[ok] = %v, want false", ev.Details["ok"])
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no TypeCompensation event found for the unknown message id")
+	}
+}
+
 // TestEngineSetHoldUnknownLinkRecordsFailedAuditEvent verifies SetHold
 // against a nonexistent link still records a TypeHold event with
 // Details[ok]=false, and returns a wrapped ErrNotFound.

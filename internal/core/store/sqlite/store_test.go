@@ -3,6 +3,7 @@ package sqlite_test
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -82,12 +83,51 @@ func TestMigrationsOnCleanDB(t *testing.T) {
 	}
 }
 
+// TestOpen_CreatesMissingNestedDBDir is the end-to-end regression for
+// ATR-310: on a fresh install, database.path's containing directory
+// may not exist yet (e.g. a systemd StateDirectory= that only created
+// the top-level state directory, not a configured nested subpath
+// underneath it). Open must create it (mode 0700) and come up fully
+// migrated and usable, rather than the caller hitting a lazy,
+// unhelpful SQLITE_CANTOPEN the first time a query runs - mirroring
+// internal/core/storage/fs.New's TestNew_CreatesMissingNestedBaseDir
+// for the storage-side ATR-309 fix.
+func TestOpen_CreatesMissingNestedDBDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state", "db")
+	path := filepath.Join(dir, "attachra.db")
+
+	st, err := sqlite.Open(path)
+	if err != nil {
+		t.Fatalf("sqlite.Open(%q) error = %v, want nil for missing nested database directory", path, err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat database directory after Open(): %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("database directory %q exists but is not a directory", dir)
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Errorf("database directory mode = %o, want 0700", perm)
+	}
+
+	// The store must be immediately usable against the directory Open
+	// just created, migrations and all.
+	ctx := context.Background()
+	if err := st.CreateMessage(ctx, store.NewMessageParams{ID: "m1", QueueID: "q1", Sender: "a@example.com"}); err != nil {
+		t.Errorf("CreateMessage() after auto-created database directory error = %v, want nil", err)
+	}
+}
+
 // TestRegisterDownloadConcurrent exercises the guarded atomic UPDATE
 // under real concurrency: 16 goroutines race to download a link
 // capped at max_downloads=3. Exactly 3 must succeed and 13 must
 // observe ErrDownloadLimitReached — never more than 3 successes (a
 // lost-update bug would let more than 3 through), matching the
-// go test -race requirement for this critical path (CLAUDE.md rule 3,
+// go test -race requirement for this critical path (the
+// mail-must-never-be-lost invariant,
 // docs/architecture/adr-011-metadata-db.md "atomic download counter
 // increment").
 func TestRegisterDownloadConcurrent(t *testing.T) {

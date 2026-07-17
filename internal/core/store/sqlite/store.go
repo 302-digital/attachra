@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/302-digital/attachra/internal/core/mail"
 	"github.com/302-digital/attachra/internal/core/store"
 )
 
@@ -180,7 +181,20 @@ func (s *Store) GetAttachment(ctx context.Context, id string) (store.Attachment,
 }
 
 // ListMessagesBySender implements store.MetadataStore.
+//
+// sender is matched via mail.NormalizeAddress against the messages.
+// sender column, which every write path stores in that same canonical
+// form (milter ingest normalizes it, see
+// internal/adapters/milter/backend.go's MailFrom; pre-existing rows
+// were normalized in place by migration 000007) — so this stays a
+// plain indexed equality (idx_messages_sender, migration 000003)
+// rather than a functional comparison that would force a full table
+// scan. This is what makes `attachra link revoke --sender` and the
+// `/links/revoke-by-sender` API find a message regardless of the
+// case or angle-bracket form an operator types (ATR-293, closing the
+// ATR-258 review's N1 finding).
 func (s *Store) ListMessagesBySender(ctx context.Context, sender string) ([]store.Message, error) {
+	sender = mail.NormalizeAddress(sender)
 	rows, err := s.db.reader.QueryContext(ctx,
 		`SELECT `+messageColumns+` FROM messages WHERE sender = ? ORDER BY created_at ASC`, sender)
 	if err != nil {
@@ -531,7 +545,7 @@ func (s *Store) SetHold(ctx context.Context, id string, hold bool, setBy string,
 // defaultExpiredAttachmentsLimit bounds ListExpiredAttachments when the
 // caller passes a non-positive limit, so a programming mistake in a
 // future caller cannot accidentally turn into an unbounded query
-// (CLAUDE.md invariant #4).
+// (the streaming invariant).
 const defaultExpiredAttachmentsLimit = 100
 
 // ListExpiredAttachments implements store.MetadataStore. The NOT EXISTS
@@ -669,6 +683,75 @@ func (s *Store) DeleteAttachment(ctx context.Context, id string) error {
 	return nil
 }
 
+// DeleteMessage implements store.MetadataStore.
+//
+// Same guarded-delete construction as DeleteAttachment, scoped to
+// message_id instead of attachment_id, plus message_links (which
+// DeleteAttachment has no reason to touch): only non-held links are
+// deleted first (`hold = 0`); an existence check for any link still
+// referencing this message_id (i.e. a held one) decides whether the
+// rest of the message's rows are safe to remove. If a held link
+// remains, DeleteMessage returns immediately without committing, so the
+// deferred Rollback restores the non-held links this call itself just
+// deleted — the net, externally-observable effect of a refused call is
+// therefore exactly "nothing changed" (ATR-239, mirroring
+// store.MetadataStore.DeleteAttachment's own ATR-259 fix).
+//
+// message_links and attachments are deleted next (order between the two
+// does not matter — neither references the other), then the messages
+// row itself last, since attachments/links/message_links all carry a
+// message_id foreign key with no ON DELETE behavior.
+func (s *Store) DeleteMessage(ctx context.Context, id string) error {
+	tx, err := s.db.writer.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqlite: delete message %q: begin tx: %w", id, err)
+	}
+	defer tx.Rollback() //nolint:errcheck // best-effort; Commit below is the success path.
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM links WHERE message_id = ? AND hold = 0`, id); err != nil {
+		return fmt.Errorf("sqlite: delete message %q: delete non-held links: %w", id, err)
+	}
+
+	var heldLinkRemains bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM links WHERE message_id = ?)`, id,
+	).Scan(&heldLinkRemains); err != nil {
+		return fmt.Errorf("sqlite: delete message %q: check for held links: %w", id, err)
+	}
+	if heldLinkRemains {
+		// A held link still references this message: refuse entirely.
+		// Returning now (without Commit) rolls back the non-held-links
+		// delete above too, so this call's net effect is a no-op, not a
+		// partial prune.
+		return fmt.Errorf("sqlite: delete message %q: %w", id, store.ErrHeld)
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM message_links WHERE message_id = ?`, id); err != nil {
+		return fmt.Errorf("sqlite: delete message %q: delete message links: %w", id, err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM attachments WHERE message_id = ?`, id); err != nil {
+		return fmt.Errorf("sqlite: delete message %q: delete attachments: %w", id, err)
+	}
+
+	res, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("sqlite: delete message %q: %w", id, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("sqlite: delete message %q: read rows affected: %w", id, err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("sqlite: delete message %q: %w", id, store.ErrNotFound)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqlite: delete message %q: commit: %w", id, err)
+	}
+	return nil
+}
+
 // IsAttachmentHeld implements store.MetadataStore. It is a plain read
 // against the reader pool — no transaction, no write-lock — used by
 // callers (internal/core/retention.Sweeper) to narrow, immediately
@@ -687,7 +770,7 @@ func (s *Store) IsAttachmentHeld(ctx context.Context, id string) (bool, error) {
 
 // ExpireStaleLinks implements store.MetadataStore as a single bulk
 // UPDATE, driven entirely by the database (no rows are ever read into
-// Go memory), matching CLAUDE.md invariant #4.
+// Go memory), matching the streaming invariant.
 func (s *Store) ExpireStaleLinks(ctx context.Context, now string) (int, error) {
 	res, err := s.db.writer.ExecContext(ctx,
 		`UPDATE links SET status = ? WHERE status = ? AND expires_at < ?`,

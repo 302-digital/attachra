@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -83,7 +84,7 @@ func newTestEnv(t *testing.T, rl adapterhttp.RateLimitConfig, opts ...testEnvOpt
 		TTL:          time.Hour,
 		MaxDownloads: 0,
 		TokenBytes:   link.MinTokenBytes,
-	}, st)
+	}, st, nil)
 	if err != nil {
 		t.Fatalf("link.NewEngine() error = %v, want nil", err)
 	}
@@ -230,6 +231,64 @@ func TestDownloadRegistersAndStreams(t *testing.T) {
 	if !strings.HasPrefix(cd, "attachment") {
 		t.Errorf("Content-Disposition = %q, want it to start with \"attachment\"", cd)
 	}
+
+	if cl := rr.Header().Get("Content-Length"); cl != strconv.Itoa(len(content)) {
+		t.Errorf("Content-Length = %q, want %d", cl, len(content))
+	}
+}
+
+// TestDownloadContentLengthReflectsStorageNotMetadata is the ATR-238
+// minor-4 regression test: att.Size (the metadata DB's record of the
+// attachment's size) and the storage object's actual size are two
+// independently-written values that can drift. Content-Length must
+// come from the storage object itself (via Driver.Stat), never from
+// the possibly-stale att.Size — otherwise a client sees a
+// Content-Length promise the streamed body does not honor.
+func TestDownloadContentLengthReflectsStorageNotMetadata(t *testing.T) {
+	env := newTestEnv(t, adapterhttp.RateLimitConfig{})
+	ctx := context.Background()
+
+	actualContent := []byte("the real object bytes stored in the driver, longer than declared")
+	key := env.putObject(actualContent)
+
+	messageID := "msg-size-drift"
+	// Deliberately declare a Size that does not match the object
+	// actually stored under key, simulating drift between the
+	// metadata DB and the storage backend.
+	const declaredSize = 3
+	created, err := env.engine.CreateLinks(ctx, link.CreateLinksParams{
+		Message:     link.MessageInput{ID: messageID, QueueID: "q-drift", Sender: "s@example.com"},
+		Attachments: []link.AttachmentInput{{ID: messageID + "-att", PartRef: "1", Filename: "drift.bin", DeclaredType: "application/octet-stream", DetectedType: "application/octet-stream", Size: declaredSize, StorageKey: key}},
+		Recipients:  []string{"r@example.com"},
+	})
+	if err != nil {
+		t.Fatalf("CreateLinks() error = %v, want nil", err)
+	}
+	var packageToken string
+	for _, c := range created {
+		if c.AttachmentID == "" {
+			packageToken = c.Token
+		}
+	}
+	links, err := env.store.ListLinksByMessage(ctx, messageID)
+	if err != nil || len(links) != 1 {
+		t.Fatalf("ListLinksByMessage() = %+v, err = %v", links, err)
+	}
+	linkID := links[0].ID
+
+	req := httptest.NewRequest("POST", downloadPath(packageToken, linkID), nil)
+	rr := httptest.NewRecorder()
+	env.handler.ServeHTTP(rr, req)
+
+	if rr.Code != 200 {
+		t.Fatalf("POST download status = %d, want 200, body = %q", rr.Code, rr.Body.String())
+	}
+	if !bytes.Equal(rr.Body.Bytes(), actualContent) {
+		t.Errorf("streamed body length = %d, want %d (the real stored object, not the declared size)", rr.Body.Len(), len(actualContent))
+	}
+	if cl := rr.Header().Get("Content-Length"); cl != strconv.Itoa(len(actualContent)) {
+		t.Errorf("Content-Length = %q, want %d (the storage object's real size, not att.Size=%d)", cl, len(actualContent), declaredSize)
+	}
 }
 
 // TestDownloadOfRiskyTypeForcesOctetStream covers SR-125-4/T1.5: a
@@ -351,6 +410,147 @@ func TestGenericNotFoundForEveryNegativeCase(t *testing.T) {
 // intPtr returns a pointer to n, for building a policy.ActionParams
 // literal with only MaxDownloads set.
 func intPtr(n int) *int { return &n }
+
+// TestPackagePageIsolatesRecipients is the HTTP-level ATR-237
+// regression test: a message with two recipients gets one Link row
+// per (attachment, recipient) pair, but the milter-MVP body only ever
+// carries one recipient's package token. GET /p/<that token> must
+// list only that recipient's own file, never the other recipient's
+// Link row for the same attachment — otherwise the page leaks that a
+// second recipient exists and exposes a linkID that could be used to
+// drain their separate download budget (see
+// TestDownloadRejectsCrossRecipientLinkID below for that half).
+func TestPackagePageIsolatesRecipients(t *testing.T) {
+	env := newTestEnv(t, adapterhttp.RateLimitConfig{})
+	ctx := context.Background()
+	content := []byte("shared-attachment-body")
+	key := env.putObject(content)
+
+	messageID := "msg-two-recipients"
+	created, err := env.engine.CreateLinks(ctx, link.CreateLinksParams{
+		Message:     link.MessageInput{ID: messageID, QueueID: "q-two", Sender: "s@example.com"},
+		Attachments: []link.AttachmentInput{{ID: messageID + "-att", PartRef: "1", Filename: "shared.bin", DeclaredType: "application/octet-stream", DetectedType: "application/octet-stream", Size: int64(len(content)), StorageKey: key}},
+		Recipients:  []string{"alice@example.com", "bob@example.com"},
+	})
+	if err != nil {
+		t.Fatalf("CreateLinks() error = %v, want nil", err)
+	}
+
+	var aliceToken, bobToken string
+	for _, c := range created {
+		if c.AttachmentID != "" {
+			continue
+		}
+		switch c.Recipient {
+		case "alice@example.com":
+			aliceToken = c.Token
+		case "bob@example.com":
+			bobToken = c.Token
+		}
+	}
+	if aliceToken == "" || bobToken == "" {
+		t.Fatalf("CreateLinks() did not return package tokens for both recipients")
+	}
+
+	req := httptest.NewRequest("GET", packagePath(aliceToken), nil)
+	rr := httptest.NewRecorder()
+	env.handler.ServeHTTP(rr, req)
+
+	if rr.Code != 200 {
+		t.Fatalf("GET package page status = %d, want 200", rr.Code)
+	}
+
+	links, err := env.store.ListLinksByMessage(ctx, messageID)
+	if err != nil || len(links) != 2 {
+		t.Fatalf("ListLinksByMessage() = %+v, err = %v, want 2 links (one per recipient)", links, err)
+	}
+	var aliceLinkID, bobLinkID string
+	for _, l := range links {
+		switch l.Recipient {
+		case "alice@example.com":
+			aliceLinkID = l.ID
+		case "bob@example.com":
+			bobLinkID = l.ID
+		}
+	}
+
+	body := rr.Body.String()
+	if !strings.Contains(body, downloadPath(aliceToken, aliceLinkID)) {
+		t.Errorf("alice's package page does not list her own file (expected form action %q)", downloadPath(aliceToken, aliceLinkID))
+	}
+	if strings.Contains(body, bobLinkID) {
+		t.Errorf("alice's package page leaks bob's linkID %q — recipients must be isolated (ATR-237)", bobLinkID)
+	}
+
+	// bobToken is unused directly here (bob never receives a URL in
+	// the MVP's shared body), asserted only to document that it was
+	// minted; RegisterPackageDownload's own recipient check is
+	// exercised end-to-end below.
+	_ = bobToken
+}
+
+// TestDownloadRejectsCrossRecipientLinkID is the HTTP-level
+// counterpart to link.TestEngineRegisterPackageDownloadRejectsCrossRecipientLinkID:
+// even if bob's linkID were somehow learned, POSTing it against
+// alice's valid package token must produce the same generic
+// not-found response as any other negative case (SR-125-5), and must
+// not charge bob's download counter.
+func TestDownloadRejectsCrossRecipientLinkID(t *testing.T) {
+	env := newTestEnv(t, adapterhttp.RateLimitConfig{})
+	ctx := context.Background()
+	content := []byte("shared-attachment-body-2")
+	key := env.putObject(content)
+
+	messageID := "msg-two-recipients-dl"
+	created, err := env.engine.CreateLinks(ctx, link.CreateLinksParams{
+		Message:     link.MessageInput{ID: messageID, QueueID: "q-two-dl", Sender: "s@example.com"},
+		Attachments: []link.AttachmentInput{{ID: messageID + "-att", PartRef: "1", Filename: "shared.bin", DeclaredType: "application/octet-stream", DetectedType: "application/octet-stream", Size: int64(len(content)), StorageKey: key}},
+		Recipients:  []string{"alice@example.com", "bob@example.com"},
+	})
+	if err != nil {
+		t.Fatalf("CreateLinks() error = %v, want nil", err)
+	}
+
+	var aliceToken string
+	for _, c := range created {
+		if c.AttachmentID == "" && c.Recipient == "alice@example.com" {
+			aliceToken = c.Token
+		}
+	}
+	if aliceToken == "" {
+		t.Fatalf("CreateLinks() did not return alice's package token")
+	}
+
+	links, err := env.store.ListLinksByMessage(ctx, messageID)
+	if err != nil || len(links) != 2 {
+		t.Fatalf("ListLinksByMessage() = %+v, err = %v, want 2 links", links, err)
+	}
+	var bobLinkID string
+	for _, l := range links {
+		if l.Recipient == "bob@example.com" {
+			bobLinkID = l.ID
+		}
+	}
+	if bobLinkID == "" {
+		t.Fatal("did not find bob's Link row")
+	}
+
+	req := httptest.NewRequest("POST", downloadPath(aliceToken, bobLinkID), nil)
+	rr := httptest.NewRecorder()
+	env.handler.ServeHTTP(rr, req)
+
+	if rr.Code == 200 {
+		t.Fatalf("POST download with alice's token + bob's linkID status = 200, want a not-found response")
+	}
+
+	got, err := env.store.GetLinkByID(ctx, bobLinkID)
+	if err != nil {
+		t.Fatalf("GetLinkByID() error = %v, want nil", err)
+	}
+	if got.Downloads != 0 {
+		t.Errorf("bob's link Downloads = %d, want 0 (must not be charged by alice's token)", got.Downloads)
+	}
+}
 
 func TestAntiCacheHeadersPresent(t *testing.T) {
 	env := newTestEnv(t, adapterhttp.RateLimitConfig{})
@@ -568,8 +768,8 @@ func TestLargeDownloadStreamsWithoutBuffering(t *testing.T) {
 
 // TestDoubleDownloadRace exercises RegisterPackageDownload's
 // concurrency safety through the full HTTP handler (not just the
-// store layer), matching CLAUDE.md's requirement that critical
-// counters be raced with go test -race.
+// store layer), confirming that critical counters are race-safe
+// (run with go test -race).
 func TestDoubleDownloadRace(t *testing.T) {
 	env := newTestEnv(t, adapterhttp.RateLimitConfig{})
 	ctx := context.Background()

@@ -26,9 +26,9 @@ milter:
   listen: "inet:127.0.0.1:6785"
   # "open": if Attachra cannot process a message (crash, timeout, bug),
   # the message is delivered unmodified rather than blocked. This is
-  # the safe default for a system that is not the mail server itself
-  # (CLAUDE.md invariant #3) — mail must never be lost because of an
-  # Attachra failure. Switch to "closed" only if your compliance
+  # the safe default for a system that is not the mail server itself:
+  # mail must never be lost because of an Attachra failure. Switch to
+  # "closed" only if your compliance
   # posture requires attachments to be provably policy-checked before
   # delivery, and you have alerting on Attachra's health (/readyz).
   failure_mode: open
@@ -64,6 +64,19 @@ http:
     - "127.0.0.1/32"
     - "::1/128"
 
+# Admin/operational surface (ATR-292): GET /metrics and the dependency-
+# detailed GET /readyz live here instead of on http.listen above, so
+# they are never reachable from wherever http.listen ends up exposed —
+# GET /healthz (liveness only) stays on http.listen too, for existing
+# probes. Loopback-only by default, same posture as http.listen.
+#
+# Upgrading from a pre-ATR-292 install that scraped /metrics or /readyz
+# on http.listen (127.0.0.1:18080)? Repoint that scraper/healthcheck at
+# this address instead — this section is new, but its default applies
+# automatically even if you don't add it here explicitly.
+admin:
+  listen: "127.0.0.1:18090"
+
 # Base URL embedded in every rewritten message's download link. REPLACE
 # with your grommunio host's real, publicly reachable hostname —
 # whatever your grommunio/nginx TLS certificate covers. Must be
@@ -95,3 +108,13 @@ database:
 policy:
   path: /etc/attachra/policy.yaml
   dry_run: false
+
+# Temporary spool file directory (ATR-262). Left unset here on
+# purpose: the systemd unit's PrivateTmp=yes already gives Attachra a
+# private, writable /tmp isolated from the host's, so the default (the
+# OS temp dir inside that private /tmp) is fine for this packaging. If
+# you set spool.dir to a path outside that private /tmp, also add it
+# to attachra.service's ReadWritePaths=, or writes will be rejected by
+# ProtectSystem=strict regardless of on-disk permissions.
+# spool:
+#   dir: /var/lib/attachra/spool

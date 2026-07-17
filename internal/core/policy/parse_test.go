@@ -392,6 +392,49 @@ default:
 	}
 }
 
+// TestParse_RetentionShorterThanTTLWarns covers the ATR-294 §3.5
+// warning: an explicit `retention` shorter than an explicit `ttl` is
+// well-formed (link.Engine.CreateLinks raises it to match ttl at run
+// time, T-5.3.1/ATR-178), but the policy is still applied — this is a
+// warning, not an error — and the warning must name the offending
+// rule so an operator can find it.
+func TestParse_RetentionShorterThanTTLWarns(t *testing.T) {
+	data := []byte(`
+version: 1
+name: "policy"
+rules:
+  - name: "short retention"
+    when:
+      attachment:
+        size: { min: "10MB" }
+    then:
+      action: replace
+      ttl: "30d"
+      retention: "1d"
+default:
+  action: pass
+`)
+	p, warnings, err := Parse(data, "retention-shorter-than-ttl.yaml")
+	if err != nil {
+		t.Fatalf("Parse returned error for a well-formed policy with retention < ttl: %v", err)
+	}
+	if p == nil {
+		t.Fatal("Parse returned nil *Policy")
+	}
+	if len(warnings) == 0 {
+		t.Fatal("Parse returned no warnings for retention shorter than ttl")
+	}
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w, "retention") && strings.Contains(w, "ttl") && strings.Contains(w, "short retention") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("warnings = %v, want one mentioning retention/ttl and the rule name %q", warnings, "short retention")
+	}
+}
+
 func TestLoad_ReadsFromDisk(t *testing.T) {
 	p, err := Load(filepath.Join("testdata", "minimal_valid.yaml"))
 	if err != nil {

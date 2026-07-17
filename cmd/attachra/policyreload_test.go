@@ -176,8 +176,8 @@ func TestRunPolicyReloadLoop_ChannelDriven(t *testing.T) {
 // TestWatchPolicyReload_StopTerminatesGoroutine verifies the
 // production wiring: watchPolicyReload's returned stop function
 // deterministically waits for its goroutine to exit, so callers (e.g.
-// run() via defer) never leave a dangling goroutine (CLAUDE.md
-// invariant: "every goroutine has an owner and a way to terminate").
+// run() via defer) never leave a dangling goroutine (the
+// every-goroutine-has-an-owner rule).
 // The parent ctx is canceled first here (the SIGINT/SIGTERM shutdown
 // path); TestWatchPolicyReload_StopTerminatesGoroutine_ParentCtxStillLive
 // below covers the other order, where ctx is NOT yet canceled.

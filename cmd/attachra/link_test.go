@@ -29,7 +29,7 @@ func newLinkTestEngine(t *testing.T) (*sqlite.Store, *link.Engine) {
 		TTL:          time.Hour,
 		MaxDownloads: 0,
 		TokenBytes:   link.MinTokenBytes,
-	}, st)
+	}, st, nil)
 	if err != nil {
 		t.Fatalf("link.NewEngine() error = %v, want nil", err)
 	}

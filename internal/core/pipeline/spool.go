@@ -5,30 +5,26 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"github.com/302-digital/attachra/internal/core/spoolutil"
 )
 
-// spoolMemThreshold bounds how much of a spooled stream is held in
-// memory before spilling to a temporary file, mirroring the same
-// threshold used by internal/adapters/milter's spool and
-// internal/core/rewrite's stageToFile (SR-115-3, CLAUDE.md invariant
-// #4): small, common inputs stay fast, while large ones never occupy
-// the configured limit's worth of memory in one allocation.
-const spoolMemThreshold = 256 * 1024 // 256 KiB
-
 // spool accumulates a stream (the message body, or a single
-// attachment's decoded content) up to spoolMemThreshold bytes in
-// memory, spilling to a temporary file beyond that. It supports being
-// read back multiple times via Reader, which AttachmentProcessor needs
-// because both message.Parse (to discover attachments and detect
-// their type) and rewrite.Rewrite (to re-walk the MIME tree) must each
-// read the complete original message independently — Envelope.Body
-// itself is a single-read stream, so it is captured into a spool once
-// via spoolReader and re-read from there.
+// attachment's decoded content) up to spoolutil.SpoolMemThreshold
+// bytes in memory, spilling to a temporary file beyond that. It
+// supports being read back multiple times via Reader, which
+// AttachmentProcessor needs because both message.Parse (to discover
+// attachments and detect their type) and rewrite.Rewrite (to re-walk
+// the MIME tree) must each read the complete original message
+// independently — Envelope.Body itself is a single-read stream, so it
+// is captured into a spool once via spoolReader and re-read from
+// there.
 //
 // spool is not safe for concurrent use: a caller writes to it once
 // (via spoolReader) and may call Reader any number of times afterward,
 // but not concurrently with itself.
 type spool struct {
+	dir  string
 	mem  bytes.Buffer
 	file *os.File
 }
@@ -37,8 +33,13 @@ type spool struct {
 // wrapping the underlying read/write failure on failure. On error, any
 // partially-written temporary file is cleaned up before returning, so
 // no spool temp file is ever leaked on the failure path.
-func spoolReader(r io.Reader) (*spool, error) {
-	s := &spool{}
+//
+// dir selects the directory any spilled temporary file is created in
+// (ATR-262); the empty string uses the OS default temporary
+// directory ($TMPDIR / os.TempDir()), matching os.CreateTemp's own
+// documented behavior for an empty dir argument.
+func spoolReader(r io.Reader, dir string) (*spool, error) {
+	s := &spool{dir: dir}
 	if err := s.readFrom(r); err != nil {
 		s.cleanup()
 		return nil, err
@@ -47,21 +48,21 @@ func spoolReader(r io.Reader) (*spool, error) {
 }
 
 // readFrom copies r into s, spilling to a temporary file once
-// spoolMemThreshold bytes have been buffered in memory.
+// spoolutil.SpoolMemThreshold bytes have been buffered in memory.
 func (s *spool) readFrom(r io.Reader) error {
 	// Read up to the memory threshold directly into mem.
-	limited := io.LimitReader(r, spoolMemThreshold)
+	limited := io.LimitReader(r, spoolutil.SpoolMemThreshold)
 	if _, err := s.mem.ReadFrom(limited); err != nil {
 		return fmt.Errorf("pipeline: spool: buffer to memory: %w", err)
 	}
-	if s.mem.Len() < spoolMemThreshold {
+	if s.mem.Len() < spoolutil.SpoolMemThreshold {
 		// r was fully drained within the memory budget.
 		return nil
 	}
 
 	// There may be more data: spill to a temp file and continue
 	// copying the remainder.
-	f, err := os.CreateTemp("", "attachra-pipeline-*.spool")
+	f, err := os.CreateTemp(s.dir, "attachra-pipeline-*.spool")
 	if err != nil {
 		return fmt.Errorf("pipeline: spool: create temp file: %w", err)
 	}

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/302-digital/attachra/internal/core/spoolutil"
 )
 
 // FuzzParse is the fuzzing seed for Parse (ATR-159 / T-3.1.4). It
@@ -17,8 +19,8 @@ import (
 // discovered leaf) must never panic either. Parse returning an error
 // is an expected, safe outcome for malformed input; only a panic is a
 // bug here — the fail-open/fail-closed decision for a returned error
-// belongs to the milter adapter (CLAUDE.md invariant #3), not to this
-// package.
+// belongs to the milter adapter (the mail-must-never-be-lost
+// invariant), not to this package.
 func FuzzParse(f *testing.F) {
 	entries, err := os.ReadDir("testdata")
 	if err != nil {
@@ -57,7 +59,7 @@ func FuzzParse(f *testing.F) {
 		}
 
 		_ = Parse(bytes.NewReader(data), limits, func(att *Attachment, body io.Reader) error {
-			content, _ := io.ReadAll(io.LimitReader(body, sniffLen))
+			content, _ := io.ReadAll(io.LimitReader(body, spoolutil.SniffLen))
 			// Must not panic regardless of how malformed the
 			// declared/decoded name or content is.
 			att.DetectedType = DetectType(content)
