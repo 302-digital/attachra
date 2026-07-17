@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/302-digital/attachra/internal/core/audit"
 	"github.com/302-digital/attachra/internal/core/store"
@@ -209,6 +210,48 @@ func TestAuditListInvalidTypeAndCursor(t *testing.T) {
 	resp = do(t, ts, http.MethodGet, "/api/v1/audit?cursor=not-a-real-cursor", adminSecret, "")
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("invalid cursor: status = %d, want 400", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+}
+
+// TestAuditListCursorPastTruncationReturnsGone covers the seq-cursor
+// safety invariant (ADR-017, ATR-308): after retention truncates a range,
+// a well-formed cursor that points into it gets 410 Gone — an explicit
+// signal, distinct from the 400 for a malformed cursor — never a silent
+// skip over the removed events.
+func TestAuditListCursorPastTruncationReturnsGone(t *testing.T) {
+	ts, st, _ := newAPITestServer(t)
+	_, adminSecret := seedToken(t, st, "admin", store.RoleAdmin)
+	ctx := context.Background()
+
+	for i := 0; i < 10; i++ {
+		if _, err := st.Record(ctx, audit.Event{Type: audit.TypeError, Actor: "test"}); err != nil {
+			t.Fatalf("Record() #%d error = %v, want nil", i, err)
+		}
+	}
+
+	// Truncate everything (a cutoff in the future makes every row old);
+	// survivors are just the checkpoint at seq 11, so min surviving
+	// seq is 11 and the anchor is seq 10.
+	res, err := st.TruncateAudit(ctx, audit.TruncateRequest{Cutoff: time.Now().Add(time.Hour), Actor: "system"})
+	if err != nil {
+		t.Fatalf("TruncateAudit() error = %v, want nil", err)
+	}
+	if !res.Truncated || res.AnchorSeq != 10 {
+		t.Fatalf("TruncateAudit() = %+v, want Truncated with AnchorSeq 10", res)
+	}
+
+	// Cursor at seq 5 (before the anchor): 410 Gone.
+	resp := do(t, ts, http.MethodGet, "/api/v1/audit?cursor="+audit.EncodeSeqCursor(5), adminSecret, "")
+	if resp.StatusCode != http.StatusGone {
+		t.Errorf("cursor before anchor: status = %d, want 410", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+
+	// Cursor at the anchor (seq 10): resumes cleanly with 200.
+	resp = do(t, ts, http.MethodGet, "/api/v1/audit?cursor="+audit.EncodeSeqCursor(10), adminSecret, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("cursor at anchor: status = %d, want 200", resp.StatusCode)
 	}
 	_ = resp.Body.Close()
 }

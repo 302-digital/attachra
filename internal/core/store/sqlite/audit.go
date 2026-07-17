@@ -3,7 +3,6 @@ package sqlite
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -17,6 +16,7 @@ import (
 var _ audit.AuditSink = (*Store)(nil)
 var _ audit.Reader = (*Store)(nil)
 var _ audit.ReaderLister = (*Store)(nil)
+var _ audit.Truncator = (*Store)(nil)
 
 // defaultAuditPageSize and maxAuditPageSize mirror the API contract's
 // shared Limit parameter default/maximum (api/openapi.yaml, parameter
@@ -109,7 +109,7 @@ func (s *Store) Record(ctx context.Context, ev audit.Event) (audit.Recorded, err
 // StreamEvents implements audit.Reader. It streams rows matching
 // filter directly from the underlying *sql.Rows cursor, calling fn once
 // per row without ever materializing the full result set in memory
-// (CLAUDE.md invariant #4), so ExportJSONL (internal/core/audit) can
+// (the streaming invariant), so ExportJSONL (internal/core/audit) can
 // export an arbitrarily large audit log with bounded memory use.
 func (s *Store) StreamEvents(ctx context.Context, filter audit.Filter, fn func(audit.Recorded) error) error {
 	query := `SELECT id, seq, prev_hash, type, actor, message_id, recipient, details, created_at
@@ -182,6 +182,13 @@ func (s *Store) ListEvents(ctx context.Context, p audit.ListParams) (audit.Page,
 		query += " AND message_id = ?"
 		args = append(args, p.MessageID)
 	}
+	// querier defaults to the plain reader pool for the common
+	// no-cursor case (first page: nothing to guard, so no need to pay
+	// for a transaction). When a cursor is present it is switched to a
+	// single read-only transaction below, so the truncation guard and
+	// the paged SELECT observe one consistent snapshot.
+	var querier sqlQuerier = s.db.reader
+
 	if p.Cursor != "" {
 		afterSeq, derr := audit.DecodeSeqCursor(p.Cursor)
 		if derr != nil {
@@ -191,13 +198,53 @@ func (s *Store) ListEvents(ctx context.Context, p audit.ListParams) (audit.Page,
 			// client-supplied cursor apart from a genuine query failure.
 			return audit.Page{}, fmt.Errorf("sqlite: list audit events: %w", derr)
 		}
+
+		// Retention truncation (ADR-017) may have removed the range this
+		// cursor points into. If the cursor's continuation point precedes
+		// the oldest surviving row, resuming here would silently skip the
+		// removed events; refuse with ErrCursorTruncated instead (mapped
+		// to 410 Gone by the HTTP layer). afterSeq+1 == minSeq (cursor
+		// exactly at the anchor) resumes cleanly and is not an error.
+		// With retention disabled, minSeq is 1 and this never fires.
+		//
+		// The guard's minAuditSeq read and the paged SELECT below MUST
+		// run against the same WAL snapshot: s.db.reader is a
+		// multi-connection pool (readers don't block the writer, ADR-011),
+		// so two independent QueryContext calls can land on different
+		// connections and straddle a truncation the sweeper commits
+		// between them — the guard would see the pre-truncation minSeq
+		// (pass), then the SELECT would see the post-truncation table and
+		// silently skip the just-removed range: exactly the silent-gap
+		// failure ErrCursorTruncated exists to prevent (security review,
+		// ATR-308 B2). A single read-only transaction fixes the snapshot
+		// at its first statement (SQLite WAL semantics), so both reads
+		// below are guaranteed consistent with each other regardless of
+		// what commits afterward.
+		tx, err := s.db.reader.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+		if err != nil {
+			return audit.Page{}, fmt.Errorf("sqlite: list audit events: begin read tx: %w", err)
+		}
+		// Read-only: there is nothing to Commit. Rollback is the correct
+		// terminal call on every path (success or error) and is always
+		// safe to call after the rows below have been read, mirroring
+		// every other tx.Rollback() deferred in this package.
+		defer tx.Rollback() //nolint:errcheck // read-only tx, no commit needed.
+
+		minSeq, ok, merr := minAuditSeqTx(ctx, tx)
+		if merr != nil {
+			return audit.Page{}, fmt.Errorf("sqlite: list audit events: %w", merr)
+		}
+		if ok && afterSeq+1 < minSeq {
+			return audit.Page{}, fmt.Errorf("sqlite: list audit events: %w", audit.ErrCursorTruncated)
+		}
 		query += " AND seq > ?"
 		args = append(args, afterSeq)
+		querier = tx
 	}
 	query += " ORDER BY seq ASC LIMIT ?"
 	args = append(args, limit+1)
 
-	rows, err := s.db.reader.QueryContext(ctx, query, args...)
+	rows, err := querier.QueryContext(ctx, query, args...)
 	if err != nil {
 		return audit.Page{}, fmt.Errorf("sqlite: list audit events: %w", err)
 	}
@@ -226,18 +273,258 @@ func (s *Store) ListEvents(ctx context.Context, p audit.ListParams) (audit.Page,
 	return page, nil
 }
 
+// TruncateAudit implements audit.Truncator (ATR-308, ADR-017): it
+// removes the contiguous seq-prefix of audit_events whose every row is
+// older than req.Cutoff — clamped down to spare any event tied to a
+// message under legal hold — and appends a TypeRetentionCheckpoint
+// anchoring the survivors, all in one writer transaction.
+//
+// The whole operation runs against s.db.writer, capped to a single
+// connection by ADR-011: the boundary computation, the hold clamp, the
+// checkpoint insert and the delete therefore see one consistent snapshot
+// and cannot interleave with any other write (in particular, a
+// concurrent SetHold either lands entirely before this transaction — and
+// is seen by the clamp — or entirely after it).
+//
+// It writes no checkpoint and removes nothing when nothing is eligible
+// (an empty/young log, or one fully pinned by legal hold), so an idle log
+// never accretes empty checkpoints.
+func (s *Store) TruncateAudit(ctx context.Context, req audit.TruncateRequest) (audit.TruncateResult, error) {
+	cutoff := req.Cutoff.UTC().Format(timeLayout)
+
+	tx, err := s.db.writer.BeginTx(ctx, nil)
+	if err != nil {
+		return audit.TruncateResult{}, fmt.Errorf("sqlite: truncate audit: begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // best-effort; Commit below is the success path.
+
+	// Boundary: the largest N such that every row with seq <= N is
+	// strictly older than the cutoff. Defined via the first row that is
+	// NOT older (so it is correct even if seq order and created_at order
+	// diverge, which only deterministic tests can arrange). If no row is
+	// recent, every row is old and N is the max seq.
+	boundary, ok, err := auditTruncationBoundary(ctx, tx, cutoff)
+	if err != nil {
+		return audit.TruncateResult{}, fmt.Errorf("sqlite: truncate audit: compute boundary: %w", err)
+	}
+	if !ok {
+		return audit.TruncateResult{}, tx.Commit()
+	}
+
+	// Legal-hold clamp: never truncate an event tied to a message that
+	// currently has a link under hold (ATR-257/258). Lower the boundary
+	// to just before the oldest such event rather than skip it mid-prefix
+	// (which would fragment the chain and void the single anchor).
+	res := audit.TruncateResult{}
+	oldestHeld, held, err := oldestHeldAuditSeq(ctx, tx, boundary)
+	if err != nil {
+		return audit.TruncateResult{}, fmt.Errorf("sqlite: truncate audit: hold clamp: %w", err)
+	}
+	if held {
+		res.HeldClamped = true
+		boundary = oldestHeld - 1
+	}
+
+	// After the clamp, is there still a present row at the boundary to
+	// anchor on? If boundary fell below the oldest surviving seq (a prior
+	// pass already truncated this far, or a hold pinned everything), there
+	// is nothing to do.
+	anchorHash, anchorFound, err := auditRowHash(ctx, tx, boundary)
+	if err != nil {
+		return audit.TruncateResult{}, fmt.Errorf("sqlite: truncate audit: read anchor: %w", err)
+	}
+	if boundary <= 0 || !anchorFound {
+		return res, tx.Commit()
+	}
+
+	var truncCount int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM audit_events WHERE seq <= ?`, boundary,
+	).Scan(&truncCount); err != nil {
+		return audit.TruncateResult{}, fmt.Errorf("sqlite: truncate audit: count: %w", err)
+	}
+	if truncCount == 0 {
+		return res, tx.Commit()
+	}
+
+	// Append the checkpoint at the current tail before deleting, so it
+	// lands at seq = maxSeq+1 (> boundary) and the delete cannot touch it.
+	prevSeq, prevHash, err := lastAuditRecord(ctx, tx)
+	if err != nil {
+		return audit.TruncateResult{}, fmt.Errorf("sqlite: truncate audit: read tail: %w", err)
+	}
+	checkpointSeq := prevSeq + 1
+	ts := time.Now().UTC()
+
+	details := map[string]any{
+		audit.DetailAnchorSeq:      boundary,
+		audit.DetailAnchorHash:     anchorHash,
+		audit.DetailTruncatedCount: truncCount,
+		audit.DetailCutoff:         req.Cutoff.UTC().Format(time.RFC3339Nano),
+		audit.DetailHeldClamped:    res.HeldClamped,
+	}
+	detailsJSON, err := marshalDetails(details)
+	if err != nil {
+		return audit.TruncateResult{}, fmt.Errorf("sqlite: truncate audit: marshal checkpoint details: %w", err)
+	}
+
+	id, err := newAuditID()
+	if err != nil {
+		return audit.TruncateResult{}, fmt.Errorf("sqlite: truncate audit: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO audit_events (id, seq, prev_hash, type, actor, message_id, recipient, details, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, checkpointSeq, prevHash, string(audit.TypeRetentionCheckpoint), req.Actor, "", "", detailsJSON, ts.Format(timeLayout),
+	); err != nil {
+		return audit.TruncateResult{}, fmt.Errorf("sqlite: truncate audit: insert checkpoint: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM audit_events WHERE seq <= ?`, boundary); err != nil {
+		return audit.TruncateResult{}, fmt.Errorf("sqlite: truncate audit: delete: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return audit.TruncateResult{}, fmt.Errorf("sqlite: truncate audit: commit: %w", err)
+	}
+
+	res.Truncated = true
+	res.AnchorSeq = boundary
+	res.AnchorHash = anchorHash
+	res.TruncatedCount = truncCount
+	res.Checkpoint = audit.Recorded{
+		Event: audit.Event{
+			Timestamp: ts,
+			Type:      audit.TypeRetentionCheckpoint,
+			Actor:     req.Actor,
+			Details:   details,
+		},
+		ID:       id,
+		Seq:      checkpointSeq,
+		PrevHash: prevHash,
+	}
+	return res, nil
+}
+
+// auditTruncationBoundary returns the largest seq N such that every row
+// with seq <= N has created_at strictly before cutoff, and ok=true when
+// such an N (>= the oldest surviving seq) exists. It is defined as
+// (min seq with created_at >= cutoff) - 1, falling back to the max seq
+// when no row is that recent, so it never selects a row newer than the
+// cutoff regardless of any seq/created_at ordering skew.
+func auditTruncationBoundary(ctx context.Context, tx *sql.Tx, cutoff string) (int64, bool, error) {
+	var firstRecent sql.NullInt64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT MIN(seq) FROM audit_events WHERE created_at >= ?`, cutoff,
+	).Scan(&firstRecent); err != nil {
+		return 0, false, err
+	}
+	if firstRecent.Valid {
+		return firstRecent.Int64 - 1, firstRecent.Int64-1 >= 1, nil
+	}
+
+	// No recent row: every row is older than the cutoff, so the boundary
+	// is the whole table up to its max seq.
+	var maxSeq sql.NullInt64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT MAX(seq) FROM audit_events`,
+	).Scan(&maxSeq); err != nil {
+		return 0, false, err
+	}
+	if !maxSeq.Valid {
+		return 0, false, nil // empty table.
+	}
+	return maxSeq.Int64, true, nil
+}
+
+// oldestHeldAuditSeq returns the smallest seq (<= upTo) of an audit row
+// tied to a message that currently has at least one link under legal
+// hold, and held=true when such a row exists. Non-message events
+// (message_id == ”) are never held.
+func oldestHeldAuditSeq(ctx context.Context, tx *sql.Tx, upTo int64) (int64, bool, error) {
+	var oldest sql.NullInt64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT MIN(seq) FROM audit_events
+		  WHERE seq <= ?
+		    AND message_id != ''
+		    AND message_id IN (SELECT message_id FROM links WHERE hold = 1)`,
+		upTo,
+	).Scan(&oldest); err != nil {
+		return 0, false, err
+	}
+	if !oldest.Valid {
+		return 0, false, nil
+	}
+	return oldest.Int64, true, nil
+}
+
+// auditRowHash recomputes the chain hash of the audit row at the given
+// seq, returning found=false if no such row exists. This is the anchor
+// hash a truncation records so the surviving chain can be resumed from
+// it (ADR-017). It computes the hash via audit.HashRecord — the single
+// canonical hash shared with the verifier (ATR-240) — so a truncation's
+// anchor_hash is, by construction, exactly what `audit verify` will
+// recompute for the boundary row.
+func auditRowHash(ctx context.Context, tx *sql.Tx, seq int64) (string, bool, error) {
+	row := tx.QueryRowContext(ctx,
+		`SELECT id, seq, prev_hash, type, actor, message_id, recipient, details, created_at
+		   FROM audit_events WHERE seq = ?`, seq)
+
+	rec, err := scanAuditRecord(row)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+
+	hash, err := audit.HashRecord(rec)
+	if err != nil {
+		return "", false, err
+	}
+	return hash, true, nil
+}
+
+// sqlQuerier is satisfied by both *sql.DB and *sql.Tx, letting
+// ListEvents run its paged SELECT against either the plain reader pool
+// (no cursor: nothing to guard) or a single read-only transaction
+// (cursor present: the guard and the SELECT must share one snapshot,
+// see ListEvents' doc comment on the cursor-truncation guard).
+type sqlQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// minAuditSeqTx returns the smallest seq currently in audit_events, with
+// ok=false for an empty table. Used by ListEvents to detect a cursor
+// that points into a range retention has since truncated (ADR-017). It
+// takes an explicit *sql.Tx (never the bare reader pool) so its caller
+// controls exactly which connection/snapshot it reads against — see
+// ListEvents' doc comment for why this must not be a second,
+// independent connection from the one the subsequent paged SELECT uses.
+func minAuditSeqTx(ctx context.Context, tx *sql.Tx) (int64, bool, error) {
+	var minSeq sql.NullInt64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT MIN(seq) FROM audit_events`,
+	).Scan(&minSeq); err != nil {
+		return 0, false, err
+	}
+	return minSeq.Int64, minSeq.Valid, nil
+}
+
 // lastAuditRecord returns the seq and computed hash of the
 // highest-seq row currently in audit_events, or (0, "", nil) if the
 // table is empty (the first record ever written has no predecessor).
+// The hash is computed via audit.HashRecord — the single canonical hash
+// shared with the verifier (ATR-240) — so the prev_hash a new row is
+// written with is exactly what `audit verify` will recompute for its
+// predecessor.
 func lastAuditRecord(ctx context.Context, tx *sql.Tx) (seq int64, hash string, err error) {
 	row := tx.QueryRowContext(ctx,
 		`SELECT id, seq, prev_hash, type, actor, message_id, recipient, details, created_at
 		   FROM audit_events ORDER BY seq DESC LIMIT 1`)
 
-	var (
-		id, prevHash, typ, actor, messageID, recipient, details, createdAt string
-	)
-	scanErr := row.Scan(&id, &seq, &prevHash, &typ, &actor, &messageID, &recipient, &details, &createdAt)
+	rec, scanErr := scanAuditRecord(row)
 	if scanErr != nil {
 		if scanErr == sql.ErrNoRows {
 			return 0, "", nil
@@ -245,13 +532,11 @@ func lastAuditRecord(ctx context.Context, tx *sql.Tx) (seq int64, hash string, e
 		return 0, "", scanErr
 	}
 
-	ts, err := parseTime(createdAt)
+	hash, err = audit.HashRecord(rec)
 	if err != nil {
 		return 0, "", err
 	}
-
-	hash = chainHash(prevHash, id, seq, ts, audit.Type(typ), actor, messageID, recipient, details)
-	return seq, hash, nil
+	return rec.Seq, hash, nil
 }
 
 // scanAuditRecord scans one audit_events row into an audit.Recorded,
@@ -304,27 +589,12 @@ func marshalDetails(details map[string]any) (string, error) {
 	return string(b), nil
 }
 
-// chainHash computes the tamper-evidence hash for one audit_events row
-// (SR-128-1): SHA-256 over the previous row's hash concatenated with
-// every field of this row, so that changing or removing any previously
-// written row (including the very first one, via prevHash) changes
-// every subsequent row's hash. This is the structural hook only; a
-// verifier that walks the table in seq order recomputing this same
-// function is deliberately not implemented as part of this task (see
-// internal/core/audit's package doc comment).
-func chainHash(prevHash, id string, seq int64, ts time.Time, typ audit.Type, actor, messageID, recipient, detailsJSON string) string {
-	h := sha256.New()
-	msg := fmt.Sprintf("%s|%s|%d|%s|%s|%s|%s|%s|%s",
-		prevHash, id, seq, ts.UTC().Format(timeLayout), typ, actor, messageID, recipient, detailsJSON)
-	// hash.Hash.Write never returns an error (its doc comment
-	// guarantees this); the error is still checked to satisfy errcheck
-	// and to fail loudly rather than silently if that contract is ever
-	// violated by a future Go version or a differently-typed h.
-	if _, err := h.Write([]byte(msg)); err != nil {
-		panic(fmt.Sprintf("sqlite: chainHash: hash.Hash.Write returned an error, violating its documented contract: %v", err))
-	}
-	return hex.EncodeToString(h.Sum(nil))
-}
+// The per-row tamper-evidence hash (SR-128-1) is computed by
+// audit.HashRecord in internal/core/audit — the single canonical hash
+// used both here (at write time, via lastAuditRecord/auditRowHash) and by
+// the `audit verify` chain walker (ATR-240). It was lifted out of this
+// package so a verifier outside internal/core/store/sqlite can recompute
+// it without importing store internals (ADR-002, ADR-017 note).
 
 // auditIDRandomBytes mirrors internal/core/link's idRandomBytes scheme
 // (128 bits of crypto/rand entropy for a store-internal row

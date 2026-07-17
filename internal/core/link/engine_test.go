@@ -1,9 +1,12 @@
 package link
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,7 +32,27 @@ func newTestEngine(t *testing.T, d Defaults) (*Engine, *sqlite.Store) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	e, err := NewEngine(st, d, st)
+	e, err := NewEngine(st, d, st, nil)
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v, want nil", err)
+	}
+	return e, st
+}
+
+// newTestEngineWithLogger is newTestEngine plus a caller-supplied
+// logger, for tests asserting on log output (ATR-294's retention-clamp
+// warning).
+func newTestEngineWithLogger(t *testing.T, d Defaults, logger *slog.Logger) (*Engine, *sqlite.Store) {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "engine-test-logger.db")
+	st, err := sqlite.Open(path)
+	if err != nil {
+		t.Fatalf("sqlite.Open() error = %v, want nil", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	e, err := NewEngine(st, d, st, logger)
 	if err != nil {
 		t.Fatalf("NewEngine() error = %v, want nil", err)
 	}
@@ -95,12 +118,33 @@ func TestEngineCreateLinksAndResolve(t *testing.T) {
 		t.Errorf("packageLinks = %d, want 2", packageLinks)
 	}
 
-	files, err := e.ListPackageFiles(ctx, "msg-1")
+	filesR1, err := e.ListPackageFiles(ctx, "msg-1", "r1@example.com")
 	if err != nil {
 		t.Fatalf("ListPackageFiles() error = %v, want nil", err)
 	}
-	if len(files) != 4 {
-		t.Errorf("ListPackageFiles() returned %d links, want 4", len(files))
+	if len(filesR1) != 2 {
+		t.Errorf("ListPackageFiles(msg-1, r1) returned %d links, want 2", len(filesR1))
+	}
+	for _, l := range filesR1 {
+		if l.Recipient != "r1@example.com" {
+			t.Errorf("ListPackageFiles(msg-1, r1) returned a Link for recipient %q, want only r1@example.com", l.Recipient)
+		}
+	}
+
+	filesR2, err := e.ListPackageFiles(ctx, "msg-1", "r2@example.com")
+	if err != nil {
+		t.Fatalf("ListPackageFiles() error = %v, want nil", err)
+	}
+	if len(filesR2) != 2 {
+		t.Errorf("ListPackageFiles(msg-1, r2) returned %d links, want 2", len(filesR2))
+	}
+
+	filesUnknown, err := e.ListPackageFiles(ctx, "msg-1", "nobody@example.com")
+	if err != nil {
+		t.Fatalf("ListPackageFiles() error = %v, want nil", err)
+	}
+	if len(filesUnknown) != 0 {
+		t.Errorf("ListPackageFiles(msg-1, nobody) returned %d links, want 0", len(filesUnknown))
 	}
 }
 
@@ -205,6 +249,121 @@ func TestEngineCreateLinksClampsRetainUntilToTTL(t *testing.T) {
 	}
 	if got.RetainUntil.Before(fileLink.ExpiresAt) {
 		t.Errorf("RetainUntil = %v is before link ExpiresAt = %v; retention must never be shorter than ttl", got.RetainUntil, fileLink.ExpiresAt)
+	}
+}
+
+// TestEngineCreateLinksLogsRetentionClampWarning covers ATR-294: when
+// resolveParams raises retention to match ttl because a genuinely
+// shorter retention was requested (mirroring
+// TestEngineCreateLinksClampsRetainUntilToTTL's own params), the clamp
+// must be observable via a warning log carrying the message ID and
+// both the requested and effective retention values — not just via the
+// RetainUntil value written to storage, which by itself gives no
+// signal that anything diverged from what the policy asked for.
+func TestEngineCreateLinksLogsRetentionClampWarning(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	e, _ := newTestEngineWithLogger(t, defaultTestDefaults(), logger)
+	ctx := context.Background()
+
+	ttl := policy.Duration(48 * time.Hour)
+	retention := policy.Duration(1 * time.Hour) // Deliberately shorter than ttl.
+	if _, err := e.CreateLinks(ctx, CreateLinksParams{
+		Message:     MessageInput{ID: "msg-clamp-log", QueueID: "Q-clamp-log", Sender: "s@example.com"},
+		Attachments: []AttachmentInput{{ID: "att-clamp-log", PartRef: "1", Filename: "f", DeclaredType: "x", DetectedType: "x", Size: 1, StorageKey: "k"}},
+		Recipients:  []string{"r@example.com"},
+		Params:      policy.ActionParams{TTL: &ttl, Retention: &retention},
+	}); err != nil {
+		t.Fatalf("CreateLinks() error = %v, want nil", err)
+	}
+
+	logOutput := logBuf.String()
+	for _, want := range []string{"retention raised to match ttl", "msg-clamp-log", "requested_retention", "effective_retention"} {
+		if !strings.Contains(logOutput, want) {
+			t.Errorf("log output = %q, want it to contain %q", logOutput, want)
+		}
+	}
+}
+
+// TestEngineCreateLinksNoWarningWhenRetentionNotClamped is the
+// negative counterpart of TestEngineCreateLinksLogsRetentionClampWarning:
+// when the policy leaves retention entirely unset (the designed
+// default-to-ttl fallback, not a surprising override — see
+// resolvedParams.retentionClamped's own doc comment) or explicitly sets
+// a retention already >= ttl, no clamp warning is logged.
+func TestEngineCreateLinksNoWarningWhenRetentionNotClamped(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	e, _ := newTestEngineWithLogger(t, defaultTestDefaults(), logger)
+	ctx := context.Background()
+
+	if _, err := e.CreateLinks(ctx, CreateLinksParams{
+		Message:     MessageInput{ID: "msg-no-clamp-log", QueueID: "Q-no-clamp-log", Sender: "s@example.com"},
+		Attachments: []AttachmentInput{{ID: "att-no-clamp-log", PartRef: "1", Filename: "f", DeclaredType: "x", DetectedType: "x", Size: 1, StorageKey: "k"}},
+		Recipients:  []string{"r@example.com"},
+		// Params left zero-value: no ttl/retention override at all.
+	}); err != nil {
+		t.Fatalf("CreateLinks() error = %v, want nil", err)
+	}
+
+	if logOutput := logBuf.String(); strings.Contains(logOutput, "retention raised to match ttl") {
+		t.Errorf("log output = %q, want no retention-clamp warning when retention was never explicitly set", logOutput)
+	}
+}
+
+// TestEngineCreateLinksDedupesRetentionClampWarning covers the
+// dedup layer added to ATR-294's clamp warning: a permanently
+// misconfigured policy/config combination (the same ttl/retention pair
+// clamping on every message that matches it) must only log the warning
+// once per Engine lifetime for that exact (ttl, requestedRetention)
+// combination — not once per message, which would flood the log at
+// production mail volume — while a genuinely different clamp situation
+// (a different ttl or a different requested retention) still gets its
+// own, separate warning.
+func TestEngineCreateLinksDedupesRetentionClampWarning(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	e, _ := newTestEngineWithLogger(t, defaultTestDefaults(), logger)
+	ctx := context.Background()
+
+	createOne := func(msgID string, ttl, retention time.Duration) {
+		t.Helper()
+		ttlD := policy.Duration(ttl)
+		retD := policy.Duration(retention)
+		if _, err := e.CreateLinks(ctx, CreateLinksParams{
+			Message:     MessageInput{ID: msgID, QueueID: "Q-" + msgID, Sender: "s@example.com"},
+			Attachments: []AttachmentInput{{ID: "att-" + msgID, PartRef: "1", Filename: "f", DeclaredType: "x", DetectedType: "x", Size: 1, StorageKey: "k"}},
+			Recipients:  []string{"r@example.com"},
+			Params:      policy.ActionParams{TTL: &ttlD, Retention: &retD},
+		}); err != nil {
+			t.Fatalf("CreateLinks(%q) error = %v, want nil", msgID, err)
+		}
+	}
+
+	// Same clamp situation (48h ttl, 1h requested retention) fires
+	// three times across three different messages — only the first
+	// should be logged.
+	createOne("msg-dedup-1", 48*time.Hour, time.Hour)
+	createOne("msg-dedup-2", 48*time.Hour, time.Hour)
+	createOne("msg-dedup-3", 48*time.Hour, time.Hour)
+
+	// A distinct clamp situation (different ttl) must still log its own
+	// warning, dedup is per-key, not a global "log once ever" latch.
+	createOne("msg-dedup-distinct", 72*time.Hour, time.Hour)
+
+	logOutput := logBuf.String()
+	gotWarnings := strings.Count(logOutput, "retention raised to match ttl")
+	if gotWarnings != 2 {
+		t.Errorf("retention-clamp warning logged %d time(s), want 2 (one per distinct (ttl, requested_retention) key); log output = %q", gotWarnings, logOutput)
+	}
+	if !strings.Contains(logOutput, "msg-dedup-1") {
+		t.Errorf("log output = %q, want the first message_id (msg-dedup-1) for the repeated clamp key", logOutput)
+	}
+	if strings.Contains(logOutput, "msg-dedup-2") || strings.Contains(logOutput, "msg-dedup-3") {
+		t.Errorf("log output = %q, want no entry for the deduped repeat messages (msg-dedup-2/3)", logOutput)
+	}
+	if !strings.Contains(logOutput, "msg-dedup-distinct") {
+		t.Errorf("log output = %q, want an entry for the distinct clamp key (msg-dedup-distinct)", logOutput)
 	}
 }
 
@@ -530,6 +689,68 @@ func TestEngineRegisterPackageDownloadRejectsCrossMessageLinkID(t *testing.T) {
 	}
 }
 
+// TestEngineRegisterPackageDownloadRejectsCrossRecipientLinkID is the
+// ATR-237 regression test: two recipients of the *same* message each
+// get their own Link row per attachment (CreateLinks' per-recipient
+// loop), but only one recipient's package token actually ships in the
+// milter-MVP's shared body (pipeline.packageURLFor picks
+// env.Recipients[0]). That one valid package token must not be usable
+// to charge the *other* recipient's Link row for the same message,
+// even though both rows share the same MessageID and the linkID is a
+// real, existing row — this is exactly the leak/shared-budget-drain
+// ATR-237 closes.
+func TestEngineRegisterPackageDownloadRejectsCrossRecipientLinkID(t *testing.T) {
+	e, st := newTestEngine(t, defaultTestDefaults())
+	ctx := context.Background()
+
+	created, err := e.CreateLinks(ctx, CreateLinksParams{
+		Message:     MessageInput{ID: "msg-multi-rcpt", QueueID: "QM", Sender: "s@example.com"},
+		Attachments: []AttachmentInput{{ID: "att-multi", PartRef: "1", Filename: "f.bin", DeclaredType: "x", DetectedType: "x", Size: 1, StorageKey: "km"}},
+		Recipients:  []string{"alice@example.com", "bob@example.com"},
+	})
+	if err != nil {
+		t.Fatalf("CreateLinks() error = %v, want nil", err)
+	}
+
+	var packageTokenAlice string
+	for _, c := range created {
+		if c.AttachmentID == "" && c.Recipient == "alice@example.com" {
+			packageTokenAlice = c.Token
+		}
+	}
+	if packageTokenAlice == "" {
+		t.Fatal("CreateLinks() did not return a package token for alice@example.com")
+	}
+
+	links, err := st.ListLinksByMessage(ctx, "msg-multi-rcpt")
+	if err != nil || len(links) != 2 {
+		t.Fatalf("ListLinksByMessage() = %+v, err = %v, want 2 links (one per recipient)", links, err)
+	}
+	var bobLinkID string
+	for _, l := range links {
+		if l.Recipient == "bob@example.com" {
+			bobLinkID = l.ID
+		}
+	}
+	if bobLinkID == "" {
+		t.Fatal("did not find a Link row for bob@example.com")
+	}
+
+	// Alice's package token paired with Bob's link ID for the same
+	// message must be refused as if the link did not exist at all.
+	if _, err := e.RegisterPackageDownload(ctx, packageTokenAlice, bobLinkID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("RegisterPackageDownload(aliceToken, bobLinkID) error = %v, want wrapping ErrNotFound", err)
+	}
+
+	got, err := st.GetLinkByID(ctx, bobLinkID)
+	if err != nil {
+		t.Fatalf("GetLinkByID() error = %v, want nil", err)
+	}
+	if got.Downloads != 0 {
+		t.Errorf("bob's link Downloads = %d, want 0 (must not be charged by alice's token)", got.Downloads)
+	}
+}
+
 // TestEngineSetHoldBlocksRevoke verifies the public SetHold API (as
 // opposed to the store.SetHold used directly by other tests in this
 // file) both sets the Hold flag that blocks Revoke and, once cleared,
@@ -594,13 +815,13 @@ func TestNewEngineRejectsInvalidDefaults(t *testing.T) {
 	}
 	defer func() { _ = st.Close() }()
 
-	if _, err := NewEngine(st, Defaults{TTL: 0, MaxDownloads: 0, TokenBytes: MinTokenBytes}, st); err == nil {
+	if _, err := NewEngine(st, Defaults{TTL: 0, MaxDownloads: 0, TokenBytes: MinTokenBytes}, st, nil); err == nil {
 		t.Errorf("NewEngine() with zero TTL error = nil, want an error")
 	}
-	if _, err := NewEngine(st, Defaults{TTL: time.Hour, MaxDownloads: -1, TokenBytes: MinTokenBytes}, st); err == nil {
+	if _, err := NewEngine(st, Defaults{TTL: time.Hour, MaxDownloads: -1, TokenBytes: MinTokenBytes}, st, nil); err == nil {
 		t.Errorf("NewEngine() with negative MaxDownloads error = nil, want an error")
 	}
-	if _, err := NewEngine(st, Defaults{TTL: time.Hour, MaxDownloads: 0, TokenBytes: 1}, st); err == nil {
+	if _, err := NewEngine(st, Defaults{TTL: time.Hour, MaxDownloads: 0, TokenBytes: 1}, st, nil); err == nil {
 		t.Errorf("NewEngine() with too-small TokenBytes error = nil, want an error")
 	}
 }

@@ -23,14 +23,18 @@ info:
     - `GET /metrics` — Prometheus text exposition format, not JSON; described
       by the metrics library itself, not by an OpenAPI document.
     - `GET /healthz` and `GET /readyz` — liveness/readiness probes
-      (`internal/adapters/http/health.go`). Both are mounted at the server
-      root, not under `/api/v1` (`internal/adapters/http/server.go`), so
-      including them as `paths` here — which inherit this document's
-      `servers: [{url: /api/v1}]` — would misrepresent their real mount
-      point as a contract detail. They are genuinely unauthenticated
-      (SR-130-1's explicit exception) but are operational Kubernetes/Docker
-      probe endpoints, not part of the admin/automation resource surface
-      this document is the source of truth for.
+      (`internal/adapters/http/health.go`). Neither is mounted under
+      `/api/v1` (`internal/adapters/http/server.go`), so including them as
+      `paths` here — which inherit this document's `servers: [{url:
+      /api/v1}]` — would misrepresent their real mount point as a contract
+      detail. They are genuinely unauthenticated (SR-130-1's explicit
+      exception) but are operational Kubernetes/Docker probe endpoints, not
+      part of the admin/automation resource surface this document is the
+      source of truth for. `GET /healthz` is served on both the public
+      download listener (`http.listen`) and the separate admin listener;
+      `GET /metrics` and `GET /readyz` are served on the admin listener
+      only (`admin.listen`, ATR-292) — never on `http.listen`, unless an
+      operator explicitly opts out via `admin.fold_into_http: true`.
 
     ## Versioning
 
@@ -108,7 +112,8 @@ info:
     `GET /audit/export` is the one exception: it streams the *entire*
     filtered result set as newline-delimited JSON in one response
     (mirroring `audit.ExportJSONL`, which is itself unbounded-but-streamed
-    per CLAUDE.md invariant #4), so it takes no `limit`/`cursor` — an
+    per the project's streaming invariant — a result set is never fully
+    buffered in memory), so it takes no `limit`/`cursor` — an
     external SIEM/archival consumer wants the full export, not a page of it.
 
     ## Errors
@@ -162,15 +167,16 @@ paths:
         - $ref: '#/components/parameters/Cursor'
         - name: sender
           in: query
-          description: Exact, case-insensitive envelope-sender match.
+          description: 'Exact envelope-sender match, case-insensitive with SMTP angle brackets ignored (ATR-293).'
           schema: { type: string }
         - name: recipient
           in: query
           description: >-
-            Exact, case-insensitive recipient match. Implemented as a join
-            against this message's links (a Message row itself carries no
-            recipient — recipients live on `store.Link`/`store.MessageLink`,
-            one per (message, recipient) pair).
+            Exact recipient match, case-insensitive with SMTP angle brackets
+            ignored (ATR-293). Implemented as a join against this message's
+            links (a Message row itself carries no recipient — recipients
+            live on `store.Link`/`store.MessageLink`, one per (message,
+            recipient) pair).
           schema: { type: string }
         - name: status
           in: query
@@ -304,7 +310,7 @@ paths:
           schema: { type: string }
         - name: recipient
           in: query
-          description: Exact, case-insensitive recipient match.
+          description: 'Exact recipient match, case-insensitive with SMTP angle brackets ignored (ATR-293).'
           schema: { type: string }
         - name: status
           in: query
@@ -709,6 +715,7 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '410': { $ref: '#/components/responses/Gone' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/InternalError' }
 
@@ -719,7 +726,7 @@ paths:
       description: >-
         Mirrors `audit.ExportJSONL`: streams every matching event as one
         compact JSON object per line, in ascending `seq` order, without
-        buffering the full result set (CLAUDE.md invariant #4). Intended
+        buffering the full result set (the project's streaming invariant). Intended
         for ingestion into an external, immutable store or SIEM
         (SR-128-3). Unlike every other list endpoint, this is **not**
         paginated — filter by `from`/`to`/`type` to bound the export size.
@@ -775,7 +782,7 @@ paths:
       description: >-
         The response's `secret` field is the only time the raw bearer
         token is ever shown; only its hash is persisted thereafter
-        (CLAUDE.md invariant #5, SR-130-2). There is no "show secret
+        (SR-130-2). There is no "show secret
         again" endpoint — losing it means issuing a new token.
       tags: [API Tokens]
       x-required-role: [admin]
@@ -901,6 +908,16 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
           example: { error: { code: not_found, message: "no resource found for the given identifier" } }
+    Gone:
+      description: >-
+        The requested continuation range no longer exists because audit
+        retention (ADR-017) truncated it. The cursor is well-formed but
+        its target events were removed; restart pagination from the first
+        page. Only `GET /audit` returns this.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: gone, message: "cursor references truncated audit events; restart pagination" } }
     PayloadTooLarge:
       description: The request body exceeded the configured size limit.
       content:
@@ -947,6 +964,7 @@ components:
                 - validation_failed
                 - payload_too_large
                 - rate_limited
+                - gone
                 - internal
             message:
               type: string
@@ -988,6 +1006,8 @@ components:
         - retention_cleanup
         - token_change
         - error
+        - compensation
+        - retention_checkpoint
 
     Message:
       type: object
@@ -1101,7 +1121,7 @@ components:
       type: object
       required: [sender]
       properties:
-        sender: { type: string }
+        sender: { type: string, description: 'Matched case-insensitively, with SMTP angle brackets ignored (ATR-293).' }
 
     RevokeBySenderResult:
       type: object
@@ -1408,8 +1428,8 @@ components:
               type: string
               description: >-
                 The raw bearer token. Shown exactly once, at creation
-                time; only its hash is persisted (CLAUDE.md invariant #5,
-                SR-130-2). There is no way to retrieve it again.
+                time; only its hash is persisted (SR-130-2). There is
+                no way to retrieve it again.
 
     PageMeta:
       type: object

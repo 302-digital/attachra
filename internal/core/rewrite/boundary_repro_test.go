@@ -27,6 +27,7 @@ func TestClassifyBoundaryLine_RFC2046Grammar(t *testing.T) {
 		{"nested boundary with shared prefix (b vs bx)", "--bx", notBoundary},
 		{"ordinary content", "just some content", notBoundary},
 		{"padding with non-LWS char is not a delimiter", "--b abc", notBoundary},
+		{"close delimiter with trailing non-padding text", "--b--x", notBoundary},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -16,7 +16,7 @@ handles a problem your MTA and your spam/AV stack don't: what happens to
 
 ![Demo: an outbound attachment is replaced with a personal download link, downloaded, then revoked](docs/assets/demo.gif)
 
-> **Status: v0.2.1 released.** The full pipeline — Postfix milter → MIME
+> **Status: v0.2.2 released.** The full pipeline — Postfix milter → MIME
 > parsing → policy engine → S3/filesystem storage → personal download link →
 > MIME rewrite → audit trail — works end to end and has been **tested in
 > production on a live [grommunio](https://grommunio.com/) (Postfix-based)
@@ -93,7 +93,7 @@ Exchange, Exim, Stalwart) as adapters later, without touching the core.
 
 ## Status & roadmap
 
-**v0.2.1 is released.** The architecture and scope decisions are recorded in
+**v0.2.2 is released.** The architecture and scope decisions are recorded in
 [`docs/Attachra_ADR.md`](docs/Attachra_ADR.md); the milestone breakdown and
 what's planned next live in [`ROADMAP.md`](ROADMAP.md) and the repo's
 issues and milestones.
@@ -124,7 +124,7 @@ attach the milter to.
    On your Debian 13 mail server:
 
    ```sh
-   version=0.2.1   # match the release you want
+   version=0.2.2   # match the release you want
    curl -LO https://github.com/302-digital/attachra/releases/download/v${version}/attachra_${version}_amd64.deb
    curl -LO https://github.com/302-digital/attachra/releases/download/v${version}/SHA256SUMS
    sha256sum -c SHA256SUMS --ignore-missing
@@ -188,11 +188,18 @@ attach the milter to.
 
 5. **Publish the download page.** Put a reverse proxy in front of
    `http.listen` (default `127.0.0.1:18080`) that exposes only the `/p/`
-   path over TLS to the outside world — never `/api/v1` or `/metrics`
-   publicly. If you're running grommunio specifically,
+   path over TLS to the outside world — never `/api/v1` publicly.
+   `/metrics` and the detailed `/readyz` live on a separate, loopback-only
+   `admin.listen` (default `127.0.0.1:18090`) and are never reachable
+   through `http.listen` at all. If you're running grommunio specifically,
    [`docs/deploy/grommunio-debian.md`](docs/deploy/grommunio-debian.md)
    walks through the whole install end to end, including a ready-made
-   nginx snippet and the exact rspamd-then-Attachra milter chain.
+   nginx snippet and the exact rspamd-then-Attachra milter chain. Before
+   pointing production traffic at it, work through
+   [`docs/integrations/recipient-trust.md`](docs/integrations/recipient-trust.md)
+   (domain registration lead time, `security.txt`, web-filter
+   categorization) — a brand-new download domain gets blocked by
+   corporate web filters by default until it has some reputation.
 
 ### Option B: Docker Compose (try it locally, no real Postfix needed)
 
@@ -243,7 +250,7 @@ Verify the container image (sign by digest — resolve `:vX.Y.Z` to a
 digest first, since only the digest is signed):
 
 ```sh
-digest=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/302-digital/attachra:v0.2.0)
+digest=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/302-digital/attachra:v0.2.2)
 cosign verify "$digest" \
   --certificate-identity-regexp '^https://github\.com/302-digital/attachra/\.github/workflows/release\.yml@.+$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com

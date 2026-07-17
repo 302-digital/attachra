@@ -93,7 +93,7 @@ func runLinkRevoke(args []string, metadataStore store.MetadataStore, engine *lin
 	fs.SetOutput(stderr)
 	actor := fs.String("actor", "", "identity of the operator performing this action (required; recorded in the audit log, since the CLI has no HTTP-auth principal to attribute it to)")
 	messageID := fs.String("message-id", "", "revoke every link belonging to this message")
-	sender := fs.String("sender", "", "revoke every link belonging to every message sent by this address")
+	sender := fs.String("sender", "", "revoke every link belonging to every message sent by this address (matched case-insensitively, angle brackets ignored — ATR-293)")
 
 	if err := fs.Parse(args); err != nil {
 		return linkError

@@ -57,7 +57,7 @@ func TestDownloadRecordsAuditEvent(t *testing.T) {
 			t.Error("download event Actor is empty, want a non-empty adapter identity")
 		}
 		// The raw bearer token must never appear in the audit trail
-		// (CLAUDE.md invariant #5): only a short, non-reversible
+		// (the token-hygiene invariant): only a short, non-reversible
 		// reference is stored.
 		if tokenRef, ok := e.Details["token_ref"].(string); !ok || tokenRef == packageToken {
 			t.Errorf("download event Details[token_ref] = %v, want a short reference distinct from the raw token", e.Details["token_ref"])

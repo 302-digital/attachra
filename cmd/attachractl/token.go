@@ -21,7 +21,7 @@ func newTokenCmd(env *appEnv) *cobra.Command {
 }
 
 // apiTokenView is the subset of schema ApiToken this CLI renders. It
-// never carries a secret or hash (SR-130-2, CLAUDE.md invariant #5) —
+// never carries a secret or hash (SR-130-2, the token-hygiene invariant) —
 // neither does the API response it is decoded from, for any operation
 // except create.
 type apiTokenView struct {

@@ -161,8 +161,9 @@ func newAuditTailCmd(env *appEnv) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "tail",
 		Short: "Show the most recent audit events, optionally following new ones",
-		Long:  "Fetches the last --lines matching events (walking every page of GET /audit internally, since the API's cursor only moves forward in ascending seq order), then, with --follow, polls for new events every --interval by filtering on the last seen event's seq/timestamp.",
-		Args:  cobra.NoArgs,
+		Long: "Fetches the last --lines matching events (walking every page of GET /audit internally, since the API's cursor only moves forward in ascending seq order), then, with --follow, polls for new events every --interval by filtering on the last seen event's seq/timestamp.\n\n" +
+			"Cost note: because the API has no reverse/tail cursor, this always reads the filtered log from its beginning to its end to find the last --lines events, discarding everything but the tail as it goes (ATR-299) — on a large or unfiltered audit log this can mean fetching a lot more than --lines events over the wire. Narrow with --message-id/--type/--from/--to where possible; a server-side tail parameter is tracked as a follow-up, not yet implemented.",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if lines <= 0 {
 				return newCLIError(exitUsage, "audit tail: --lines must be positive")
@@ -275,7 +276,7 @@ func newAuditExportCmd(env *appEnv) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "export",
 		Short: "Export the full filtered audit log as JSON Lines",
-		Long:  "Streams GET /audit/export directly to stdout without buffering (CLAUDE.md invariant #4): one JSON object per line, in ascending seq order, unaffected by --json (this command's output is always JSON Lines). Unlike `audit list`/`audit tail`, this is not paginated — narrow the result with --from/--to/--type.",
+		Long:  "Streams GET /audit/export directly to stdout without buffering: one JSON object per line, in ascending seq order, unaffected by --json (this command's output is always JSON Lines). Unlike `audit list`/`audit tail`, this is not paginated — narrow the result with --from/--to/--type.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			query := url.Values{}

@@ -193,9 +193,10 @@ func TestProcess_RecordsErrorEventOnFailure(t *testing.T) {
 	}
 }
 
-// TestProcess_AuditSinkFailureDoesNotAffectVerdict verifies CLAUDE.md
-// invariant #3 in the audit dimension: if the configured AuditSink
-// itself fails, Process must still return its normal Verdict/error —
+// TestProcess_AuditSinkFailureDoesNotAffectVerdict verifies the
+// mail-must-never-be-lost invariant in the audit dimension: if the
+// configured AuditSink itself fails, Process must still return its
+// normal Verdict/error —
 // audit recording is best-effort and must never cause the message to
 // be lost, rejected, or delayed.
 func TestProcess_AuditSinkFailureDoesNotAffectVerdict(t *testing.T) {

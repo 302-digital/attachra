@@ -150,7 +150,7 @@ func newRoleMatrixTestServer(t *testing.T) (*APIHandler, *httptest.Server) {
 		TTL:          72 * time.Hour,
 		MaxDownloads: 0,
 		TokenBytes:   link.MinTokenBytes,
-	}, st)
+	}, st, nil)
 	if err != nil {
 		t.Fatalf("link.NewEngine() error = %v, want nil", err)
 	}

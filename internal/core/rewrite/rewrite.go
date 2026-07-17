@@ -14,18 +14,13 @@ import (
 
 	"github.com/302-digital/attachra/internal/core/message"
 	"github.com/302-digital/attachra/internal/core/policy"
+	"github.com/302-digital/attachra/internal/core/spoolutil"
 )
 
 // ProcessedHeaderVersion is the value written in the "version"
 // component of the X-Attachra-Processed header (US-3.2 acceptance
 // criteria: "a header X-Attachra-Processed is added").
 const ProcessedHeaderVersion = "1"
-
-// spoolMemThreshold bounds how much of the rewritten message rewrite
-// buffers in memory (via stageToFile) before spilling to a temporary
-// file, mirroring internal/adapters/milter's spool (SR-115-3,
-// CLAUDE.md invariant #4).
-const spoolMemThreshold = 256 * 1024 // 256 KiB
 
 // Input is the input to Rewrite.
 type Input struct {
@@ -63,6 +58,14 @@ type Input struct {
 	// as the short id component of X-Attachra-Processed. If empty, a
 	// random id is generated.
 	ProcessedID string
+
+	// SpoolDir selects the directory stageToFile creates its temporary
+	// spill file in once the rewritten output exceeds
+	// spoolutil.SpoolMemThreshold (ATR-262). It is expected to be
+	// config.SpoolConfig.Dir; the empty string (the default) uses the
+	// OS default temporary directory ($TMPDIR / os.TempDir()), matching
+	// os.CreateTemp's own documented behavior for an empty dir argument.
+	SpoolDir string
 }
 
 // Result is the output of a successful Rewrite.
@@ -150,7 +153,7 @@ func Rewrite(in Input, tmpl *Templates) (*Result, error) {
 		return nil, err
 	}
 
-	body, err := stageToFile(func(w io.Writer) error {
+	body, err := stageToFile(in.SpoolDir, func(w io.Writer) error {
 		rw := &rewriter{
 			decisionByPath: decisionByPath,
 			plainBlock:     plainBlock,
@@ -167,10 +170,10 @@ func Rewrite(in Input, tmpl *Templates) (*Result, error) {
 }
 
 // randomID returns a short random hex id (SR "short id") for
-// X-Attachra-Processed, from crypto/rand per CLAUDE.md invariant #5
-// (the same primitive used for link tokens, even though this id is
-// not a security-sensitive secret — consistency avoids a second
-// pattern for "generate a random identifier").
+// X-Attachra-Processed, from crypto/rand per the token-hygiene
+// invariant (the same primitive used for link tokens, even though
+// this id is not a security-sensitive secret — consistency avoids a
+// second pattern for "generate a random identifier").
 func randomID() (string, error) {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -180,10 +183,14 @@ func randomID() (string, error) {
 }
 
 // stageToFile invokes write with a destination writer, spooling the
-// output to memory up to spoolMemThreshold bytes and to a temporary
-// file beyond that (mirroring internal/adapters/milter's spool,
-// SR-115-3 / CLAUDE.md invariant #4), then returns a reader over the
-// complete staged result positioned at the start.
+// output to memory up to spoolutil.SpoolMemThreshold bytes and to a
+// temporary file beyond that (mirroring internal/adapters/milter's
+// spool, SR-115-3, the streaming invariant), then returns a reader
+// over the complete staged result positioned at the start. dir
+// selects the directory any spilled temporary file is created in
+// (ATR-262); the empty string uses the OS default temporary
+// directory ($TMPDIR / os.TempDir()), matching os.CreateTemp's own
+// documented behavior for an empty dir argument.
 //
 // Rewriting a MIME tree fundamentally requires knowing, for the
 // outermost multipart/mixed envelope, whether a block needs to be
@@ -196,9 +203,9 @@ func randomID() (string, error) {
 // instead of a two-pass or backtracking one, at the cost of one
 // bounded buffer/temp-file per rewritten message — the same trade-off
 // milter's own spool already makes for the *input* side.
-func stageToFile(write func(io.Writer) error) (io.Reader, error) {
+func stageToFile(dir string, write func(io.Writer) error) (io.Reader, error) {
 	var mem bytes.Buffer
-	limited := &thresholdWriter{buf: &mem, threshold: spoolMemThreshold}
+	limited := &thresholdWriter{buf: &mem, threshold: spoolutil.SpoolMemThreshold, dir: dir}
 
 	if err := write(limited); err != nil {
 		if limited.file != nil {
@@ -226,16 +233,18 @@ func stageToFile(write func(io.Writer) error) (io.Reader, error) {
 
 // thresholdWriter accumulates writes in buf until threshold bytes
 // have been written, then spills buf's contents (and all subsequent
-// writes) to a newly created temporary file.
+// writes) to a newly created temporary file in dir (the empty string
+// meaning the OS default temporary directory).
 type thresholdWriter struct {
 	buf       *bytes.Buffer
 	threshold int
+	dir       string
 	file      *os.File
 }
 
 func (w *thresholdWriter) Write(p []byte) (int, error) {
 	if w.file == nil && w.buf.Len()+len(p) > w.threshold {
-		f, err := os.CreateTemp("", "attachra-rewrite-body-*.spool")
+		f, err := os.CreateTemp(w.dir, "attachra-rewrite-body-*.spool")
 		if err != nil {
 			return 0, fmt.Errorf("rewrite: create spool temp file: %w", err)
 		}
@@ -322,10 +331,6 @@ func (rw *rewriter) run(src io.Reader, dst io.Writer) error {
 		return fmt.Errorf("rewrite: read top-level header: %w", err)
 	}
 
-	if _, err := dst.Write(withProcessedHeader(headerBytes, rw.processedID)); err != nil {
-		return fmt.Errorf("rewrite: write top-level header: %w", err)
-	}
-
 	contentType := header.Get("Content-Type")
 	mediaType, params, err := mime.ParseMediaType(contentType)
 	if err != nil {
@@ -335,7 +340,17 @@ func (rw *rewriter) run(src io.Reader, dst io.Writer) error {
 
 	switch {
 	case strings.HasPrefix(mediaType, "multipart/"):
-		if err := rw.rewriteMultipart(br, dst, params["boundary"], "0"); err != nil {
+		// The top-level Content-Type is already multipart and does not
+		// change, so the original header block is emitted verbatim (plus
+		// the synthesized X-Attachra-Processed) before its child parts.
+		if _, err := dst.Write(withProcessedHeader(headerBytes, rw.processedID)); err != nil {
+			return fmt.Errorf("rewrite: write top-level header: %w", err)
+		}
+		// true: this is the message's genuinely outermost multipart
+		// structure, written directly to Rewrite's final output, so its
+		// closing delimiter owns the final trailing CRLF (see
+		// boundaryWriter.finalCRLF's doc comment in walk.go).
+		if err := rw.rewriteMultipart(br, dst, params["boundary"], "0", true); err != nil {
 			return err
 		}
 	default:
@@ -345,8 +360,13 @@ func (rw *rewriter) run(src io.Reader, dst io.Writer) error {
 		// leaf (PartPath "0"). Promote it into a small
 		// multipart/mixed envelope so the replacement block has a
 		// well-formed place to live alongside the (dropped) original
-		// body.
-		if err := rw.rewriteTopLevelSinglePart(br, dst, header, "0"); err != nil {
+		// body. rewriteTopLevelSinglePart writes its OWN top-level
+		// header block: promotion changes the top-level Content-Type
+		// (and drops the single part's other content headers), which
+		// must land INSIDE the header block, before its terminating
+		// blank line — writing it after the block, as this path used to,
+		// pushed the promoted Content-Type into the body (ATR-291).
+		if err := rw.rewriteTopLevelSinglePart(br, dst, headerBytes, "0"); err != nil {
 			return err
 		}
 	}
@@ -362,36 +382,48 @@ func (rw *rewriter) run(src io.Reader, dst io.Writer) error {
 // "multipart/..."): there is no sibling structure to preserve, so
 // rewrite promotes the message into a small multipart/mixed envelope
 // wrapping the (possibly dropped, possibly kept) original body plus a
-// new multipart/alternative part carrying the replacement block. The
-// promoted Content-Type is the only header rewrite performs on the
-// top-level message itself (all other original headers, plus the
-// synthesized X-Attachra-Processed, are preserved verbatim by run()
-// before this is called).
-func (rw *rewriter) rewriteTopLevelSinglePart(br *bufio.Reader, dst io.Writer, header textprotoHeader, partPath string) error {
+// new multipart/alternative part carrying the replacement block.
+//
+// Unlike the multipart path, this promotion CHANGES the top-level
+// Content-Type (application/... -> multipart/mixed), so this function
+// emits the whole top-level header block itself rather than relying on
+// run() having emitted the original one: promoteHeaderBlock preserves
+// every original envelope header verbatim, drops the single part's own
+// content headers (Content-Type, Content-Transfer-Encoding,
+// Content-Disposition, ... — they describe the wrapped body, not the new
+// multipart envelope, and moving them down/dropping them is what keeps
+// the promoted Content-Type inside the header block rather than in the
+// body, ATR-291), and appends the multipart/mixed Content-Type,
+// MIME-Version and X-Attachra-Processed.
+func (rw *rewriter) rewriteTopLevelSinglePart(br *bufio.Reader, dst io.Writer, headerBytes []byte, partPath string) error {
 	rest, err := io.ReadAll(br)
 	if err != nil {
 		return fmt.Errorf("rewrite: read top-level single-part body: %w", err)
 	}
 
 	boundary := "attachra-top-" + rw.processedID
-	if _, err := fmt.Fprintf(dst, "Content-Type: multipart/mixed; boundary=%q\r\nMIME-Version: 1.0\r\n\r\n", boundary); err != nil {
+	if _, err := dst.Write(promoteHeaderBlock(headerBytes, boundary, rw.processedID)); err != nil {
 		return fmt.Errorf("rewrite: write promoted top-level header: %w", err)
 	}
 
-	bw := &boundaryWriter{dst: dst, boundary: boundary}
+	// This writes directly to Rewrite's final output (dst), the same
+	// as rw.run's top-level rewriteMultipart call, so its closing
+	// delimiter owns the message's final trailing CRLF too (see
+	// boundaryWriter.finalCRLF's doc comment).
+	bw := &boundaryWriter{dst: dst, boundary: boundary, finalCRLF: true}
 
 	decision, hasDecision := rw.decisionByPath[partPath]
 	if !hasDecision || decision.Action != policy.ActionReplace {
-		var headerBuf bytes.Buffer
-		for name, values := range header {
-			for _, v := range values {
-				fmt.Fprintf(&headerBuf, "%s: %s\r\n", name, v)
-			}
-		}
-		headerBuf.WriteString("\r\n")
-		headerBuf.Write(rest)
+		// The original body is kept: re-emit it as a wrapped part
+		// carrying only its own content headers (the ones dropped from
+		// the promoted top-level block). Envelope headers stay on the
+		// top-level block above and must not be duplicated here.
+		var partBuf bytes.Buffer
+		partBuf.Write(contentHeaderLines(headerBytes))
+		partBuf.WriteString("\r\n")
+		partBuf.Write(rest)
 
-		if err := bw.writePart(headerBuf.Bytes()); err != nil {
+		if err := bw.writePart(partBuf.Bytes()); err != nil {
 			return err
 		}
 	}

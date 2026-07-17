@@ -1,6 +1,6 @@
 package http
 
-import "sync"
+import "time"
 
 // authThrottle rate-limits repeated authentication failures per source
 // IP (SR-130-5's "rate limit on auth failures"; anti-brute-force against
@@ -11,34 +11,46 @@ import "sync"
 // throttled by it no matter how many requests it makes, while a client
 // spraying invalid tokens is cut off after a small number of tries.
 //
-// It reuses the same dependency-free tokenBucket the rest of this adapter
-// uses. Buckets are created lazily per IP and never evicted within the
-// process lifetime — the same accepted MVP bound documented on
-// perIPLimiter (a pathological number of distinct source IPs grows this
-// map); it is not a correctness issue.
+// It reuses the same dependency-free tokenBucket the rest of this
+// adapter uses, stored in an evictingBucketMap (ATR-297) rather than a
+// plain map, so a pathological number of distinct source IPs cannot
+// grow buckets without bound — see evictingBucketMap's doc comment for
+// the eviction policy.
 //
 // Safe for concurrent use by multiple goroutines.
 type authThrottle struct {
-	mu sync.Mutex
-
 	ratePerMinute int
 	burst         int
-	buckets       map[string]*tokenBucket
+	buckets       *evictingBucketMap
 }
 
 // newAuthThrottle returns an authThrottle allowing ratePerMinute
-// sustained auth failures per IP with the given burst. A ratePerMinute
-// <= 0 disables throttling (failAllowed always returns true), so an
-// operator can turn it off, and unit tests that do not exercise it are
-// unaffected.
+// sustained auth failures per IP with the given burst, evicted per the
+// package-default bounds (defaultBucketMapMaxEntries/
+// defaultBucketMapTTL). A ratePerMinute <= 0 disables throttling
+// (failAllowed always returns true), so an operator can turn it off,
+// and unit tests that do not exercise it are unaffected.
 func newAuthThrottle(ratePerMinute, burst int) *authThrottle {
+	return newAuthThrottleWithBounds(ratePerMinute, burst, 0, 0)
+}
+
+// newAuthThrottleWithBounds is newAuthThrottle with explicit eviction
+// bounds (ATR-297): maxEntries <= 0 and/or ttl <= 0 fall back to the
+// package defaults, mirroring newPerIPLimiterWithBounds.
+func newAuthThrottleWithBounds(ratePerMinute, burst, maxEntries int, ttl time.Duration) *authThrottle {
 	if burst <= 0 {
 		burst = ratePerMinute
+	}
+	if maxEntries <= 0 {
+		maxEntries = defaultBucketMapMaxEntries
+	}
+	if ttl <= 0 {
+		ttl = defaultBucketMapTTL
 	}
 	return &authThrottle{
 		ratePerMinute: ratePerMinute,
 		burst:         burst,
-		buckets:       make(map[string]*tokenBucket),
+		buckets:       newEvictingBucketMap(maxEntries, ttl),
 	}
 }
 
@@ -52,13 +64,7 @@ func (a *authThrottle) failAllowed(ip string) bool {
 		return true
 	}
 
-	a.mu.Lock()
-	b, ok := a.buckets[ip]
-	if !ok {
-		b = newTokenBucket(a.ratePerMinute, a.burst)
-		a.buckets[ip] = b
-	}
-	a.mu.Unlock()
-
+	rate, burst := a.ratePerMinute, a.burst
+	b := a.buckets.getOrCreate(ip, func() *tokenBucket { return newTokenBucket(rate, burst) })
 	return b.allow()
 }

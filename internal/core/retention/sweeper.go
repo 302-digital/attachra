@@ -87,6 +87,22 @@ type Params struct {
 	// link.Engine's own nil-defaulting posture.
 	AuditSink audit.AuditSink
 
+	// AuditTruncator, when non-nil together with a positive
+	// AuditRetention, lets each Sweep pass also truncate the tamper-
+	// evident audit log's old, contiguous, hold-respecting prefix
+	// (ATR-308, ADR-017). Nil (or a non-positive AuditRetention) leaves
+	// the audit log append-only forever — the default, opt-in-off
+	// behavior. cmd/attachra wires the sqlite Store here, which
+	// implements audit.Truncator.
+	AuditTruncator audit.Truncator
+
+	// AuditRetention is how long audit events are kept before Sweep
+	// truncates them (config retention.audit_retention_seconds). A
+	// non-positive value disables audit truncation regardless of
+	// AuditTruncator. Separate from the file/link retention deadline,
+	// which is written per-attachment at link creation.
+	AuditRetention time.Duration
+
 	// Metrics receives Prometheus observations for each attachment
 	// processed. A nil Metrics is valid: every metrics.Metrics method
 	// is nil-safe, so Sweeper never needs its own nil check before
@@ -113,12 +129,14 @@ type Params struct {
 // practice cmd/attachra drives exactly one Sweeper from a single
 // ticker-owned goroutine.
 type Sweeper struct {
-	metadata  store.MetadataStore
-	storage   storage.Driver
-	audit     audit.AuditSink
-	metrics   *metrics.Metrics
-	logger    *slog.Logger
-	chunkSize int
+	metadata       store.MetadataStore
+	storage        storage.Driver
+	audit          audit.AuditSink
+	auditTruncator audit.Truncator
+	auditRetention time.Duration
+	metrics        *metrics.Metrics
+	logger         *slog.Logger
+	chunkSize      int
 
 	// now is overridable for deterministic tests; production code
 	// always uses the zero value, which falls back to time.Now.
@@ -146,12 +164,14 @@ func New(p Params) (*Sweeper, error) {
 	}
 
 	return &Sweeper{
-		metadata:  p.Metadata,
-		storage:   p.Storage,
-		audit:     sink,
-		metrics:   p.Metrics,
-		logger:    p.Logger,
-		chunkSize: chunkSize,
+		metadata:       p.Metadata,
+		storage:        p.Storage,
+		audit:          sink,
+		auditTruncator: p.AuditTruncator,
+		auditRetention: p.AuditRetention,
+		metrics:        p.Metrics,
+		logger:         p.Logger,
+		chunkSize:      chunkSize,
 	}, nil
 }
 
@@ -214,6 +234,11 @@ type Result struct {
 	// doc comment for why this is a non-destructive, not
 	// hold-sensitive, bookkeeping update).
 	ExpiredLinks int
+
+	// AuditTruncated is the number of audit-log events this pass removed
+	// via checkpoint truncation (ATR-308, ADR-017). Zero whenever audit
+	// retention is disabled (the default) or nothing was eligible.
+	AuditTruncated int64
 }
 
 // Sweep runs one retention cleanup pass: it marks stale links expired,
@@ -266,6 +291,7 @@ func (s *Sweeper) Sweep(ctx context.Context) (Result, error) {
 		s.log().Warn("retention: failed to mark stale links expired", "error", err.Error())
 	} else {
 		res.ExpiredLinks = expired
+		s.metrics.ObserveRetentionExpiredLinks(expired)
 	}
 
 	// The held-at-T0 count is taken here, immediately before the first
@@ -328,7 +354,63 @@ chunkLoop:
 		}
 	}
 
+	s.sweepAudit(ctx, &res)
+
 	return res, nil
+}
+
+// sweepAudit truncates the tamper-evident audit log's old, contiguous,
+// hold-respecting prefix (ATR-308, ADR-017), when — and only when —
+// audit retention is configured (a non-nil Truncator and a positive
+// retention window). It is a no-op otherwise, keeping the log
+// append-only forever by default.
+//
+// Like every other step of a Sweep pass, a failure here is logged and
+// swallowed rather than propagated: audit truncation is background
+// housekeeping, and a store hiccup on it must not fail the whole sweep
+// (which also purges expired attachments). The truncation itself is
+// atomic and records its own checkpoint event, so a failure simply
+// leaves the log un-truncated for the next pass to retry — never a
+// half-truncated, unverifiable chain. A canceled ctx is treated the same
+// way (nothing to report; the next pass retries).
+func (s *Sweeper) sweepAudit(ctx context.Context, res *Result) {
+	if s.auditTruncator == nil || s.auditRetention <= 0 {
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		return
+	}
+
+	cutoff := s.clock().Add(-s.auditRetention)
+	out, err := s.auditTruncator.TruncateAudit(ctx, audit.TruncateRequest{
+		Cutoff: cutoff,
+		Actor:  sweepActor,
+	})
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
+		s.log().Warn("retention: failed to truncate audit log", "error", err.Error())
+		return
+	}
+	if out.Truncated {
+		res.AuditTruncated = out.TruncatedCount
+		s.metrics.ObserveAuditTruncation(out.TruncatedCount)
+		return
+	}
+	if out.HeldClamped {
+		// The entire eligible prefix was pinned by legal hold (N1, per
+		// security review): without this log line, a pass that removes
+		// nothing is silent — an operator who enabled
+		// audit_retention_seconds and sees no growth relief has no signal
+		// why. This is also a documented footgun (ADR-017 "Limitations",
+		// docs/architecture/audit-retention.md): an authorized insider
+		// with hold-setting privileges can set (and never lift) a hold on
+		// one old, low-value message to indefinitely defeat truncation of
+		// the whole prefix behind it, with no DB-level access required.
+		s.log().Warn("retention: audit truncation fully blocked by legal hold",
+			"cutoff", cutoff.UTC().Format(time.RFC3339Nano))
+	}
 }
 
 // purgeAndRecord purges a single attachment, updates res and metrics,

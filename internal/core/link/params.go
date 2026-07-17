@@ -61,6 +61,32 @@ type resolvedParams struct {
 	ttl          time.Duration
 	maxDownloads int
 	retention    time.Duration
+
+	// retentionClamped is true when retention (below) was raised to
+	// equal ttl because a non-zero, explicitly configured value — the
+	// policy's `then.retention` or, absent that, a non-zero
+	// Defaults.Retention — was shorter than ttl (ATR-294). This is
+	// deliberately false when neither the policy nor Defaults set a
+	// retention at all (requestedRetention == 0): that is the designed
+	// "no floor configured, use ttl" fallback documented on
+	// Defaults.Retention, not a value silently overridden, so it must
+	// not be reported as a clamp. The clamp itself is required and
+	// silent by design (T-5.3.1/ATR-178: "retention >= ttl"), but a
+	// clamp firing on a genuinely-configured value is operator-visible
+	// information: it means storage data outlives what the matched
+	// policy or global config literally asked for, which is worth
+	// surfacing for data-minimization review (GDPR art. 5(1)(e)). See
+	// CreateLinks' use of this field for where it is logged.
+	retentionClamped bool
+
+	// requestedRetention is the retention value that would have
+	// applied absent the ttl floor: params.Retention if set, else
+	// d.Retention (0 if neither set it). Equal to retention whenever
+	// retentionClamped is false. Kept only for diagnostics (the
+	// clamp-warning log message); it never reaches persistence —
+	// retention (the clamped value) is what CreateLinks actually
+	// writes as RetainUntil.
+	requestedRetention time.Duration
 }
 
 // resolveParams merges params (from a matched Rule's ActionSpec or,
@@ -78,6 +104,8 @@ type resolvedParams struct {
 // from config when absent" half of that acceptance criterion — the
 // resolved retention becomes equal to ttl, which is always a valid,
 // non-zero value since Defaults.Validate requires a positive TTL.
+// resolvedParams.retentionClamped/requestedRetention (ATR-294) record
+// whether this happened and what was asked for, so a caller can log it.
 func resolveParams(params policy.ActionParams, d Defaults) resolvedParams {
 	out := resolvedParams{
 		ttl:          d.TTL,
@@ -95,7 +123,13 @@ func resolveParams(params policy.ActionParams, d Defaults) resolvedParams {
 		out.retention = params.Retention.Duration()
 	}
 
+	out.requestedRetention = out.retention
 	if out.retention < out.ttl {
+		// A zero requestedRetention means nothing configured a
+		// retention at all (see Defaults.Retention's own doc comment)
+		// — that is the designed default-to-ttl fallback, not a
+		// surprising override, so it is not flagged as a clamp.
+		out.retentionClamped = out.retention != 0
 		out.retention = out.ttl
 	}
 

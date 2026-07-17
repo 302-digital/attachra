@@ -22,6 +22,7 @@ const (
 	errCodeValidationFailed = "validation_failed"
 	errCodePayloadTooLarge  = "payload_too_large"
 	errCodeRateLimited      = "rate_limited"
+	errCodeGone             = "gone"
 	errCodeInternal         = "internal"
 )
 

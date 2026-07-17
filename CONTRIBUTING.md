@@ -11,7 +11,9 @@ Participation in this project is governed by our
 ## Building and testing
 
 Attachra is a single Go module that builds to one static binary
-(see [ADR-001](docs/Attachra_ADR.md#adr-001-language)).
+(see [ADR-001](docs/Attachra_ADR.md#adr-001-language)). Building from
+source requires the Go toolchain version pinned in
+[`go.mod`](go.mod) (currently Go 1.26.5) or newer.
 
 ```
 make build   # builds the attachra binary

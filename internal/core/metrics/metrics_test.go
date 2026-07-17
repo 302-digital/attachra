@@ -146,11 +146,37 @@ func TestObserveRetentionCleanup(t *testing.T) {
 	}
 }
 
+func TestObserveRetentionExpiredLinks(t *testing.T) {
+	m := metrics.New()
+
+	m.ObserveRetentionExpiredLinks(3)
+	m.ObserveRetentionExpiredLinks(2)
+	m.ObserveRetentionExpiredLinks(0)
+
+	if got := testutil.ToFloat64(m.RetentionExpiredLinks); got != 5 {
+		t.Errorf("RetentionExpiredLinks = %v, want 5", got)
+	}
+}
+
+func TestObserveAuditTruncation(t *testing.T) {
+	m := metrics.New()
+
+	m.ObserveAuditTruncation(6)
+	m.ObserveAuditTruncation(4)
+	m.ObserveAuditTruncation(0)  // no-op.
+	m.ObserveAuditTruncation(-3) // no-op.
+
+	if got := testutil.ToFloat64(m.AuditEventsTruncated); got != 10 {
+		t.Errorf("AuditEventsTruncated = %v, want 10", got)
+	}
+}
+
 // TestNilMetricsIsSafe verifies every Observe* method is a no-op (never
 // panics) on a nil *Metrics, since pipeline/milter/http call sites
 // treat an unconfigured Metrics field exactly like a nil logger or
 // audit sink (best-effort, optional instrumentation never allowed to
-// affect the mail-delivery critical path, CLAUDE.md invariant #3).
+// affect the mail-delivery critical path, per the
+// mail-must-never-be-lost invariant).
 func TestNilMetricsIsSafe(_ *testing.T) {
 	var m *metrics.Metrics
 
@@ -160,4 +186,6 @@ func TestNilMetricsIsSafe(_ *testing.T) {
 	m.ObserveDownload("success")
 	m.ObserveError("pipeline")
 	m.ObserveRetentionCleanup("deleted")
+	m.ObserveRetentionExpiredLinks(1)
+	m.ObserveAuditTruncation(5)
 }

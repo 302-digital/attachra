@@ -69,7 +69,7 @@ func NewHandler(engine *link.Engine, st downloadStore, drv storage.Driver, logge
 		logger:         logger,
 		audit:          auditSinkOrNop(sink),
 		metrics:        m,
-		limiter:        newPerIPLimiter(rl.PerIPRequestsPerMinute, rl.PerIPBurst, rl.NotFoundPerIPPerMinute),
+		limiter:        newPerIPLimiterWithBounds(rl.PerIPRequestsPerMinute, rl.PerIPBurst, rl.NotFoundPerIPPerMinute, rl.EvictionMaxEntries, rl.EvictionTTL),
 		tarpit:         rl,
 		trustedProxies: trusted,
 	}
@@ -118,8 +118,11 @@ func (h *Handler) notFound(w http.ResponseWriter, r *http.Request, action, token
 // resolvePackage resolves token to its MessageLink, folding every
 // negative outcome (not found, expired, revoked) into the generic
 // not-found response per SR-125-5; ok is false if the caller should
-// stop (the response has already been written).
-func (h *Handler) resolvePackage(w http.ResponseWriter, r *http.Request, token string) (mlMessageID string, ok bool) {
+// stop (the response has already been written). It also returns the
+// MessageLink's own Recipient (ATR-237) so the caller can scope the
+// file listing to it rather than showing every recipient's Link rows
+// for the message.
+func (h *Handler) resolvePackage(w http.ResponseWriter, r *http.Request, token string) (mlMessageID, mlRecipient string, ok bool) {
 	ml, err := h.engine.ResolvePackage(r.Context(), token)
 	if err != nil {
 		reason := "package link resolve failed"
@@ -127,7 +130,7 @@ func (h *Handler) resolvePackage(w http.ResponseWriter, r *http.Request, token s
 			reason = "package link resolve error: " + err.Error()
 		}
 		h.notFound(w, r, "package_page_view", token, reason)
-		return "", false
+		return "", "", false
 	}
-	return ml.MessageID, true
+	return ml.MessageID, ml.Recipient, true
 }

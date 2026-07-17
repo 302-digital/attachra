@@ -35,5 +35,7 @@ coverage.*
 .omc/
 
 # Local secrets (never commit)
+.claude/.scrt/
 
 # Agent worktrees (never commit)
+.claude/worktrees/

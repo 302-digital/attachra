@@ -14,7 +14,9 @@ package e2e
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"mime"
@@ -23,8 +25,10 @@ import (
 	"net/http"
 	"net/smtp"
 	"net/textproto"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -195,11 +199,18 @@ func TestMilterAcceptsMessage(t *testing.T) {
 // Postfix, for the same reason TestMilterAcceptsMessage does (see its
 // doc comment): scripting Postfix's SMTP-to-milter handoff and
 // observing the final delivered message requires mailbox/queue
-// tooling this compose stack does not provide. Verifying that the
-// replaced attachment's bytes are actually retrievable from MinIO via
-// the resulting package-page URL is left as a documented follow-up
-// (see this task's final report) rather than added here, to keep this
-// smoke test focused on the milter-visible rewrite behavior.
+// tooling this compose stack does not provide.
+//
+// ATR-344: beyond the milter-visible rewrite, this test also drives
+// the two-step download flow the resulting package-page URL points at
+// (GET /p/<token> then POST /p/<token>/d/<link-id>, see
+// internal/adapters/http/package_page.go and download.go) and
+// compares the downloaded bytes against the original attachment
+// content by sha256 — the gap a manual check caught at the v0.2.1
+// release gate (the milter-level assertions above only confirm the
+// bytes were *removed* from the rewritten message, not that the
+// replacement link actually serves the *same* bytes back from
+// storage).
 func TestMilterReplacesAttachment(t *testing.T) {
 	requireReachable(t, "Attachra milter", milterAddr())
 
@@ -285,6 +296,107 @@ func TestMilterReplacesAttachment(t *testing.T) {
 	if !strings.Contains(rewrittenStr, "e2e-report.bin") {
 		t.Error("rewritten body does not mention the replaced attachment's file name")
 	}
+
+	// ATR-344: follow the package-page link end to end and confirm the
+	// bytes served back out are byte-identical to what was replaced,
+	// not just that the raw content disappeared from the rewritten
+	// body (see the doc comment above).
+	packageURL := extractPackageURL(t, rewrittenStr)
+	downloadURL := fetchDownloadURL(t, packageURL)
+	downloaded, contentDisposition := downloadFile(t, downloadURL)
+
+	wantSum := sha256.Sum256([]byte(attachmentContent))
+	gotSum := sha256.Sum256(downloaded)
+	if gotSum != wantSum {
+		t.Errorf("downloaded attachment sha256 = %x, want %x (content = %q)", gotSum, wantSum, downloaded)
+	}
+	if !strings.Contains(contentDisposition, "e2e-report.bin") {
+		t.Errorf("download Content-Disposition = %q, want it to mention e2e-report.bin", contentDisposition)
+	}
+}
+
+// downloadLinkRe matches the "Download link: <url>" line rendered by
+// internal/core/rewrite/templates/en/block.txt.tmpl's plain-text
+// replacement block, capturing the URL itself (which runs to the next
+// whitespace, since the template emits nothing else on that line).
+var downloadLinkRe = regexp.MustCompile(`Download link:\s*(\S+)`)
+
+// extractPackageURL pulls the package-page URL out of a rewritten
+// message body's plain-text replacement block.
+func extractPackageURL(t *testing.T, rewrittenBody string) string {
+	t.Helper()
+
+	m := downloadLinkRe.FindStringSubmatch(rewrittenBody)
+	if m == nil {
+		t.Fatalf("rewritten body has no %q line:\n%s", "Download link: <url>", rewrittenBody)
+	}
+	return m[1]
+}
+
+// downloadFormActionRe matches the package page's single-use download
+// form action attribute (internal/adapters/http/templates.go's
+// packagePageTemplate: `<form method="post" action="{{$.PackagePath}}/d/{{.Ref}}">`).
+var downloadFormActionRe = regexp.MustCompile(`action="([^"]+/d/[^"]+)"`)
+
+// fetchDownloadURL performs step 1 of the two-step download flow
+// (SR-125-3, docs/architecture/package-page-decision.md §4.1 item 3):
+// GET the package page and extract the step-2 download URL from its
+// download form, exactly as a recipient's browser would.
+func fetchDownloadURL(t *testing.T, packageURL string) string {
+	t.Helper()
+
+	resp, err := http.Get(packageURL) //nolint:gosec // packageURL is produced by this test itself, not attacker-controlled
+	if err != nil {
+		t.Fatalf("GET package page %s: %v", packageURL, err)
+	}
+	defer resp.Body.Close() //nolint:errcheck // best-effort close of a test response
+
+	page, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read package page body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET package page %s: status %d, body:\n%s", packageURL, resp.StatusCode, page)
+	}
+
+	m := downloadFormActionRe.FindSubmatch(page)
+	if m == nil {
+		t.Fatalf("package page has no download form action:\n%s", page)
+	}
+
+	base, err := url.Parse(packageURL)
+	if err != nil {
+		t.Fatalf("parse package URL %q: %v", packageURL, err)
+	}
+	ref, err := url.Parse(string(m[1]))
+	if err != nil {
+		t.Fatalf("parse download form action %q: %v", m[1], err)
+	}
+	return base.ResolveReference(ref).String()
+}
+
+// downloadFile performs step 2 of the two-step download flow (POST
+// the download URL with an empty body, per
+// internal/adapters/http/download.go's serveDownload) and returns the
+// streamed attachment bytes plus the response's Content-Disposition
+// header.
+func downloadFile(t *testing.T, downloadURL string) ([]byte, string) {
+	t.Helper()
+
+	resp, err := http.Post(downloadURL, "", nil) //nolint:gosec // downloadURL is produced by this test itself, not attacker-controlled
+	if err != nil {
+		t.Fatalf("POST download %s: %v", downloadURL, err)
+	}
+	defer resp.Body.Close() //nolint:errcheck // best-effort close of a test response
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read download response body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST download %s: status %d, body:\n%s", downloadURL, resp.StatusCode, body)
+	}
+	return body, resp.Header.Get("Content-Disposition")
 }
 
 // TestSendMailWithAttachmentDelivers sends a test email with a small
@@ -392,6 +504,13 @@ func writeTempAttachment(t *testing.T, size int64) string {
 // but stays self-contained so the e2e suite has no dependency on
 // hack/, keeping the "e2e" build-tagged package free of cross-cutting
 // build concerns.
+//
+// ATR-342: the attachment is base64-encoded (RFC 2045 §6.8) rather
+// than sent with "Content-Transfer-Encoding: binary", for the same
+// reason hack/sendmail-test's attachFile is (see its doc comment):
+// sendMailInsecureTLS below writes msg through net/smtp's textproto
+// dotWriter, which canonicalizes bare LF bytes to CRLF and would
+// silently corrupt a raw binary payload.
 func buildTestMessage(from, to, subject, attachmentPath string) ([]byte, error) {
 	var buf strings.Builder
 	writer := multipart.NewWriter(&buf)
@@ -428,13 +547,13 @@ func buildTestMessage(from, to, subject, attachmentPath string) ([]byte, error) 
 
 	part, err := writer.CreatePart(textproto.MIMEHeader{
 		"Content-Type":              {contentType},
-		"Content-Transfer-Encoding": {"binary"},
+		"Content-Transfer-Encoding": {"base64"},
 		"Content-Disposition":       {fmt.Sprintf("attachment; filename=%q", name)},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create attachment part: %w", err)
 	}
-	if _, err := io.Copy(part, f); err != nil {
+	if err := writeBase64Encoded(part, f); err != nil {
 		return nil, fmt.Errorf("copy attachment: %w", err)
 	}
 
@@ -443,4 +562,65 @@ func buildTestMessage(from, to, subject, attachmentPath string) ([]byte, error) 
 	}
 
 	return []byte(buf.String()), nil
+}
+
+// base64EncodedLineLength is the maximum number of base64-encoded
+// characters per line, matching RFC 2045 §6.8's 76-character limit for
+// base64 MIME body content.
+const base64EncodedLineLength = 76
+
+// writeBase64Encoded streams src into dst as base64 (RFC 2045 §6.8),
+// wrapped at base64EncodedLineLength characters per line with CRLF
+// line breaks, without buffering the whole encoded attachment in
+// memory. It mirrors hack/sendmail-test's base64LineWriter (ATR-342).
+func writeBase64Encoded(dst io.Writer, src io.Reader) error {
+	lw := &base64LineWriter{w: dst}
+	enc := base64.NewEncoder(base64.StdEncoding, lw)
+	if _, err := io.Copy(enc, src); err != nil {
+		return fmt.Errorf("base64-encode: %w", err)
+	}
+	if err := enc.Close(); err != nil {
+		return fmt.Errorf("close base64 encoder: %w", err)
+	}
+	if lw.lineLen > 0 {
+		if _, err := lw.w.Write([]byte("\r\n")); err != nil {
+			return fmt.Errorf("write trailing line break: %w", err)
+		}
+	}
+	return nil
+}
+
+// base64LineWriter wraps an underlying writer, inserting a CRLF line
+// break every base64EncodedLineLength bytes written to it. See
+// hack/sendmail-test/main.go's identical type for the full rationale;
+// duplicated here rather than imported so the "e2e" build-tagged
+// package stays free of a dependency on hack/'s package main.
+type base64LineWriter struct {
+	w       io.Writer
+	lineLen int
+}
+
+func (lw *base64LineWriter) Write(p []byte) (int, error) {
+	total := 0
+	for len(p) > 0 {
+		remaining := base64EncodedLineLength - lw.lineLen
+		n := remaining
+		if n > len(p) {
+			n = len(p)
+		}
+		if _, err := lw.w.Write(p[:n]); err != nil {
+			return total, err
+		}
+		total += n
+		lw.lineLen += n
+		p = p[n:]
+
+		if lw.lineLen == base64EncodedLineLength {
+			if _, err := lw.w.Write([]byte("\r\n")); err != nil {
+				return total, err
+			}
+			lw.lineLen = 0
+		}
+	}
+	return total, nil
 }

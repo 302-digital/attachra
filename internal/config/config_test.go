@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -158,6 +159,7 @@ http:
 	t.Setenv("ATTACHRA_LOG_FORMAT", "json")
 	t.Setenv("ATTACHRA_MILTER_LISTEN", "inet:0.0.0.0:9999")
 	t.Setenv("ATTACHRA_HTTP_LISTEN", "0.0.0.0:8888")
+	t.Setenv("ATTACHRA_ADMIN_LISTEN", "0.0.0.0:9999")
 
 	cfg, err := Load(path)
 	if err != nil {
@@ -175,6 +177,185 @@ http:
 	}
 	if cfg.HTTP.Listen != "0.0.0.0:8888" {
 		t.Errorf("HTTP.Listen = %q, want env override %q", cfg.HTTP.Listen, "0.0.0.0:8888")
+	}
+	if cfg.Admin.Listen != "0.0.0.0:9999" {
+		t.Errorf("Admin.Listen = %q, want env override %q", cfg.Admin.Listen, "0.0.0.0:9999")
+	}
+}
+
+// TestLoad_AdminFoldIntoHTTPEnvOverride verifies
+// ATTACHRA_ADMIN_FOLD_INTO_HTTP is parsed the same way as
+// ATTACHRA_POLICY_DRY_RUN ("true"/"1", case-insensitive for "true").
+func TestLoad_AdminFoldIntoHTTPEnvOverride(t *testing.T) {
+	path := writeTempConfig(t, `
+log:
+  level: info
+  format: text
+milter:
+  listen: "inet:127.0.0.1:6785"
+http:
+  listen: "127.0.0.1:8080"
+`)
+
+	t.Setenv("ATTACHRA_ADMIN_FOLD_INTO_HTTP", "true")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v, want nil", err)
+	}
+	if !cfg.Admin.FoldIntoHTTP {
+		t.Error("Admin.FoldIntoHTTP = false, want true (env override)")
+	}
+}
+
+// TestDefault_AdminPopulated verifies Default() sets a loopback-only
+// admin.listen (ATR-292) on a port that is NOT Prometheus's own default
+// (9090 — the most likely co-located neighbor), matching http.listen's
+// own default posture, with FoldIntoHTTP off, and that the default
+// value passes validation.
+func TestDefault_AdminPopulated(t *testing.T) {
+	d := Default()
+
+	if d.Admin.Listen != "127.0.0.1:18090" {
+		t.Errorf("Admin.Listen = %q, want %q", d.Admin.Listen, "127.0.0.1:18090")
+	}
+	if d.Admin.Listen == "127.0.0.1:9090" {
+		t.Error("Admin.Listen defaults to Prometheus's own default port 9090 — likely bind collision with a co-located Prometheus server")
+	}
+	if d.Admin.FoldIntoHTTP {
+		t.Error("Admin.FoldIntoHTTP = true, want false (hardened separated-surface default)")
+	}
+	if err := d.Validate(); err != nil {
+		t.Errorf("Default().Validate() = %v, want nil", err)
+	}
+}
+
+// TestLoad_AdminFromYAML verifies admin.listen loads from the YAML
+// file, overriding Default()'s value.
+func TestLoad_AdminFromYAML(t *testing.T) {
+	path := writeTempConfig(t, `
+log:
+  level: info
+  format: text
+milter:
+  listen: "inet:127.0.0.1:6785"
+http:
+  listen: "127.0.0.1:8080"
+admin:
+  listen: "127.0.0.1:9191"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v, want nil", err)
+	}
+	if cfg.Admin.Listen != "127.0.0.1:9191" {
+		t.Errorf("Admin.Listen = %q, want %q", cfg.Admin.Listen, "127.0.0.1:9191")
+	}
+}
+
+// TestLoad_AdminListenEmptyIsNormalizedNotDisabled is the core ATR-292
+// security-review regression test: an explicit empty admin.listen in
+// YAML (mirroring the same failure mode as an empty-but-present
+// ATTACHRA_ADMIN_LISTEN env var, exercised in TestLoad_EnvOverride's
+// sibling below) must NOT silently disable the admin/public surface
+// separation. It is normalized back to the safe default instead.
+func TestLoad_AdminListenEmptyIsNormalizedNotDisabled(t *testing.T) {
+	path := writeTempConfig(t, `
+log:
+  level: info
+  format: text
+milter:
+  listen: "inet:127.0.0.1:6785"
+http:
+  listen: "127.0.0.1:8080"
+admin:
+  listen: ""
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v, want nil", err)
+	}
+	if cfg.Admin.Listen != Default().Admin.Listen {
+		t.Errorf("Admin.Listen = %q, want the safe default %q (empty is not an opt-out)", cfg.Admin.Listen, Default().Admin.Listen)
+	}
+}
+
+// TestLoad_AdminListenEmptyEnvIsNormalizedNotDisabled reproduces the
+// exact bug the ATR-292 security review flagged: an ATTACHRA_ADMIN_LISTEN
+// environment variable that is *present but empty* (a common accident
+// with CI/tooling that exports variables unconditionally) must not
+// silently fold the admin routes onto the public listener.
+func TestLoad_AdminListenEmptyEnvIsNormalizedNotDisabled(t *testing.T) {
+	path := writeTempConfig(t, `
+log:
+  level: info
+  format: text
+milter:
+  listen: "inet:127.0.0.1:6785"
+http:
+  listen: "127.0.0.1:8080"
+`)
+	t.Setenv("ATTACHRA_ADMIN_LISTEN", "")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v, want nil", err)
+	}
+	if cfg.Admin.Listen != Default().Admin.Listen {
+		t.Errorf("Admin.Listen = %q, want the safe default %q (empty env override is not an opt-out)", cfg.Admin.Listen, Default().Admin.Listen)
+	}
+}
+
+// TestLoad_AdminFoldIntoHTTPTrue verifies the ONLY way to actually fold
+// admin routes onto the public listener: an explicit
+// admin.fold_into_http: true. Listen may be left empty in this mode
+// (internal/adapters/http.Server ignores it) — normalization skips it
+// specifically because fold_into_http is set.
+func TestLoad_AdminFoldIntoHTTPTrue(t *testing.T) {
+	path := writeTempConfig(t, `
+log:
+  level: info
+  format: text
+milter:
+  listen: "inet:127.0.0.1:6785"
+http:
+  listen: "127.0.0.1:8080"
+admin:
+  listen: ""
+  fold_into_http: true
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v, want nil", err)
+	}
+	if !cfg.Admin.FoldIntoHTTP {
+		t.Error("Admin.FoldIntoHTTP = false, want true")
+	}
+	if cfg.Admin.Listen != "" {
+		t.Errorf("Admin.Listen = %q, want empty (not normalized when fold_into_http is true)", cfg.Admin.Listen)
+	}
+}
+
+// TestValidate_AdminListenEmptyWithoutFoldIsRejected verifies
+// Config.Validate's defense-in-depth check: a Config built directly
+// (bypassing Load's normalization) with an empty admin.listen and
+// FoldIntoHTTP false fails validation rather than silently reaching
+// internal/adapters/http as an implicit fold.
+func TestValidate_AdminListenEmptyWithoutFoldIsRejected(t *testing.T) {
+	cfg := Default()
+	cfg.Admin.Listen = ""
+	cfg.Admin.FoldIntoHTTP = false
+
+	if err := cfg.Validate(); err == nil {
+		t.Error("Validate() error = nil, want error (empty admin.listen without fold_into_http)")
+	}
+
+	cfg.Admin.FoldIntoHTTP = true
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() error = %v, want nil (empty admin.listen IS valid when fold_into_http is true)", err)
 	}
 }
 
@@ -640,6 +821,10 @@ func TestRetentionConfig_Validate(t *testing.T) {
 		{name: "enabled with zero interval", cfg: RetentionConfig{Enabled: true, IntervalSeconds: 0, ChunkSize: 200}, wantErr: true},
 		{name: "enabled with negative interval", cfg: RetentionConfig{Enabled: true, IntervalSeconds: -1, ChunkSize: 200}, wantErr: true},
 		{name: "enabled with zero chunk size", cfg: RetentionConfig{Enabled: true, IntervalSeconds: 3600, ChunkSize: 0}, wantErr: true},
+		{name: "audit retention zero is valid (opt-in off)", cfg: RetentionConfig{Enabled: true, IntervalSeconds: 3600, ChunkSize: 200, AuditRetentionSeconds: 0}, wantErr: false},
+		{name: "audit retention positive is valid", cfg: RetentionConfig{Enabled: true, IntervalSeconds: 3600, ChunkSize: 200, AuditRetentionSeconds: 7776000}, wantErr: false},
+		{name: "audit retention negative is invalid", cfg: RetentionConfig{Enabled: true, IntervalSeconds: 3600, ChunkSize: 200, AuditRetentionSeconds: -1}, wantErr: true},
+		{name: "audit retention negative invalid even when disabled", cfg: RetentionConfig{Enabled: false, AuditRetentionSeconds: -5}, wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -915,5 +1100,123 @@ http:
 	}
 	if !cfg.Policy.DryRun {
 		t.Error("Policy.DryRun = false, want env override true")
+	}
+}
+
+func TestDefault_SpoolPopulated(t *testing.T) {
+	cfg := Default()
+	if cfg.Spool.Dir != "" {
+		t.Errorf("Spool.Dir = %q, want empty (OS default temp dir)", cfg.Spool.Dir)
+	}
+}
+
+func TestSpoolConfig_Validate(t *testing.T) {
+	writableDir := t.TempDir()
+
+	unwritableDir := t.TempDir()
+	if err := os.Chmod(unwritableDir, 0o500); err != nil { //nolint:gosec // test fixture: a read+execute-only *directory* deliberately made unwritable, not a sensitive file
+		t.Fatalf("chmod unwritable dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(unwritableDir, 0o700) }) //nolint:gosec // restoring the same test-fixture *directory* so TempDir cleanup can remove it
+
+	fileNotDir := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(fileNotDir, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		dir     string
+		wantErr bool
+	}{
+		{name: "empty is valid (OS default temp dir)", dir: "", wantErr: false},
+		{name: "existing writable directory", dir: writableDir, wantErr: false},
+		{name: "nonexistent directory", dir: filepath.Join(writableDir, "does-not-exist"), wantErr: true},
+		{name: "path is a file, not a directory", dir: fileNotDir, wantErr: true},
+		{name: "existing but unwritable directory", dir: unwritableDir, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Skip the unwritable-directory case when running as a user
+			// (e.g. root in some CI containers) that ignores directory
+			// permission bits and can write there anyway.
+			if tt.name == "existing but unwritable directory" {
+				probe := filepath.Join(unwritableDir, ".probe")
+				if err := os.WriteFile(probe, []byte("x"), 0o600); err == nil {
+					_ = os.Remove(probe)
+					t.Skip("running as a user that bypasses directory write permissions")
+				}
+			}
+
+			errs := SpoolConfig{Dir: tt.dir}.validate()
+			if (len(errs) > 0) != tt.wantErr {
+				t.Errorf("validate() errs = %v, wantErr %v", errs, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoad_SpoolDirFromYAML(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTempConfig(t, fmt.Sprintf(`
+log:
+  level: info
+  format: text
+milter:
+  listen: "inet:127.0.0.1:6785"
+http:
+  listen: "127.0.0.1:8080"
+spool:
+  dir: %q
+`, dir))
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v, want nil", err)
+	}
+	if cfg.Spool.Dir != dir {
+		t.Errorf("Spool.Dir = %q, want %q", cfg.Spool.Dir, dir)
+	}
+}
+
+func TestLoad_SpoolDirInvalid_FailsFast(t *testing.T) {
+	path := writeTempConfig(t, `
+log:
+  level: info
+  format: text
+milter:
+  listen: "inet:127.0.0.1:6785"
+http:
+  listen: "127.0.0.1:8080"
+spool:
+  dir: /this/path/does/not/exist/anywhere
+`)
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load() error = nil, want error for nonexistent spool.dir")
+	}
+}
+
+func TestLoad_SpoolDirEnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTempConfig(t, `
+log:
+  level: info
+  format: text
+milter:
+  listen: "inet:127.0.0.1:6785"
+http:
+  listen: "127.0.0.1:8080"
+`)
+
+	t.Setenv("ATTACHRA_SPOOL_DIR", dir)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v, want nil", err)
+	}
+	if cfg.Spool.Dir != dir {
+		t.Errorf("Spool.Dir = %q, want env override %q", cfg.Spool.Dir, dir)
 	}
 }

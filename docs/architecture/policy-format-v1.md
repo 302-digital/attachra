@@ -131,6 +131,15 @@ Consistency rules (checked by the validator, see §3.5):
 - `ttl`/`max_downloads`/`retention`/`link` are only valid with `action: replace`. An error with `pass`/`block`.
 - `reason` is only valid with `action: block`.
 - If `retention` is not set on `replace` — the file is kept for at least `ttl` (otherwise the link would point at a deleted file); the effective retention default comes from the global config (US-5.3).
+- **`retention` can never be shorter than `ttl` in practice.** The engine silently raises the effective retention to match `ttl` at run time (`internal/core/link.Engine.CreateLinks`, via `resolveParams`) whenever the resolved retention would otherwise be shorter: a link must never outlive the storage object it points to. Two situations reach this clamp:
+  - a rule sets an explicit `retention` shorter than its own explicit `ttl` — always a per-rule authoring mistake, and the one case the validator can catch statically (see below);
+  - a rule sets an explicit `ttl` **longer** than the global config's `links.default_retention_seconds`, while leaving that rule's own `retention` unset. Both values are independently valid (config load already rejects a global `default_retention_seconds` shorter than `default_ttl_seconds`, see `docs/deploy/retention.md`), but their combination at a specific rule still needs the same runtime floor, and the validator has no way to see it — it would require cross-referencing every rule's `ttl` against the *global* config default, which is out of scope for a per-file validator.
+
+  Either way, the number an operator reads in the policy file's `retention:` field is not always the number actually enforced in storage, which matters for data-minimization review (GDPR art. 5(1)(e)). Two places surface this so it is never silent end-to-end:
+  - **At validate time**, when both `ttl` and `retention` are explicitly set on the same rule and `retention < ttl`, the validator emits a warning naming the rule (§3.5) — this catches the first, author-visible case immediately.
+  - **At run time**, the first time the clamp actually fires for a given `(ttl, requested retention)` combination (covering both situations above, including the config-default-driven one validate cannot see), `link.Engine.CreateLinks` logs a warning with an example message ID and the requested vs. effective retention. It deliberately does *not* log when a rule/config leaves `retention` unset entirely with no `ttl` override in play either — falling back to `ttl` with nothing configured anywhere is the designed default, not an override being silently discarded. A permanently misconfigured rule/config combination clamps identically on every message that matches it; rather than logging on every one of those messages, the warning is deduplicated per distinct `(ttl, requested retention)` pair for the Engine's process lifetime, so the operator gets exactly one example to act on instead of a flood proportional to mail volume.
+
+  See [docs/deploy/retention.md](../deploy/retention.md) for the operator-facing view of this (config knobs, metrics, and the post-upgrade legacy-attachment behavior).
 
 `duration` format: suffixes `s`, `m`, `h`, `d` (`d` = 24h). Fractional and compound values (`1d12h`) are not supported in v1 — kept simple for readability. `"0"` is forbidden.
 
@@ -203,6 +212,7 @@ Validation is mandatory (US-4.1: "the schema is formally specified and validated
 - Unreachable rules after a catch-all (§3.3).
 - A rule that can never match anything (e.g. `size: {min: "10MB", max: "1MB"}` — an empty range).
 - `replace` without `retention` when `ttl` is explicitly set (a reminder that retention will come from config).
+- `replace` with both `ttl` and `retention` explicitly set where `retention` is shorter than `ttl`: retention is silently raised to match `ttl` at run time (a link must never outlive the object it points to) — see §2.4's consistency rules for the full clamp behavior, including the run-time-only warning that also covers a config-default-driven clamp this validate-time check cannot see.
 
 **Message format** — with a path (JSON-pointer-like) and human-readable text, for example:
 

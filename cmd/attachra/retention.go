@@ -85,5 +85,6 @@ func runRetentionSweepOnce(ctx context.Context, sweeper *retention.Sweeper, logg
 		"held_skipped", res.HeldSkipped,
 		"failed", res.Failed,
 		"expired_links", res.ExpiredLinks,
+		"audit_truncated", res.AuditTruncated,
 	)
 }

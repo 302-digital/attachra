@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/302-digital/attachra/internal/core/audit"
 	"github.com/302-digital/attachra/internal/core/link"
 	"github.com/302-digital/attachra/internal/core/message"
 	"github.com/302-digital/attachra/internal/core/pipeline"
@@ -19,6 +20,7 @@ import (
 	"github.com/302-digital/attachra/internal/core/rewrite"
 	"github.com/302-digital/attachra/internal/core/storage"
 	fsstorage "github.com/302-digital/attachra/internal/core/storage/fs"
+	"github.com/302-digital/attachra/internal/core/store"
 	"github.com/302-digital/attachra/internal/core/store/sqlite"
 )
 
@@ -101,7 +103,7 @@ func newTestHarness(t *testing.T) *testHarness {
 		TTL:          defaultTTL,
 		MaxDownloads: 0,
 		TokenBytes:   16,
-	}, st)
+	}, st, nil)
 	if err != nil {
 		t.Fatalf("link.NewEngine() error = %v, want nil", err)
 	}
@@ -502,9 +504,9 @@ func TestProcess_EmptyBodyAccepts(t *testing.T) {
 // exceeding AttachmentProcessorParams.MaxAttachmentSize surfaces as a
 // Process error (which the milter adapter resolves into
 // fail-open/fail-closed) rather than being silently accepted or
-// truncated — CLAUDE.md invariant #3 forbids resolving a limit
-// violation into a silent pass, and #4 forbids buffering past the
-// configured bound.
+// truncated — the mail-must-never-be-lost invariant forbids resolving
+// a limit violation into a silent pass, and the streaming invariant
+// forbids buffering past the configured bound.
 func TestProcess_OversizedAttachmentErrors(t *testing.T) {
 	h := newTestHarness(t)
 
@@ -530,5 +532,170 @@ func TestProcess_OversizedAttachmentErrors(t *testing.T) {
 	verdict, err := proc.Process(context.Background(), envelopeFor(testMessage))
 	if err == nil {
 		t.Fatalf("Process() error = nil, want an error for an oversized attachment; verdict = %+v", verdict)
+	}
+}
+
+// brokenTemplates loads a *rewrite.Templates whose text/plain template
+// parses fine but fails at Execute time (it references a field that
+// does not exist on rewrite's internal template view), used to force
+// rewrite.Rewrite to fail deterministically after
+// link.Engine.CreateLinks has already succeeded — exactly the ordering
+// ATR-239's metadata compensation exists for.
+func brokenTemplates(t *testing.T) *rewrite.Templates {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "broken.txt.tmpl")
+	if err := writeFile(path, "{{.NoSuchField}}"); err != nil {
+		t.Fatalf("write broken template: %v", err)
+	}
+	tmpl, err := rewrite.LoadTemplates(rewrite.TemplateConfig{TextTemplatePath: path})
+	if err != nil {
+		t.Fatalf("rewrite.LoadTemplates() error = %v, want nil (must parse, only fail at Execute)", err)
+	}
+	return tmpl
+}
+
+// holdingMetadataStore wraps a store.MetadataStore, immediately placing
+// every Link it creates under legal hold. It exists only to
+// deterministically reproduce, in a single-threaded test, the
+// exceedingly narrow race link.Engine.PurgeMessage's own doc comment
+// describes: a hold landing in the window between CreateLinks
+// succeeding and the pipeline's own compensating PurgeMessage call for
+// the same message (ATR-239).
+type holdingMetadataStore struct {
+	store.MetadataStore
+}
+
+func (s *holdingMetadataStore) CreateLink(ctx context.Context, p store.NewLinkParams) error {
+	if err := s.MetadataStore.CreateLink(ctx, p); err != nil {
+		return err
+	}
+	return s.SetHold(ctx, p.ID, true, "test-hold", time.Now().UTC().Format(time.RFC3339Nano))
+}
+
+// streamPipelineEvents drains every audit.Recorded event from st.
+func streamPipelineEvents(t *testing.T, st *sqlite.Store) []audit.Recorded {
+	t.Helper()
+	var got []audit.Recorded
+	if err := st.StreamEvents(context.Background(), audit.Filter{}, func(r audit.Recorded) error {
+		got = append(got, r)
+		return nil
+	}); err != nil {
+		t.Fatalf("StreamEvents() error = %v, want nil", err)
+	}
+	return got
+}
+
+// TestProcess_RewriteFailureCompensatesMetadata verifies ATR-239's core
+// fix: when rewrite.Rewrite fails after link.Engine.CreateLinks has
+// already durably written the message's metadata, Process's rollback
+// deletes that metadata (not just the uploaded storage object it
+// already rolled back before this fix), leaving no orphaned
+// Message/Attachment/Link/MessageLink rows behind, and records a
+// TypeCompensation audit event reporting success.
+func TestProcess_RewriteFailureCompensatesMetadata(t *testing.T) {
+	h := newTestHarness(t)
+	h.tmpl = brokenTemplates(t)
+	proc := newProcessor(t, h, replaceAllPolicy, false)
+
+	verdict, err := proc.Process(context.Background(), envelopeFor(testMessage))
+	if err == nil {
+		t.Fatalf("Process() error = nil, want a rewrite error; verdict = %+v", verdict)
+	}
+	if verdict != nil {
+		t.Errorf("Process() verdict = %+v, want nil on error", verdict)
+	}
+	if !strings.Contains(err.Error(), "rewrite message") {
+		t.Errorf("Process() error = %v, want it to mention the rewrite failure", err)
+	}
+
+	msgs, err := h.auditSink.ListMessagesBySender(context.Background(), "sender@example.com")
+	if err != nil {
+		t.Fatalf("ListMessagesBySender() error = %v, want nil", err)
+	}
+	if len(msgs) != 0 {
+		t.Errorf("ListMessagesBySender() = %+v, want empty (compensation must delete the orphaned Message row)", msgs)
+	}
+
+	got := streamPipelineEvents(t, h.auditSink)
+	var found bool
+	for _, ev := range got {
+		if ev.Type != audit.TypeCompensation {
+			continue
+		}
+		found = true
+		if ev.Details["ok"] != true {
+			t.Errorf("compensation event Details[ok] = %v, want true", ev.Details["ok"])
+		}
+	}
+	if !found {
+		t.Fatalf("no TypeCompensation event recorded among %d events: %+v", len(got), got)
+	}
+}
+
+// TestProcess_RewriteFailureCompensationRefusedByHoldDoesNotPanic
+// verifies that when the metadata compensation itself is refused (a
+// link is under legal hold — a narrow but real race reproduced
+// deterministically here via holdingMetadataStore), Process does not
+// panic, still returns the original rewrite error (never a
+// compensation-specific one), leaves the Message/Attachment/Link rows
+// in place (a refused compensation is a no-op, not a partial prune),
+// and records a TypeCompensation event reporting the refusal.
+func TestProcess_RewriteFailureCompensationRefusedByHoldDoesNotPanic(t *testing.T) {
+	h := newTestHarness(t)
+	h.tmpl = brokenTemplates(t)
+
+	engine, err := link.NewEngine(&holdingMetadataStore{MetadataStore: h.auditSink}, link.Defaults{
+		TTL:          defaultTTL,
+		MaxDownloads: 0,
+		TokenBytes:   16,
+	}, h.auditSink, nil)
+	if err != nil {
+		t.Fatalf("link.NewEngine() error = %v, want nil", err)
+	}
+	h.link = engine
+
+	proc := newProcessor(t, h, replaceAllPolicy, false)
+
+	var verdict *pipeline.Verdict
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("Process() panicked: %v", r)
+			}
+		}()
+		verdict, err = proc.Process(context.Background(), envelopeFor(testMessage))
+	}()
+
+	if err == nil {
+		t.Fatalf("Process() error = nil, want the original rewrite error; verdict = %+v", verdict)
+	}
+	if !strings.Contains(err.Error(), "rewrite message") {
+		t.Errorf("Process() error = %v, want it to still mention the rewrite failure, not a compensation error", err)
+	}
+	if verdict != nil {
+		t.Errorf("Process() verdict = %+v, want nil on error", verdict)
+	}
+
+	msgs, listErr := h.auditSink.ListMessagesBySender(context.Background(), "sender@example.com")
+	if listErr != nil {
+		t.Fatalf("ListMessagesBySender() error = %v, want nil", listErr)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("ListMessagesBySender() = %+v, want exactly 1 (a refused compensation must leave the row in place)", msgs)
+	}
+
+	got := streamPipelineEvents(t, h.auditSink)
+	var found bool
+	for _, ev := range got {
+		if ev.Type != audit.TypeCompensation || ev.MessageID != msgs[0].ID {
+			continue
+		}
+		found = true
+		if ev.Details["ok"] != false {
+			t.Errorf("compensation event Details[ok] = %v, want false (refused due to hold)", ev.Details["ok"])
+		}
+	}
+	if !found {
+		t.Fatalf("no TypeCompensation event recorded for message %q among %d events: %+v", msgs[0].ID, len(got), got)
 	}
 }

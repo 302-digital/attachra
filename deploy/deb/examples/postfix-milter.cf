@@ -31,6 +31,43 @@
 #   sudo postconf -e 'non_smtpd_milters = inet:localhost:11332, inet:127.0.0.1:6785'
 #   sudo systemctl reload postfix
 #
+# WARNING — this order breaks DKIM if rspamd signs outbound mail.
+# "rspamd first" is only correct when rspamd's dkim_signing module is
+# NOT active for your sending domain. If it is, rspamd signs the
+# message BEFORE Attachra rewrites the body, so every outbound message
+# with a replaced attachment carries a DKIM signature that fails
+# verification downstream (dkim=fail, "body hash did not verify" at
+# Gmail and others). Check whether rspamd is configured to sign on
+# this host:
+#
+#   rspamadm configdump dkim_signing
+#
+# Signing is effectively ON when the output shows a signing domain
+# with a selector/key path and a matching sign_authenticated /
+# sign_local / sign_networks condition. There is no reliable top-level
+# "enabled" flag — do NOT treat the absence of one as "not signing".
+# When in doubt, send a test message to a mailbox-provider account and
+# check the Authentication-Results header (see "Verifying the fix in
+# practice" in docs/integrations/dkim.md).
+#
+# If rspamd signs, either disable dkim_signing in rspamd and run a
+# dedicated signer (e.g. opendkim) AFTER Attachra in the chain, or put
+# Attachra first:
+#
+#   sudo postconf -e 'smtpd_milters = inet:127.0.0.1:6785, inet:localhost:11332'
+#   sudo postconf -e 'non_smtpd_milters = inet:127.0.0.1:6785, inet:localhost:11332'
+#
+# Trade-off of Attachra-first: rspamd's AV/attachment scanning then
+# sees only Attachra's replacement text, never the original attachment
+# bytes — and a message rspamd later rejects has already had its
+# attachment uploaded to storage with a live download link (the link
+# is not externally discoverable, but the file is retained until
+# retention/revoke removes it). If original attachments must be
+# AV-scanned before leaving the mail system, prefer the dedicated-
+# signer option over reordering.
+#
+# Live-verified ordering matrix and trade-offs: docs/integrations/dkim.md.
+#
 # The resulting effective main.cf values look like this:
 #
 # smtpd_milters = inet:localhost:11332, inet:127.0.0.1:6785
@@ -56,8 +93,9 @@
 # milter_default_action=accept matters for Attachra too: if the milter
 # connection to Attachra can't be established at all, Postfix delivers
 # the mail unmodified rather than queuing or rejecting it, matching
-# attachra.yaml's milter.failure_mode: open (CLAUDE.md invariant #3:
-# mail must never be lost because of an Attachra failure). Keep both
+# attachra.yaml's milter.failure_mode: open (the project's core
+# invariant: mail must never be lost because of an Attachra failure).
+# Keep both
 # settings in sync if you ever switch failure_mode to "closed".
 #
 # --- grommunio-setup can regenerate main.cf ---------------------------

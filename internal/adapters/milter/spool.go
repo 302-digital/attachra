@@ -5,22 +5,18 @@ import (
 	"fmt"
 	"io"
 	"os"
-)
 
-// spoolMemThreshold is the number of bytes a message body is allowed
-// to occupy in memory before spool spills it to a temporary file on
-// disk. This keeps small, common messages fast while still bounding
-// worst-case memory use for large ones (SR-115-3).
-const spoolMemThreshold = 256 * 1024 // 256 KiB
+	"github.com/302-digital/attachra/internal/core/spoolutil"
+)
 
 // spool is a minimal, single-writer-then-single-reader streaming
 // buffer for a milter session's message body. It accumulates
-// BodyChunk data in memory up to spoolMemThreshold bytes; beyond that
-// it spills to a temporary file on disk so the adapter never buffers
-// an entire large message in memory (CLAUDE.md invariant #4,
-// SR-115-3). It also enforces maxSize, aborting with an error once
-// the configured message size limit is exceeded, rather than the
-// adapter's own limit machinery.
+// BodyChunk data in memory up to spoolutil.SpoolMemThreshold bytes;
+// beyond that it spills to a temporary file on disk so the adapter
+// never buffers an entire large message in memory (the streaming
+// invariant, SR-115-3). It also enforces maxSize, aborting with an
+// error once the configured message size limit is exceeded, rather
+// than the adapter's own limit machinery.
 //
 // spool is not safe for concurrent use: a single milter session
 // writes to it serially (BodyChunk calls) and reads from it once
@@ -28,6 +24,7 @@ const spoolMemThreshold = 256 * 1024 // 256 KiB
 // message.
 type spool struct {
 	maxSize int64
+	dir     string
 
 	written int64
 	mem     bytes.Buffer
@@ -35,9 +32,13 @@ type spool struct {
 }
 
 // newSpool creates a spool that rejects writes once more than
-// maxSize bytes have been written in total.
-func newSpool(maxSize int64) *spool {
-	return &spool{maxSize: maxSize}
+// maxSize bytes have been written in total. dir selects the directory
+// any spilled temporary file is created in (ATR-262); the empty
+// string uses the OS default temporary directory ($TMPDIR /
+// os.TempDir()), matching os.CreateTemp's own documented behavior for
+// an empty dir argument.
+func newSpool(maxSize int64, dir string) *spool {
+	return &spool{maxSize: maxSize, dir: dir}
 }
 
 // errSpoolTooLarge is returned by Write once the cumulative written
@@ -52,7 +53,7 @@ func (s *spool) Write(chunk []byte) (int, error) {
 		return 0, fmt.Errorf("%w: limit=%d", errSpoolTooLarge, s.maxSize)
 	}
 
-	if s.file == nil && s.mem.Len()+len(chunk) > spoolMemThreshold {
+	if s.file == nil && s.mem.Len()+len(chunk) > spoolutil.SpoolMemThreshold {
 		if err := s.spillToDisk(); err != nil {
 			return 0, err
 		}
@@ -77,7 +78,7 @@ func (s *spool) Write(chunk []byte) (int, error) {
 // spillToDisk moves any in-memory contents accumulated so far into a
 // newly created temporary file and switches subsequent writes to it.
 func (s *spool) spillToDisk() error {
-	f, err := os.CreateTemp("", "attachra-milter-body-*.spool")
+	f, err := os.CreateTemp(s.dir, "attachra-milter-body-*.spool")
 	if err != nil {
 		return fmt.Errorf("milter: spool: create temp file: %w", err)
 	}

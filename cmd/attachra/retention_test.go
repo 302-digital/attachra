@@ -92,8 +92,8 @@ func TestWatchRetentionCleanup_NilSweeperIsNoOp(t *testing.T) {
 // TestWatchRetentionCleanup_StopTerminatesGoroutine mirrors
 // TestWatchPolicyReload_StopTerminatesGoroutine: stop() must
 // deterministically wait for its goroutine to exit even though the
-// parent ctx is already canceled by the time stop runs (CLAUDE.md
-// invariant: every goroutine has an owner and a way to terminate).
+// parent ctx is already canceled by the time stop runs (the
+// every-goroutine-has-an-owner rule).
 func TestWatchRetentionCleanup_StopTerminatesGoroutine(t *testing.T) {
 	sweeper := newTestSweeper(t)
 	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))

@@ -6,8 +6,8 @@
 // never depend back on this package — see ADR-002.
 //
 // The message body is streamed into a bounded spool (see spool.go) as
-// it arrives, never buffered whole in memory (CLAUDE.md invariant
-// #4), and any processing error or panic is resolved into the
-// configured fail-open/fail-closed behavior (see config.go,
-// backend.go; CLAUDE.md invariant #3).
+// it arrives, never buffered whole in memory (the streaming invariant),
+// and any processing error or panic is resolved into the configured
+// fail-open/fail-closed behavior (see config.go, backend.go; the
+// mail-must-never-be-lost invariant).
 package milter

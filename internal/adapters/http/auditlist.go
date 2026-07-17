@@ -102,6 +102,17 @@ func (h *APIHandler) handleAuditCollection(w http.ResponseWriter, r *http.Reques
 			writeAPIError(w, h.logger, http.StatusBadRequest, errCodeBadRequest, "invalid cursor")
 			return
 		}
+		if errors.Is(err, audit.ErrCursorTruncated) {
+			// The cursor points into a range audit retention (ADR-017)
+			// has since truncated. 410 Gone is the honest answer: the
+			// requested continuation range no longer exists. This is
+			// deliberately distinct from the 400 for a malformed cursor —
+			// the cursor is well-formed, its target is just gone — so a
+			// client can tell "retry from a fresh first page" apart from
+			// "fix your cursor".
+			writeAPIError(w, h.logger, http.StatusGone, errCodeGone, "cursor references truncated audit events; restart pagination")
+			return
+		}
 		h.logger.Error("api: list audit events failed", "error", err.Error())
 		writeAPIError(w, h.logger, http.StatusInternalServerError, errCodeInternal, "an internal error occurred")
 		return
@@ -121,7 +132,7 @@ func (h *APIHandler) handleAuditCollection(w http.ResponseWriter, r *http.Reques
 // handleAuditExport implements GET /api/v1/audit/export (admin,
 // viewer, auditor): streams every matching event as JSON Lines
 // (audit.ExportJSONL), in ascending seq order, without buffering the
-// full result set (CLAUDE.md invariant #4, SR-128-3). Unlike
+// full result set (the streaming invariant, SR-128-3). Unlike
 // handleAuditCollection, this endpoint is deliberately not paginated —
 // api/openapi.yaml's description directs a caller wanting a bounded
 // export to filter by from/to/type instead.

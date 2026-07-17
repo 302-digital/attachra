@@ -62,7 +62,7 @@ func newTestLinkEngine(t *testing.T, st *sqlite.Store) *link.Engine {
 		TTL:          72 * time.Hour,
 		MaxDownloads: 0,
 		TokenBytes:   link.MinTokenBytes,
-	}, st)
+	}, st, nil)
 	if err != nil {
 		t.Fatalf("link.NewEngine() error = %v, want nil", err)
 	}
@@ -321,7 +321,7 @@ func TestAPITokenCRUDLifecycle(t *testing.T) {
 // successful token creation and a successful revocation through the
 // REST API record a TypeTokenChange audit event carrying the acting
 // admin's identity, the affected token's id/name/role, and never the
-// token secret or its hash (ATR-296, SR-128-2, invariant #5).
+// token secret or its hash (ATR-296, SR-128-2, the token-hygiene invariant).
 func TestAPITokenCreateAndRevokeRecordAuditEvents(t *testing.T) {
 	ts, st, _ := newAPITestServer(t)
 	adminID, adminSecret := seedToken(t, st, "admin", store.RoleAdmin)

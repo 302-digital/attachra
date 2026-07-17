@@ -11,8 +11,13 @@ import "context"
 //
 // AuditSink is append-only by contract: no method in this interface
 // updates or deletes a previously recorded Event. Implementations must
-// not expose such an operation even internally reachable from this
-// package (SR-128-1).
+// not expose such an operation reachable from an event producer that
+// depends on AuditSink (SR-128-1). Retention truncation (ADR-017) is
+// the single, deliberate exception, and it is intentionally NOT part of
+// this interface: it lives on the separate Truncator interface (see
+// retention.go) so only the background sweeper — never a mail-path or
+// API producer — can invoke it, and every truncation records its own
+// tamper-evident checkpoint event.
 //
 // All methods must be safe for concurrent use by multiple goroutines.
 //

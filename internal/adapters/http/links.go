@@ -15,8 +15,8 @@ import (
 // linkDTO is the JSON shape of a single link (api/openapi.yaml, schema
 // Link). It deliberately never carries TokenHash — the object store
 // key equivalent for a link's bearer credential — matching the schema's
-// explicit "Deliberately excludes token_hash" note (CLAUDE.md
-// invariant #5). HoldSetBy/HoldSetAt are pointers so an unheld link
+// explicit "Deliberately excludes token_hash" note (the token-hygiene
+// invariant). HoldSetBy/HoldSetAt are pointers so an unheld link
 // renders them as JSON null rather than an empty string/epoch.
 type linkDTO struct {
 	ID           string  `json:"id"`
@@ -173,7 +173,7 @@ func (h *APIHandler) handleRevokeBySender(w http.ResponseWriter, r *http.Request
 
 // listLinks implements GET /api/v1/links (admin, viewer): a
 // cursor-paginated, filterable page of links, never a token hash
-// (SR-130-5, CLAUDE.md invariant #5).
+// (SR-130-5, the token-hygiene invariant).
 func (h *APIHandler) listLinks(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.authorize(w, r, store.RoleAdmin, store.RoleViewer); !ok {
 		return

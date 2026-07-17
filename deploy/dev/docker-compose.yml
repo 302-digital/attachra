@@ -98,6 +98,7 @@ services:
     ports:
       - "8080:8080"
       - "7357:7357"
+      - "18090:18090"
     networks:
       - attachra-dev
     depends_on:

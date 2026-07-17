@@ -105,27 +105,50 @@ func mustReadAll(t *testing.T, r io.Reader) []byte {
 	return b
 }
 
+// TestRewrite_NoReplaceDecision_PassthroughByteForByte covers
+// Rewrite's documented trivial-bypass guarantee: a decision with no
+// ActionReplace verdict at all returns in.Message completely
+// untouched, not even re-serialized (see Rewrite's doc comment).
+//
+// The multipart_related_alternative.eml case additionally pins this
+// against future rewrite/walk.go refactors: if the trivial early
+// return in Rewrite (rewrite.go's `if !in.hasReplace() { ... }`) is
+// ever removed or bypassed for an all-pass decision, every part would
+// instead flow through the full rewriteMultipart/boundaryWriter walk
+// — the same nested multipart/related + multipart/alternative
+// structure whose closing-delimiter CRLF handling regressed once
+// already (ATR-235's round-trip corpus test in roundtrip_test.go
+// caught it). A real bytes.Equal comparison via the actual Rewrite()
+// entry point here catches that regression immediately, independent
+// of which code path produces the output.
 func TestRewrite_NoReplaceDecision_PassthroughByteForByte(t *testing.T) {
-	path := testdataPath("multipart_mixed_basic.eml")
-	raw, atts := parseTestdata(t, path)
-	decision := decisionReplacingAttachments(atts /* no replace paths */)
+	for _, file := range []string{
+		"multipart_mixed_basic.eml",
+		"multipart_related_alternative.eml",
+	} {
+		t.Run(file, func(t *testing.T) {
+			path := testdataPath(file)
+			raw, atts := parseTestdata(t, path)
+			decision := decisionReplacingAttachments(atts /* no replace paths */)
 
-	result, err := Rewrite(Input{
-		Message:     bytes.NewReader(raw),
-		Attachments: atts,
-		Decision:    decision,
-		PackageURL:  "https://dl.example.com/p/token",
-	}, testTemplates(t))
-	if err != nil {
-		t.Fatalf("Rewrite: %v", err)
-	}
+			result, err := Rewrite(Input{
+				Message:     bytes.NewReader(raw),
+				Attachments: atts,
+				Decision:    decision,
+				PackageURL:  "https://dl.example.com/p/token",
+			}, testTemplates(t))
+			if err != nil {
+				t.Fatalf("Rewrite: %v", err)
+			}
 
-	got := mustReadAll(t, result.Body)
-	if !bytes.Equal(got, raw) {
-		t.Fatalf("passthrough result differs from original:\n--- got ---\n%s\n--- want ---\n%s", got, raw)
-	}
-	if len(result.Replaced) != 0 {
-		t.Fatalf("Replaced = %v, want empty", result.Replaced)
+			got := mustReadAll(t, result.Body)
+			if !bytes.Equal(got, raw) {
+				t.Fatalf("passthrough result differs from original:\n--- got ---\n%s\n--- want ---\n%s", got, raw)
+			}
+			if len(result.Replaced) != 0 {
+				t.Fatalf("Replaced = %v, want empty", result.Replaced)
+			}
+		})
 	}
 }
 

@@ -14,6 +14,15 @@ milter:
 http:
   listen: 0.0.0.0:8080
 
+# Admin/operational surface (ATR-292): GET /metrics and the detailed
+# GET /readyz. 0.0.0.0 (rather than the loopback-only production
+# default) so they are reachable from the host via the port mapping in
+# docker-compose.yml, for local poking around
+# (curl localhost:18090/metrics) — this compose stack's own bridge
+# network is not internet-reachable regardless.
+admin:
+  listen: 0.0.0.0:18090
+
 # Public base URL for package-page links embedded in a rewritten
 # message body (docs/architecture/package-page-decision.md §4.1 item
 # 1). Points at this compose stack's own published HTTP port; not

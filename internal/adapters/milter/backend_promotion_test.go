@@ -1,6 +1,11 @@
 package milter_test
 
 import (
+	"bytes"
+	"io"
+	"mime"
+	"net/mail"
+	"net/textproto"
 	"os"
 	"path/filepath"
 	"strings"
@@ -67,7 +72,7 @@ func newRealAttachmentProcessor(t *testing.T, policyYAML string) pipeline.Proces
 		TTL:          7 * 24 * time.Hour,
 		MaxDownloads: 0,
 		TokenBytes:   16,
-	}, st)
+	}, st, nil)
 	if err != nil {
 		t.Fatalf("link.NewEngine() error = %v, want nil", err)
 	}
@@ -102,28 +107,24 @@ func newRealAttachmentProcessor(t *testing.T, policyYAML string) pipeline.Proces
 	return proc
 }
 
-// TestRewriteMessage_PromotionPath is the ATR-289 review's promotion-path
-// regression test (docs/architecture/tech-debt.md TD-8). It reproduces
+// TestRewriteMessage_PromotionPath is the ATR-290/291 promotion-path
+// regression test (ATR-291). It reproduces
 // the exact scenario internal/core/rewrite.Rewrite's
 // rewriteTopLevelSinglePart handles specially: a message whose ENTIRE
 // body is a single, non-multipart, replace-decided "attachment" (no
-// multipart/mixed wrapper at all). Rewrite promotes such a message into
-// a synthetic multipart/mixed envelope by writing a NEW "Content-Type:
-// multipart/mixed; ..." line into the output stream AFTER the original
-// top-level header block has already been written — so NewBody's parsed
-// header block still carries the ORIGINAL (now stale) Content-Type,
-// while the actual MIME structure that follows is multipart. Applied
-// naively through milter's body-only ReplaceBody, this would deliver a
-// message whose Content-Type header (kept by the MTA, e.g.
-// "application/octet-stream") no longer matches its multipart/mixed
-// body — silent, MUA-breaking corruption, not just a missing link.
+// multipart/mixed wrapper at all). Rewrite promotes such a message into a
+// synthetic multipart/mixed envelope, changing the top-level Content-Type
+// in place and dropping the promoted single part's stale content headers.
 //
-// bodyLooksLikeHeaderBlock's fail-safe must catch this (the general
-// per-header value comparison in replaceMessage cannot: the changed
-// Content-Type line never appears in NewBody's parsed header block at
-// all, see that function's own doc comment), so the whole message must
-// come back as a true fail-open — accepted completely unmodified, i.e.
-// ZERO modify actions on the wire — rather than a corrupted rewrite.
+// After ATR-291 (Content-Type kept inside NewBody's header block) and
+// ATR-290 (this adapter applying that change via milter ChangeHeader),
+// the promotion path must now WORK end-to-end rather than fail open. This
+// test asserts the milter PROTOCOL semantics directly — a ChangeHeader
+// for Content-Type, a delete (ChangeHeader with empty value) for the
+// dropped Content-Disposition, and a ReplaceBody — and then reconstructs
+// the message the MTA would deliver (original headers with those
+// modifications applied, plus the replaced body) and verifies it is a
+// valid multipart/mixed message carrying the replacement link.
 func TestRewriteMessage_PromotionPath(t *testing.T) {
 	proc := newRealAttachmentProcessor(t, replaceAllPolicyYAML)
 	addr := startTestServer(t, proc, func(c *milter.Config) {
@@ -136,6 +137,14 @@ func TestRewriteMessage_PromotionPath(t *testing.T) {
 		t.Fatalf("session: %v", err)
 	}
 	defer sess.Close() //nolint:errcheck // best-effort cleanup
+
+	// The headers the MTA holds, in arrival order, mirrored below when
+	// reconstructing the delivered message.
+	origHeaders := []hdrKV{
+		{"Subject", "single-part promotion test"},
+		{"Content-Type", "application/octet-stream"},
+		{"Content-Disposition", `attachment; filename="report.bin"`},
+	}
 
 	steps := []struct {
 		name string
@@ -153,9 +162,9 @@ func TestRewriteMessage_PromotionPath(t *testing.T) {
 			// No multipart/mixed at all: the whole message is a single
 			// non-multipart part with a replace-eligible disposition,
 			// which is exactly what triggers rewrite's promotion path.
-			hdr.Add("Subject", "single-part promotion test")
-			hdr.Add("Content-Type", "application/octet-stream")
-			hdr.Add("Content-Disposition", `attachment; filename="report.bin"`)
+			for _, h := range origHeaders {
+				hdr.Add(h.name, h.value)
+			}
 			return sess.Header(hdr)
 		}},
 	}
@@ -177,7 +186,138 @@ func TestRewriteMessage_PromotionPath(t *testing.T) {
 
 	requireAccept(t, act)
 
-	if len(modifyActs) != 0 {
-		t.Fatalf("expected zero modify actions (true fail-open, unmodified delivery) on the promotion path, got %d: %+v", len(modifyActs), modifyActs)
+	// --- Protocol-level assertions (the ATR-290 mechanism). ---
+	var (
+		sawContentTypeChange bool
+		sawDispositionDelete bool
+		sawReplaceBody       bool
+		replacedBody         []byte
+	)
+	for _, ma := range modifyActs {
+		switch ma.Type {
+		case dmilter.ActionChangeHeader:
+			switch textproto.CanonicalMIMEHeaderKey(ma.HeaderName) {
+			case "Content-Type":
+				if ma.HeaderValue == "" {
+					t.Errorf("Content-Type must be CHANGED, not deleted: %+v", ma)
+				}
+				mt, _, perr := mime.ParseMediaType(ma.HeaderValue)
+				if perr != nil || mt != "multipart/mixed" {
+					t.Errorf("ChangeHeader Content-Type = %q (mt=%q err=%v), want multipart/mixed", ma.HeaderValue, mt, perr)
+				}
+				if ma.HeaderIndex != 1 {
+					t.Errorf("ChangeHeader Content-Type index = %d, want 1 (the single original occurrence)", ma.HeaderIndex)
+				}
+				sawContentTypeChange = true
+			case "Content-Disposition":
+				if ma.HeaderValue != "" {
+					t.Errorf("Content-Disposition must be DELETED (empty value), got %q", ma.HeaderValue)
+				}
+				sawDispositionDelete = true
+			}
+		case dmilter.ActionReplaceBody:
+			sawReplaceBody = true
+			replacedBody = append(replacedBody, ma.Body...)
+		}
 	}
+	if !sawContentTypeChange {
+		t.Error("expected a ChangeHeader modify action promoting Content-Type to multipart/mixed (ATR-290)")
+	}
+	if !sawDispositionDelete {
+		t.Error("expected a ChangeHeader delete of the dropped Content-Disposition")
+	}
+	if !sawReplaceBody {
+		t.Error("expected a ReplaceBody modify action")
+	}
+
+	// --- End-to-end: reconstruct and validate the delivered message. ---
+	delivered := applyModifyActions(t, origHeaders, modifyActs, replacedBody)
+
+	msg, err := mail.ReadMessage(bytes.NewReader(delivered))
+	if err != nil {
+		t.Fatalf("delivered message did not parse: %v\n--- delivered ---\n%s", err, delivered)
+	}
+	mt, params, err := mime.ParseMediaType(msg.Header.Get("Content-Type"))
+	if err != nil || mt != "multipart/mixed" {
+		t.Fatalf("delivered Content-Type = %q (mt=%q err=%v), want multipart/mixed", msg.Header.Get("Content-Type"), mt, err)
+	}
+	if params["boundary"] == "" {
+		t.Fatalf("delivered multipart/mixed has no boundary parameter")
+	}
+	if got := msg.Header.Get("Content-Disposition"); got != "" {
+		t.Errorf("delivered message still carries the dropped Content-Disposition: %q", got)
+	}
+	if got := msg.Header.Get("Subject"); got != "single-part promotion test" {
+		t.Errorf("Subject not preserved through promotion: %q", got)
+	}
+
+	// The whole reconstructed message must re-parse as valid MIME via the
+	// codebase parser, and the original attachment bytes must be gone.
+	if err := message.Parse(bytes.NewReader(delivered), message.DefaultLimits(), func(_ *message.Attachment, body io.Reader) error {
+		_, cerr := io.Copy(io.Discard, body)
+		return cerr
+	}); err != nil {
+		t.Fatalf("delivered message failed to re-parse as valid MIME: %v\n--- delivered ---\n%s", err, delivered)
+	}
+	if bytes.Contains(delivered, []byte(rawAttachment)) {
+		t.Errorf("dropped attachment bytes still present in the delivered message:\n%s", delivered)
+	}
+	if !bytes.Contains(delivered, []byte("links.example.com")) {
+		t.Errorf("delivered message does not carry the replacement package link:\n%s", delivered)
+	}
+}
+
+// applyModifyActions reconstructs the RFC 5322 message the MTA would
+// deliver by applying the milter ModifyActions (AddHeader / ChangeHeader /
+// delete) to the original header list in arrival order, then appending
+// the replaced body. It reimplements only the header semantics this
+// adapter exercises: single-occurrence Change and delete plus AddHeader
+// (append), which is enough to validate the promotion path faithfully.
+func applyModifyActions(t *testing.T, orig []hdrKV, actions []dmilter.ModifyAction, body []byte) []byte {
+	t.Helper()
+
+	headers := make([]hdrKV, len(orig))
+	copy(headers, orig)
+
+	nthIndex := func(name string, idx uint32) int {
+		canon := textproto.CanonicalMIMEHeaderKey(name)
+		count := uint32(0)
+		for i, h := range headers {
+			if textproto.CanonicalMIMEHeaderKey(h.name) == canon {
+				count++
+				if count == idx {
+					return i
+				}
+			}
+		}
+		return -1
+	}
+
+	for _, ma := range actions {
+		switch ma.Type {
+		case dmilter.ActionAddHeader:
+			headers = append(headers, hdrKV{name: ma.HeaderName, value: ma.HeaderValue})
+		case dmilter.ActionChangeHeader:
+			pos := nthIndex(ma.HeaderName, ma.HeaderIndex)
+			if pos < 0 {
+				t.Fatalf("ChangeHeader references missing header %q[%d]", ma.HeaderName, ma.HeaderIndex)
+			}
+			if ma.HeaderValue == "" {
+				headers = append(headers[:pos], headers[pos+1:]...)
+			} else {
+				headers[pos].value = ma.HeaderValue
+			}
+		}
+	}
+
+	var buf bytes.Buffer
+	for _, h := range headers {
+		buf.WriteString(h.name)
+		buf.WriteString(": ")
+		buf.WriteString(h.value)
+		buf.WriteString("\r\n")
+	}
+	buf.WriteString("\r\n")
+	buf.Write(body)
+	return buf.Bytes()
 }

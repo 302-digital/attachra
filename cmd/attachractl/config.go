@@ -46,6 +46,34 @@ type connectConfig struct {
 	Token    string
 	Insecure bool
 	Timeout  time.Duration
+	// Warnings holds non-fatal advisories collected while resolving the
+	// config (currently: an on-disk file carrying the bearer token is
+	// readable/writable by group or other). root.go prints each of
+	// these to stderr once the config has fully resolved, the same way
+	// it already does for --insecure.
+	Warnings []string
+}
+
+// unsafeSecretFilePermBits mirrors the bits ssh(1) warns/refuses on for
+// a private key file: group or world read/write/execute. A bearer
+// token — whether the dedicated --token-file or an inline token: in
+// the YAML config file — is exactly the same kind of secret, so the
+// same permission hygiene applies (SR-130-2).
+const unsafeSecretFilePermBits = 0o077
+
+// secretFilePermWarning returns a human-readable warning if info's
+// permission bits grant group or other access, or "" if the file is
+// already owner-only. info may be nil (the Stat that produced it
+// failed) in which case there is nothing to warn about here — the
+// read that follows will surface its own, clearer error.
+func secretFilePermWarning(path string, info os.FileInfo) string {
+	if info == nil {
+		return ""
+	}
+	if info.Mode().Perm()&unsafeSecretFilePermBits == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%q holds a bearer token secret and is readable or writable by group/other (mode %s); run \"chmod 0600 %s\"", path, info.Mode().Perm(), path)
 }
 
 // defaultConfigPath returns ~/.config/attachractl/config.yaml, or ""
@@ -66,36 +94,53 @@ func defaultConfigPath() string {
 // existence — but a present-and-unreadable-or-malformed file is,
 // since silently ignoring a broken config a user believes is in
 // effect would be confusing.
-func loadFileConfig(path string) (fileConfig, error) {
+//
+// The returned warning is non-empty only when the file carries an
+// inline "token:" (SR-130-2) and its permissions are group/other
+// accessible; a file that only references a separate token_file is not
+// itself a secret, so its own permissions are not checked here (that
+// file's permissions are checked by readTokenFile instead).
+func loadFileConfig(path string) (fc fileConfig, warning string, err error) {
 	if path == "" {
-		return fileConfig{}, nil
+		return fileConfig{}, "", nil
 	}
+	info, _ := os.Stat(path)
 	data, err := os.ReadFile(path) //nolint:gosec // operator-supplied config path, not untrusted input
 	if err != nil {
 		if os.IsNotExist(err) {
-			return fileConfig{}, nil
+			return fileConfig{}, "", nil
 		}
-		return fileConfig{}, fmt.Errorf("read config file %q: %w", path, err)
+		return fileConfig{}, "", fmt.Errorf("read config file %q: %w", path, err)
 	}
-	var fc fileConfig
 	if err := yaml.Unmarshal(data, &fc); err != nil {
-		return fileConfig{}, fmt.Errorf("parse config file %q: %w", path, err)
+		return fileConfig{}, "", fmt.Errorf("parse config file %q: %w", path, err)
 	}
-	return fc, nil
+	if fc.Token != "" {
+		warning = secretFilePermWarning(path, info)
+	}
+	return fc, warning, nil
 }
 
 // readTokenFile reads and trims a file expected to contain nothing but
-// a bearer token secret (optionally with a trailing newline).
-func readTokenFile(path string) (string, error) {
+// a bearer token secret (optionally with a trailing newline). The
+// returned warning is non-empty when the file's permissions grant
+// group or other access — this CLI does not refuse to use such a file
+// (an operator may have deliberate reasons, e.g. a read-only mount
+// inside a container image with its own access controls), but staying
+// silent about a genuine misconfiguration would defeat the whole point
+// of keeping the secret out of a flag/argv (SR-130-2, doc.go).
+func readTokenFile(path string) (token, warning string, err error) {
+	info, _ := os.Stat(path)
+	warning = secretFilePermWarning(path, info)
 	data, err := os.ReadFile(path) //nolint:gosec // operator-supplied token file path, not untrusted input
 	if err != nil {
-		return "", fmt.Errorf("read token file %q: %w", path, err)
+		return "", "", fmt.Errorf("read token file %q: %w", path, err)
 	}
-	token := strings.TrimSpace(string(data))
+	token = strings.TrimSpace(string(data))
 	if token == "" {
-		return "", fmt.Errorf("token file %q is empty", path)
+		return "", "", fmt.Errorf("token file %q is empty", path)
 	}
-	return token, nil
+	return token, warning, nil
 }
 
 // resolveConnectConfig resolves the endpoint URL, bearer token and TLS
@@ -110,12 +155,15 @@ func readTokenFile(path string) (string, error) {
 // the config file's token/token_file field — so it never appears in
 // argv (visible to other local users via /proc/<pid>/cmdline or ps).
 func resolveConnectConfig(flags connectFlags, getenv func(string) string) (connectConfig, error) {
-	fc, err := loadFileConfig(flags.configPath)
+	fc, fcWarning, err := loadFileConfig(flags.configPath)
 	if err != nil {
 		return connectConfig{}, err
 	}
 
 	cfg := connectConfig{Timeout: flags.timeout}
+	if fcWarning != "" {
+		cfg.Warnings = append(cfg.Warnings, fcWarning)
+	}
 
 	switch {
 	case flags.url != "":
@@ -132,19 +180,25 @@ func resolveConnectConfig(flags connectFlags, getenv func(string) string) (conne
 
 	switch {
 	case flags.tokenFile != "":
-		token, err := readTokenFile(flags.tokenFile)
+		token, warning, err := readTokenFile(flags.tokenFile)
 		if err != nil {
 			return connectConfig{}, err
 		}
 		cfg.Token = token
+		if warning != "" {
+			cfg.Warnings = append(cfg.Warnings, warning)
+		}
 	case getenv("ATTACHRACTL_TOKEN") != "":
 		cfg.Token = getenv("ATTACHRACTL_TOKEN")
 	case fc.TokenFile != "":
-		token, err := readTokenFile(fc.TokenFile)
+		token, warning, err := readTokenFile(fc.TokenFile)
 		if err != nil {
 			return connectConfig{}, err
 		}
 		cfg.Token = token
+		if warning != "" {
+			cfg.Warnings = append(cfg.Warnings, warning)
+		}
 	case fc.Token != "":
 		cfg.Token = fc.Token
 	}

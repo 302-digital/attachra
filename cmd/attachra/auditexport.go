@@ -17,13 +17,22 @@ const (
 )
 
 // runAuditCommand dispatches `attachra audit <subcommand> ...`.
-// Currently the only subcommand is `export`.
+// Subcommands: `export` (stream the log as JSON Lines) and `verify`
+// (check the tamper-evidence hash chain, ATR-240).
 func runAuditCommand(args []string, sink audit.Reader, stdout, stderr io.Writer) int {
-	if len(args) == 0 || args[0] != "export" {
-		fmt.Fprintln(stderr, "attachra: usage: attachra audit export [--from RFC3339] [--to RFC3339] [--type TYPE]") //nolint:errcheck // best-effort diagnostic on stderr
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "attachra: usage: attachra audit (export|verify) ...") //nolint:errcheck // best-effort diagnostic on stderr
 		return auditExportError
 	}
-	return runAuditExport(args[1:], sink, stdout, stderr)
+	switch args[0] {
+	case "export":
+		return runAuditExport(args[1:], sink, stdout, stderr)
+	case "verify":
+		return runAuditVerify(args[1:], sink, stdout, stderr)
+	default:
+		fmt.Fprintln(stderr, "attachra: usage: attachra audit (export|verify) ...") //nolint:errcheck // best-effort diagnostic on stderr
+		return auditExportError
+	}
 }
 
 // runAuditExport implements `attachra audit export` (T-7.1.3,
@@ -31,7 +40,7 @@ func runAuditCommand(args []string, sink audit.Reader, stdout, stderr io.Writer)
 // stdout as JSON Lines (one compact JSON object per line), for
 // ingestion into an external immutable store/SIEM. Output is streamed
 // via audit.ExportJSONL, so memory use is independent of how large the
-// audit log has grown (CLAUDE.md invariant #4).
+// audit log has grown (the streaming invariant — no full-message buffering).
 func runAuditExport(args []string, sink audit.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("attachra audit export", flag.ContinueOnError)
 	fs.SetOutput(stderr)

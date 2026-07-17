@@ -44,12 +44,19 @@ or by the orchestrator with the founder's sign-off (internal process docs).
 9. Check that the tag pipeline's `build-deb` job is green: it runs
    `make build-deb`, producing `dist/attachra_<version>_amd64.deb` and
    `dist/attachra_<version>_arm64.deb`, then publishes both plus a
-   `SHA256SUMS` manifest to the GitLab generic package registry — no manual
+   `SHA256SUMS` manifest to the internal generic package registry — no manual
    upload step. On a tag build `<version>` is the clean `X.Y.Z` (see step 8),
    so the packages land at:
-   `<gitlab-instance>/api/v4/projects/<project-id>/packages/generic/attachra/X.Y.Z/attachra_X.Y.Z_amd64.deb`
+   `<registry-instance>/api/v4/projects/<project-id>/packages/generic/attachra/X.Y.Z/attachra_X.Y.Z_amd64.deb`
    (and `..._arm64.deb`, `.../SHA256SUMS`) — browsable under the project's
    Packages & Registries → Package Registry page.
 10. Update the status snapshot in the internal project notes and the comment
     on the release ticket (what shipped, links to the pipeline/image/deb
     packages).
+11. README status ("Status: vX.Y.Z released", the roadmap line and the
+    quickstart `version=` example) must be bumped BEFORE the tag — the
+    tagged tree ships with whatever the README says at that moment.
+12. Bump the website (attachra.org repository, index.html): the hero meta
+    version line and the "Where the project is" status note. Push only
+    after the GitHub release is actually live, so the site never claims a
+    release that does not exist yet.

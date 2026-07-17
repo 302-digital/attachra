@@ -14,6 +14,7 @@ import (
 
 	dmilter "github.com/d--j/go-milter"
 
+	"github.com/302-digital/attachra/internal/core/mail"
 	"github.com/302-digital/attachra/internal/core/metrics"
 	"github.com/302-digital/attachra/internal/core/pipeline"
 )
@@ -69,22 +70,37 @@ func newBackend(cfg Config, processor pipeline.Processor, logger *slog.Logger, m
 // MailFrom records the envelope sender, preferring the {mail_addr}
 // macro (set by Postfix/Sendmail) and falling back to the raw
 // argument the MTA passed on the MAIL command.
+//
+// The captured value is passed through mail.NormalizeAddress before
+// being stored: the raw MAIL command argument still carries its SMTP
+// reverse-path angle brackets ("<user@example.com>") and whatever case
+// the sending client used, and even the {mail_addr} macro is not
+// guaranteed bracket-free on every MTA. Normalizing here — the point
+// Attachra first observes the address — is what makes the audit trail,
+// message listings, and revoke-by-sender all agree on one canonical
+// form downstream (ATR-293, closing the ATR-258 review's N1 finding:
+// previously this field was stored exactly as received, so
+// `attachra link revoke --sender john@corp.com` silently failed to
+// match a message recorded as `John@Corp.com`).
 func (b *backend) MailFrom(from string, _ string, m dmilter.Modifier) (*dmilter.Response, error) {
 	if v, ok := m.GetEx(dmilter.MacroMailAddr); ok && v != "" {
-		b.sender = v
+		b.sender = mail.NormalizeAddress(v)
 	} else {
-		b.sender = from
+		b.sender = mail.NormalizeAddress(from)
 	}
 	return dmilter.RespContinue, nil
 }
 
 // RcptTo records one envelope recipient, preferring the {rcpt_addr}
-// macro over the raw RCPT argument.
+// macro over the raw RCPT argument. See MailFrom's doc comment for why
+// the value is normalized here: the same ATR-293 reasoning applies to
+// recipients (audit records and message listings key on this exact
+// value too).
 func (b *backend) RcptTo(rcptTo string, _ string, m dmilter.Modifier) (*dmilter.Response, error) {
 	if v, ok := m.GetEx(dmilter.MacroRcptAddr); ok && v != "" {
-		b.recipients = append(b.recipients, v)
+		b.recipients = append(b.recipients, mail.NormalizeAddress(v))
 	} else {
-		b.recipients = append(b.recipients, rcptTo)
+		b.recipients = append(b.recipients, mail.NormalizeAddress(rcptTo))
 	}
 	return dmilter.RespContinue, nil
 }
@@ -111,7 +127,7 @@ func (b *backend) Header(name, value string, _ dmilter.Modifier) (*dmilter.Respo
 // itself enforces cfg.MaxMessageSize.
 func (b *backend) BodyChunk(chunk []byte, _ dmilter.Modifier) (*dmilter.Response, error) {
 	if b.body == nil {
-		b.body = newSpool(b.cfg.MaxMessageSize)
+		b.body = newSpool(b.cfg.MaxMessageSize, b.cfg.SpoolDir)
 	}
 	if _, err := b.body.Write(chunk); err != nil {
 		return nil, fmt.Errorf("milter: body chunk: %w", err)
@@ -314,7 +330,7 @@ func senderDomain(addr string) string {
 // emits CRLF so the reconstructed message matches what a compliant
 // client would have sent. The header block is small and bounded (the
 // MTA enforces its own header-size limits), so serializing it into a
-// single reader does not violate CLAUDE.md invariant #4; body is never
+// single reader does not violate the streaming invariant; body is never
 // buffered here — io.MultiReader streams it straight through.
 func (b *backend) reassembleMessage(body io.Reader) io.Reader {
 	if len(b.headers) == 0 {
@@ -344,34 +360,44 @@ func (b *backend) reassembleMessage(body io.Reader) io.Reader {
 // given transport replaces content (ADR-002). The milter ReplaceBody
 // wire operation (SMFIR_REPLBODY) replaces only the body — the MTA
 // keeps the headers it already holds — so replaceMessage splits NewBody
-// into its header block and body: it streams the body into
-// m.ReplaceBody (never buffering it whole, CLAUDE.md invariant #4) and
-// re-adds, via m.AddHeader, every header the rewrite introduced relative
-// to the message the MTA already has. "Introduced" is decided by
-// canonical field name: a header whose name the original message did
-// not carry is added (in practice just X-Attachra-Processed, US-3.2);
-// headers the rewrite left unchanged are already on the MTA side and are
-// not touched, avoiding duplicates. AddHeader calls are issued in
-// sorted-by-name order for deterministic, reproducible behavior (Go map
-// iteration order is randomized).
+// into its header block and body: it streams the body into m.ReplaceBody
+// (never buffering it whole, the streaming invariant) and reconciles
+// NewBody's header block against the headers the MTA already has
+// (b.headers, matched by canonical field name and occurrence order):
+//   - a header the rewrite introduced (name absent from the original —
+//     in practice X-Attachra-Processed, US-3.2, plus MIME-Version on the
+//     promotion path) is appended via m.AddHeader;
+//   - a header whose value the rewrite changed (the top-level
+//     Content-Type on the single-part-to-multipart promotion path,
+//     ATR-290/291) is updated in place via m.ChangeHeader;
+//   - a header the rewrite dropped (the promoted single part's stale
+//     Content-Transfer-Encoding / Content-Disposition, which now live on
+//     the wrapped body part) is deleted via m.ChangeHeader with an empty
+//     value;
+//   - a header left unchanged is already on the MTA side and is not
+//     touched, avoiding duplicates.
 //
-// Fail-safe (ATR-289 review, TD-8 in docs/architecture/tech-debt.md):
-// this adapter can only ADD a header via milter's AddHeader; it cannot
-// change the value of a header the MTA already has (that needs
-// OptChangeHeader / m.ChangeHeader, tracked separately as ATR-290). If a
-// rewrite ever needed to CHANGE an existing header's value — rather than
-// only add new ones — silently proceeding here would delivver a message
-// whose body no longer matches a header still holding its original
-// value (CLAUDE.md invariant #3's "never silently corrupt" reading of
-// "never lose a message"). So replaceMessage detects two shapes of that
-// hazard before issuing a single AddHeader/ReplaceBody call, and returns
-// an error (which the caller resolves into fail-open/fail-closed) the
-// moment either is seen — see headerValueChanged and
-// bodyLooksLikeHeaderBlock's own doc comments for what each one guards
-// against and why. Detection runs to completion, and only THEN are any
-// modifier calls made, so a detected hazard leaves the milter session
-// completely untouched (a true fail-open delivers the original message
-// verbatim, not a partially-modified one).
+// All header modifications are issued before the ReplaceBody run (Postfix
+// requires the ReplaceBody chunks to arrive as one uninterrupted run,
+// see go-milter's Modifier.ReplaceBody doc), and deletions are applied
+// highest-index-first so removing one occurrence of a repeated header
+// name does not shift the 1-based index of another still pending for the
+// same name (the ModifyAction.HeaderIndex contract).
+//
+// Fail-safe (ATR-289 review, ATR-291):
+// any modifier call that the MTA rejects (e.g. it did not negotiate
+// OptChangeHeader) returns an error, which the caller resolves into the
+// configured fail-open/fail-closed path. The milter protocol has no
+// rollback, so modifications issued before a mid-stream failure cannot
+// be withdrawn by this side; delivery of a half-modified message is
+// instead prevented by the MTA's commit semantics — Postfix applies
+// queued modifications only after the milter's clean final response,
+// and a session that errors out falls back to milter_default_action
+// with the original message intact. bodyLooksLikeHeaderBlock remains as
+// a narrow guard against an unexpected regression where a changed
+// header would again leak past the parsed header block into the body;
+// after the ATR-291 rewrite fix it is never expected to trip on
+// legitimate output.
 func (b *backend) replaceMessage(queueID string, m dmilter.Modifier, newBody io.Reader) error {
 	// NewBody may be a temp-file-backed io.ReadCloser
 	// (internal/core/rewrite.Rewrite's spoolFile, once the rewritten body
@@ -405,42 +431,68 @@ func (b *backend) replaceMessage(queueID string, m dmilter.Modifier, newBody io.
 		originalValues[name] = append(originalValues[name], h.value)
 	}
 
-	var toAdd []string
-	for name, values := range rewrittenHeader {
-		orig, hadOriginal := originalValues[name]
-		if !hadOriginal {
-			toAdd = append(toAdd, name)
-			continue
-		}
-		if changedName, changedOrig, changedNew, changed := headerValueChanged(name, orig, values); changed {
-			b.logger.Warn("milter: rewritten message changes an existing header value, which this adapter cannot apply (AddHeader only adds, see ATR-290)",
-				"queue_id", queueID, "header", changedName)
-			return fmt.Errorf("milter: rewritten header %q changed value (original %q, rewritten %q): %w",
-				changedName, changedOrig, changedNew, errHeaderValueChanged)
-		}
-		// Values match (after normalization): this header is already on
-		// the MTA side and unchanged, so it is neither re-added nor
-		// otherwise touched.
-	}
-
-	// Promotion-path fail-safe (TD-8 / ATR-291): a changed Content-Type
-	// that internal/core/rewrite's single-part-to-multipart promotion
-	// writes past the header block (into what this adapter treats as
-	// body) never appears in rewrittenHeader at all, so the per-header
-	// comparison above cannot see it. bodyLooksLikeHeaderBlock catches
-	// that specific shape by inspecting the body's own first line.
+	// Defensive guard (ATR-291): before the ATR-291 rewrite fix a
+	// changed top-level Content-Type could be written past NewBody's
+	// header block, landing in what this adapter treats as body, where
+	// the reconciliation below could not see it. The fix keeps every
+	// changed header inside the header block, so this must never trip on
+	// legitimate output; it stays as a fail-safe against an unexpected
+	// regression, checked before any modifier call so a trip is a true
+	// fail-open (see resolveFailure in the caller).
 	if bodyLooksLikeHeaderBlock(br) {
-		b.logger.Warn("milter: rewritten message body begins with what looks like another header block, refusing to apply (see TD-8 / ATR-291)",
+		b.logger.Warn("milter: rewritten message body begins with what looks like another header block, refusing to apply (see ATR-291)",
 			"queue_id", queueID)
 		return fmt.Errorf("milter: rewritten message body looks like a header block: %w", errPromotedContentType)
 	}
 
-	sort.Strings(toAdd)
-	for _, name := range toAdd {
-		for _, value := range rewrittenHeader[name] {
-			if err := m.AddHeader(name, value); err != nil {
+	// Reconcile the rewritten header block against the headers the MTA
+	// already holds. Deletions are deferred and applied last, highest
+	// index first, so removing one occurrence of a repeated header name
+	// does not shift the 1-based index of another still pending for the
+	// same name (ModifyAction.HeaderIndex is per canonical name).
+	var deletes []headerDelete
+	for _, name := range headerNameUnion(originalValues, rewrittenHeader) {
+		orig := originalValues[name]
+		want := rewrittenHeader[name]
+
+		minLen := len(orig)
+		if len(want) < minLen {
+			minLen = len(want)
+		}
+
+		// Occurrences present on both sides: change in place when the
+		// value differs (after normalization), otherwise leave untouched.
+		for i := 0; i < minLen; i++ {
+			if normalizeHeaderValue(orig[i]) == normalizeHeaderValue(want[i]) {
+				continue
+			}
+			if err := m.ChangeHeader(i+1, name, want[i]); err != nil {
+				return fmt.Errorf("milter: change header %q[%d]: %w", name, i+1, err)
+			}
+		}
+		// Occurrences only in the rewritten block: append them.
+		for i := len(orig); i < len(want); i++ {
+			if err := m.AddHeader(name, want[i]); err != nil {
 				return fmt.Errorf("milter: add rewritten header %q: %w", name, err)
 			}
+		}
+		// Occurrences only in the original block: schedule for deletion.
+		for i := len(want); i < len(orig); i++ {
+			deletes = append(deletes, headerDelete{name: name, index: i + 1})
+		}
+	}
+
+	sort.Slice(deletes, func(i, j int) bool {
+		if deletes[i].name != deletes[j].name {
+			return deletes[i].name < deletes[j].name
+		}
+		return deletes[i].index > deletes[j].index
+	})
+	for _, d := range deletes {
+		// An empty value is milter's "delete this header" (SMFIR_CHGHEADER
+		// with a zero-length value).
+		if err := m.ChangeHeader(d.index, d.name, ""); err != nil {
+			return fmt.Errorf("milter: delete header %q[%d]: %w", d.name, d.index, err)
 		}
 	}
 
@@ -450,37 +502,44 @@ func (b *backend) replaceMessage(queueID string, m dmilter.Modifier, newBody io.
 	return nil
 }
 
-// errHeaderValueChanged and errPromotedContentType are sentinel causes
-// wrapped by replaceMessage's two fail-safes, giving log/test call sites
-// something stable to match on independent of the queue-id-specific
-// message text.
-var (
-	errHeaderValueChanged  = fmt.Errorf("milter: existing header value changed")
-	errPromotedContentType = fmt.Errorf("milter: rewritten body looks like a promoted header block")
-)
-
-// headerValueChanged reports whether orig and rewritten (both value
-// lists for the same canonical header name across possibly-repeated
-// headers, e.g. "Received") differ once normalizeHeaderValue is applied
-// to every element pairwise, positionally. A length mismatch also
-// counts as changed. On a match it returns ("", "", "", false); on a
-// mismatch it returns the header name and the first differing pair of
-// (normalized) values for use in an error/log message.
-func headerValueChanged(name string, orig, rewritten []string) (changedName, changedOrig, changedNew string, changed bool) {
-	if len(orig) != len(rewritten) {
-		return name, strings.Join(orig, " / "), strings.Join(rewritten, " / "), true
-	}
-	for i := range orig {
-		o, r := normalizeHeaderValue(orig[i]), normalizeHeaderValue(rewritten[i])
-		if o != r {
-			return name, o, r, true
-		}
-	}
-	return "", "", "", false
+// headerDelete is one scheduled header deletion (a milter ChangeHeader
+// with an empty value), carrying the canonical header name and the
+// 1-based index of the occurrence to remove.
+type headerDelete struct {
+	name  string
+	index int
 }
 
+// headerNameUnion returns the sorted union of the canonical header names
+// present in either the original (MTA-side) or the rewritten header set,
+// so replaceMessage reconciles every name deterministically (Go map
+// iteration order is randomized) and considers names that disappeared
+// from the rewritten block (which must be deleted) as well as ones that
+// appeared or changed.
+func headerNameUnion(orig, rewritten map[string][]string) []string {
+	seen := make(map[string]struct{}, len(orig)+len(rewritten))
+	for name := range orig {
+		seen[name] = struct{}{}
+	}
+	for name := range rewritten {
+		seen[name] = struct{}{}
+	}
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// errPromotedContentType is the sentinel cause wrapped by
+// replaceMessage's bodyLooksLikeHeaderBlock fail-safe, giving log/test
+// call sites something stable to match on independent of the
+// queue-id-specific message text.
+var errPromotedContentType = fmt.Errorf("milter: rewritten body looks like a promoted header block")
+
 // normalizeHeaderValue prepares a header value for content-equality
-// comparison in headerValueChanged, making the comparison robust to
+// comparison in replaceMessage, making the comparison robust to
 // superficial differences that do not change the header's meaning
 // rather than to its actual content:
 //   - a leading run of spaces/tabs is trimmed — go-milter's Header
@@ -535,33 +594,27 @@ const promotionHeaderSniffLen = 512
 // ordinary message content.
 //
 // This is a narrow, deliberately blunt fail-safe for one specific known
-// gap (TD-8, ATR-291): internal/core/rewrite's rewriteTopLevelSinglePart
-// (invoked when a whole single-part message is promoted into a
-// multipart/mixed envelope so the replacement block has somewhere to
-// live) writes its new "Content-Type: multipart/mixed; boundary=...
-// \r\nMIME-Version: 1.0\r\n\r\n" preamble to the output stream AFTER the
-// top-level header block (and its terminating blank line) has already
-// been written by run(). That means the changed Content-Type lands in
-// what this adapter treats as "body", never in NewBody's parsed header
-// block — so headerValueChanged above never sees it and cannot detect
-// that the message's real Content-Type has silently gone out of sync
-// with the (unchanged, original) Content-Type still in the header
-// block.
+// gap (ATR-291): before the ATR-291 rewrite fix,
+// internal/core/rewrite's rewriteTopLevelSinglePart (invoked when a whole
+// single-part message is promoted into a multipart/mixed envelope so the
+// replacement block has somewhere to live) wrote its new "Content-Type:
+// multipart/mixed" preamble to the output stream AFTER the top-level
+// header block (and its terminating blank line) had already been written,
+// so the changed Content-Type landed in what this adapter treats as
+// "body", never in NewBody's parsed header block. ATR-291 fixed rewrite
+// to keep the promoted Content-Type inside the header block, so this must
+// never trip on legitimate output; it remains only to catch an unexpected
+// regression of that exact shape rather than silently delivering a
+// message whose Content-Type header and body have gone out of sync.
 //
-// Every legitimate rewrite output this adapter otherwise receives always
-// begins its body with a MIME boundary delimiter line ("--boundary"),
-// never a bare "field-name: value" line — verified directly against
-// rewrite.Rewrite's actual promotion-path output (see
-// TestRewriteMessage_PromotionPath in backend_promotion_test.go, which
-// dumps the real bytes this function is checking). A body that DOES
-// start that way is therefore a reliable, specific signal of this one
-// known gap rather than of ordinary message content coincidentally
-// containing a colon on its first line. ATR-290/291 track the real fix
-// (using milter's ChangeHeader to update Content-Type in place); until
-// then, tripping this check routes the message through the same
-// fail-open/fail-closed path as any other processing error, rather than
-// silently delivering a message whose Content-Type header and body have
-// gone out of sync.
+// Every legitimate rewrite output this adapter receives begins its body
+// with a MIME boundary delimiter line ("--boundary"), never a bare
+// "field-name: value" line. A leading "--" is therefore ruled out up
+// front: a MIME boundary parameter may legally contain a colon (RFC 2046
+// §5.1.1 bcharsnospace), so a "--boundary:with-colon" delimiter must not
+// be mistaken for a header field (this is the only realistic false
+// positive, since ordinary content rarely starts its first body line with
+// a bare field-name and a colon).
 func bodyLooksLikeHeaderBlock(br *bufio.Reader) bool {
 	peek, _ := br.Peek(promotionHeaderSniffLen)
 	if len(peek) == 0 {
@@ -572,6 +625,15 @@ func bodyLooksLikeHeaderBlock(br *bufio.Reader) bool {
 	if nl := bytes.IndexAny(peek, "\r\n"); nl >= 0 {
 		line = peek[:nl]
 	}
+
+	// A MIME boundary delimiter line, never a header field — even though a
+	// boundary parameter may legally contain a colon. This is the normal,
+	// correct first body line of every rewrite output (including the
+	// promotion path after ATR-291).
+	if bytes.HasPrefix(line, []byte("--")) {
+		return false
+	}
+
 	colon := bytes.IndexByte(line, ':')
 	if colon <= 0 {
 		return false

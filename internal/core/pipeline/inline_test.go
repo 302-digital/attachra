@@ -30,6 +30,7 @@ import (
 	"encoding/base64"
 	"io"
 	"log/slog"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -130,6 +131,37 @@ func newProcessorWithDryRunLogger(t *testing.T, h *testHarness, policyYAML strin
 		MaxAttachmentSize: 10 << 20,
 		PublicBaseURL:     "https://links.example.com",
 		DryRun:            true,
+		Logger:            logger,
+		AuditSink:         h.auditSink,
+	})
+	if err != nil {
+		t.Fatalf("NewAttachmentProcessor() error = %v, want nil", err)
+	}
+	return proc
+}
+
+// newProcessorWithLogger mirrors newProcessor but wires a custom
+// *slog.Logger (NOT dry-run), for asserting Process's own log output —
+// e.g. the B2 cid-scan gate's Debug-level "skipped" line (fixtures
+// 21/22), which newProcessorWithDryRunLogger's forced DryRun mode would
+// otherwise short-circuit before Process ever reaches.
+func newProcessorWithLogger(t *testing.T, h *testHarness, policyYAML string, logger *slog.Logger) *pipeline.AttachmentProcessor {
+	t.Helper()
+
+	policyPath := buildPolicyFile(t, policyYAML)
+	store, err := policy.NewStore(policyPath)
+	if err != nil {
+		t.Fatalf("policy.NewStore() error = %v, want nil", err)
+	}
+
+	proc, err := pipeline.NewAttachmentProcessor(pipeline.AttachmentProcessorParams{
+		PolicyStore:       store,
+		Storage:           h.storage,
+		LinkEngine:        h.link,
+		Templates:         h.tmpl,
+		Limits:            message.DefaultLimits(),
+		MaxAttachmentSize: 10 << 20,
+		PublicBaseURL:     "https://links.example.com",
 		Logger:            logger,
 		AuditSink:         h.auditSink,
 	})
@@ -341,14 +373,16 @@ func TestProcess_AppleMailStyleInlineAttachmentReplaced(t *testing.T) {
 	}
 }
 
-// TestProcess_CIDWithoutHTMLReference_StillProtected is Fixture 3: a
-// Content-ID + multipart/related part whose Content-ID is never
-// actually referenced anywhere in the HTML body via cid:. ADR-016
-// phase 1 does not verify the cid: reference (deferred to phase 2, see
-// "Alternatives considered"), so this part is still protected purely
-// on the structural signal (Content-ID + multipart/related parent) —
-// a documented, accepted over-protection, not a bypass.
-func TestProcess_CIDWithoutHTMLReference_StillProtected(t *testing.T) {
+// TestProcess_CIDNotReferencedFromHTML_Replaced is Fixture 3, updated
+// for ADR-016 phase 2 (ATR-307): a Content-ID + multipart/related PNG
+// whose Content-ID is never referenced anywhere in the HTML body via
+// cid:. Phase 1 protected such a part on the structural signal alone (an
+// accepted over-protection); phase 2 verifies the cid: reference, so an
+// unreferenced Content-ID asset is no longer an InlineAsset in the
+// protective sense and REPLACES normally like any other attachment. The
+// HTML body itself (a structural body part) is still downgraded/preserved
+// by protectStructuralBodies.
+func TestProcess_CIDNotReferencedFromHTML_Replaced(t *testing.T) {
 	png := pngPayload(t, 64)
 	msg := "From: sender@example.com\r\n" +
 		"To: rcpt@example.com\r\n" +
@@ -375,20 +409,28 @@ func TestProcess_CIDWithoutHTMLReference_StillProtected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Process() error = %v, want nil", err)
 	}
-	// Both parts are decided replace by replaceAllPolicy's default (the
-	// PNG via InlineAsset classification, the HTML body as a structural
-	// body part), but both are downgraded to pass by their respective
-	// protective layers, so Process must accept the message completely
-	// untouched.
-	if verdict.Action != pipeline.VerdictAccept {
-		t.Fatalf("verdict.Action = %v, want VerdictAccept (protected PNG + protected HTML body => nothing left to replace)", verdict.Action)
+	if verdict.Action != pipeline.VerdictRewrite {
+		t.Fatalf("verdict.Action = %v, want VerdictRewrite (unreferenced CID asset now replaces)", verdict.Action)
+	}
+
+	rewritten, err := io.ReadAll(verdict.NewBody)
+	if err != nil {
+		t.Fatalf("read rewritten body: %v", err)
+	}
+	if strings.Contains(string(rewritten), b64(png)) {
+		t.Error("rewritten body still contains the PNG payload, want it replaced (Content-ID never referenced from HTML)")
 	}
 
 	got := collectEvents(t, h)
-	protectedLists := inlineProtectedPartPaths(t, got)
-	if len(protectedLists) != 1 || len(protectedLists[0]) != 1 {
-		t.Fatalf("inline_protected lists = %v, want exactly one event with exactly one protected part path", protectedLists)
+	counts := countByType(got)
+	if counts[audit.TypeAttachmentStored] != 1 {
+		t.Errorf("TypeAttachmentStored count = %d, want 1 (the unreferenced PNG is now uploaded)", counts[audit.TypeAttachmentStored])
 	}
+	// The PNG must NOT appear as protected any more.
+	if lists := inlineProtectedPartPaths(t, got); len(lists) != 0 {
+		t.Errorf("inline_protected lists = %v, want none (unreferenced CID asset is no longer protected)", lists)
+	}
+	// The HTML structural body is still downgraded/preserved.
 	bodyLists := bodyProtectedPartPaths(t, got)
 	if len(bodyLists) != 1 || len(bodyLists[0]) != 1 {
 		t.Fatalf("body_protected lists = %v, want exactly one event with exactly one protected part path", bodyLists)
@@ -991,5 +1033,447 @@ func TestProcess_MasqueradingStructuralBody_DetectedTypeBlockFires(t *testing.T)
 	}
 	if !strings.Contains(verdict.Reason, "zip content is blocked") {
 		t.Errorf("verdict.Reason = %q, want the blocking rule's reason", verdict.Reason)
+	}
+}
+
+// --- ADR-016 phase 2 (ATR-307): cid: reference verification -----------
+//
+// Fixtures 16-22 pin the phase-2 refinement end-to-end: an InlineAsset is
+// protected only when its Content-ID is really referenced via cid: from a
+// text/html body of the same multipart/related container. See cid_test.go
+// for the lower-level scanner/scoping/fail-safe unit tests, including the
+// aggregate scan-byte/token budget unit tests. Fixture 20 exercises the
+// aggregate token budget end-to-end (a security review of the first
+// version of this change found the per-part scan bound alone was
+// insufficient: a message with many text/html parts could still
+// aggregate several GiB of retained token maps, B1); fixtures 21-22
+// exercise the companion fix that skips the scan entirely for a message
+// with no inline-asset candidate at all (B2).
+
+// relatedImageBeforeHTML builds a multipart/related where the cid image
+// part comes BEFORE the referencing text/html part — RFC 2387 only
+// SHOULD (not MUST) put the root/HTML part first, so the pipeline must
+// tolerate an image-before-HTML ordering. The pipeline collects every
+// HTML body's references before applying protection, so document order
+// is irrelevant.
+func relatedImageBeforeHTML(png []byte) string {
+	return "From: sender@example.com\r\n" +
+		"To: rcpt@example.com\r\n" +
+		"Subject: image before html\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart/related; boundary=\"REL\"\r\n" +
+		"\r\n" +
+		"--REL\r\n" +
+		"Content-Type: image/png\r\n" +
+		"Content-ID: <logo123>\r\n" +
+		"Content-Transfer-Encoding: base64\r\n" +
+		"\r\n" +
+		b64(png) + "\r\n" +
+		"--REL\r\n" +
+		"Content-Type: text/html; charset=utf-8\r\n" +
+		"\r\n" +
+		"<html><body><img src=\"cid:logo123\"></body></html>\r\n" +
+		"--REL--\r\n"
+}
+
+// TestProcess_InlineImageBeforeHTML_StillProtected is Fixture 16: the
+// referencing HTML appears after the image in document order. The image
+// must still be recognized as referenced and protected.
+func TestProcess_InlineImageBeforeHTML_StillProtected(t *testing.T) {
+	png := pngPayload(t, 64)
+	msg := relatedImageBeforeHTML(png)
+
+	h := newTestHarness(t)
+	proc := newProcessor(t, h, replaceAllPolicy, false)
+
+	verdict, err := proc.Process(context.Background(), envelopeFor(msg))
+	if err != nil {
+		t.Fatalf("Process() error = %v, want nil", err)
+	}
+	// The image is protected and the HTML body is downgraded, so nothing
+	// is left to replace: accept untouched.
+	if verdict.Action != pipeline.VerdictAccept {
+		t.Fatalf("verdict.Action = %v, want VerdictAccept (image-before-HTML must not defeat cid verification)", verdict.Action)
+	}
+
+	got := collectEvents(t, h)
+	if counts := countByType(got); counts[audit.TypeAttachmentStored] != 0 {
+		t.Errorf("TypeAttachmentStored count = %d, want 0 (referenced inline image is protected)", counts[audit.TypeAttachmentStored])
+	}
+	protectedLists := inlineProtectedPartPaths(t, got)
+	if len(protectedLists) != 1 || len(protectedLists[0]) != 1 {
+		t.Fatalf("inline_protected lists = %v, want exactly one event with exactly one protected part path", protectedLists)
+	}
+}
+
+// TestProcess_CIDNoHTMLPart_Replaced is Fixture 17: a multipart/related
+// with a Content-ID image and a text/PLAIN body (no text/html at all).
+// With no HTML part there can be no cid: reference, so the image is not a
+// protected InlineAsset and replaces normally.
+func TestProcess_CIDNoHTMLPart_Replaced(t *testing.T) {
+	png := pngPayload(t, 64)
+	msg := "From: sender@example.com\r\n" +
+		"To: rcpt@example.com\r\n" +
+		"Subject: cid with no html part\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart/related; boundary=\"REL\"\r\n" +
+		"\r\n" +
+		"--REL\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"\r\n" +
+		"Plain body, cid:logo123 mentioned here does not count.\r\n" +
+		"--REL\r\n" +
+		"Content-Type: image/png\r\n" +
+		"Content-ID: <logo123>\r\n" +
+		"Content-Transfer-Encoding: base64\r\n" +
+		"\r\n" +
+		b64(png) + "\r\n" +
+		"--REL--\r\n"
+
+	h := newTestHarness(t)
+	proc := newProcessor(t, h, replaceAllPolicy, false)
+
+	verdict, err := proc.Process(context.Background(), envelopeFor(msg))
+	if err != nil {
+		t.Fatalf("Process() error = %v, want nil", err)
+	}
+	if verdict.Action != pipeline.VerdictRewrite {
+		t.Fatalf("verdict.Action = %v, want VerdictRewrite (no HTML part => no cid reference => replace)", verdict.Action)
+	}
+
+	rewritten, err := io.ReadAll(verdict.NewBody)
+	if err != nil {
+		t.Fatalf("read rewritten body: %v", err)
+	}
+	if strings.Contains(string(rewritten), b64(png)) {
+		t.Error("rewritten body still contains the PNG payload, want it replaced (a cid: token in a text/plain body must not grant protection)")
+	}
+	if lists := inlineProtectedPartPaths(t, collectEvents(t, h)); len(lists) != 0 {
+		t.Errorf("inline_protected lists = %v, want none", lists)
+	}
+}
+
+// TestProcess_InlineCIDUnquotedAndSingleQuoted_Protected is Fixture 18:
+// cid: references written unquoted and single-quoted (rather than the
+// canonical double-quoted src="cid:...") must still be recognized. Two
+// images, each referenced with a different quoting style, both protected.
+func TestProcess_InlineCIDUnquotedAndSingleQuoted_Protected(t *testing.T) {
+	pngA := pngPayload(t, 64)
+	pngB := pngPayload(t, 65)
+	msg := "From: sender@example.com\r\n" +
+		"To: rcpt@example.com\r\n" +
+		"Subject: unquoted and single-quoted cid\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart/related; boundary=\"REL\"\r\n" +
+		"\r\n" +
+		"--REL\r\n" +
+		"Content-Type: text/html; charset=utf-8\r\n" +
+		"\r\n" +
+		"<html><body><img src=cid:imgA><img src='cid:imgB'></body></html>\r\n" +
+		"--REL\r\n" +
+		"Content-Type: image/png\r\n" +
+		"Content-ID: <imgA>\r\n" +
+		"Content-Transfer-Encoding: base64\r\n" +
+		"\r\n" +
+		b64(pngA) + "\r\n" +
+		"--REL\r\n" +
+		"Content-Type: image/png\r\n" +
+		"Content-ID: <imgB>\r\n" +
+		"Content-Transfer-Encoding: base64\r\n" +
+		"\r\n" +
+		b64(pngB) + "\r\n" +
+		"--REL--\r\n"
+
+	h := newTestHarness(t)
+	proc := newProcessor(t, h, replaceAllPolicy, false)
+
+	verdict, err := proc.Process(context.Background(), envelopeFor(msg))
+	if err != nil {
+		t.Fatalf("Process() error = %v, want nil", err)
+	}
+	if verdict.Action != pipeline.VerdictAccept {
+		t.Fatalf("verdict.Action = %v, want VerdictAccept (both images protected, HTML downgraded)", verdict.Action)
+	}
+
+	got := collectEvents(t, h)
+	if counts := countByType(got); counts[audit.TypeAttachmentStored] != 0 {
+		t.Errorf("TypeAttachmentStored count = %d, want 0 (both referenced images protected)", counts[audit.TypeAttachmentStored])
+	}
+	protectedLists := inlineProtectedPartPaths(t, got)
+	if len(protectedLists) != 1 || len(protectedLists[0]) != 2 {
+		t.Fatalf("inline_protected lists = %v, want exactly one event with exactly two protected part paths", protectedLists)
+	}
+}
+
+// TestProcess_MultipleHTMLParts_ReferencedProtected_UnreferencedReplaced
+// is Fixture 19: a multipart/related whose root is a
+// multipart/alternative (text/plain + text/html, the common Outlook
+// shape — the HTML is a GRANDCHILD of the related container, not a direct
+// sibling) plus two images. The alternative's HTML references only imgA;
+// imgA is protected, imgB (never referenced) is replaced. This exercises
+// both container scoping across the alternative nesting and the
+// per-asset referenced/unreferenced split.
+func TestProcess_MultipleHTMLParts_ReferencedProtected_UnreferencedReplaced(t *testing.T) {
+	imgA := pngPayload(t, 64)
+	imgB := pngPayload(t, 65)
+	msg := "From: sender@example.com\r\n" +
+		"To: rcpt@example.com\r\n" +
+		"Subject: alternative root plus two inline images\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart/related; boundary=\"REL\"\r\n" +
+		"\r\n" +
+		"--REL\r\n" +
+		"Content-Type: multipart/alternative; boundary=\"ALT\"\r\n" +
+		"\r\n" +
+		"--ALT\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"\r\n" +
+		"See the logo.\r\n" +
+		"--ALT\r\n" +
+		"Content-Type: text/html; charset=utf-8\r\n" +
+		"\r\n" +
+		"<html><body><img src=\"cid:imgA\"></body></html>\r\n" +
+		"--ALT--\r\n" +
+		"--REL\r\n" +
+		"Content-Type: image/png\r\n" +
+		"Content-ID: <imgA>\r\n" +
+		"Content-Transfer-Encoding: base64\r\n" +
+		"\r\n" +
+		b64(imgA) + "\r\n" +
+		"--REL\r\n" +
+		"Content-Type: image/png\r\n" +
+		"Content-ID: <imgB>\r\n" +
+		"Content-Transfer-Encoding: base64\r\n" +
+		"\r\n" +
+		b64(imgB) + "\r\n" +
+		"--REL--\r\n"
+
+	h := newTestHarness(t)
+	proc := newProcessor(t, h, replaceAllPolicy, false)
+
+	verdict, err := proc.Process(context.Background(), envelopeFor(msg))
+	if err != nil {
+		t.Fatalf("Process() error = %v, want nil", err)
+	}
+	if verdict.Action != pipeline.VerdictRewrite {
+		t.Fatalf("verdict.Action = %v, want VerdictRewrite (imgB is unreferenced and must replace)", verdict.Action)
+	}
+
+	rewritten, err := io.ReadAll(verdict.NewBody)
+	if err != nil {
+		t.Fatalf("read rewritten body: %v", err)
+	}
+	body := string(rewritten)
+	if !strings.Contains(body, b64(imgA)) {
+		t.Error("rewritten body lost imgA, want it preserved (referenced from the alternative's HTML)")
+	}
+	if strings.Contains(body, b64(imgB)) {
+		t.Error("rewritten body still contains imgB, want it replaced (never referenced)")
+	}
+
+	got := collectEvents(t, h)
+	if counts := countByType(got); counts[audit.TypeAttachmentStored] != 1 {
+		t.Errorf("TypeAttachmentStored count = %d, want 1 (only the unreferenced imgB)", counts[audit.TypeAttachmentStored])
+	}
+	protectedLists := inlineProtectedPartPaths(t, got)
+	if len(protectedLists) != 1 || len(protectedLists[0]) != 1 {
+		t.Fatalf("inline_protected lists = %v, want exactly one event with exactly one protected part path (imgA only)", protectedLists)
+	}
+}
+
+// aggregateCIDTokenBudget mirrors pipeline's unexported
+// maxAggregateCIDTokens (internal/core/pipeline/cid.go) so this
+// external test can construct a single html part whose distinct cid:
+// token count exceeds the aggregate per-message budget without needing
+// to import an unexported constant across the package boundary. Keep
+// this in sync with cid.go's maxAggregateCIDTokens.
+const aggregateCIDTokenBudget = 65536
+
+// aggregateBudgetOverflowMessage builds a multipart/mixed with two
+// multipart/related groups: the first's html body alone carries
+// tokenCount distinct cid: tokens (including cid:logoA, so its own
+// asset IS present among them) — enough to exceed the aggregate
+// per-message cid: token budget (ATR-307 security review, B1) — and the
+// second is a normal, tiny, cheap-to-scan html+png pair (cid:logoB).
+func aggregateBudgetOverflowMessage(tokenCount int, pngA, pngB []byte) string {
+	var htmlA strings.Builder
+	for i := 0; i < tokenCount; i++ {
+		htmlA.WriteString("cid:")
+		htmlA.WriteString(strconv.Itoa(i))
+		htmlA.WriteByte(' ')
+	}
+	htmlA.WriteString("cid:logoA")
+
+	return "From: sender@example.com\r\n" +
+		"To: rcpt@example.com\r\n" +
+		"Subject: aggregate cid token budget overflow\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart/mixed; boundary=\"MIXED\"\r\n" +
+		"\r\n" +
+		"--MIXED\r\n" +
+		"Content-Type: multipart/related; boundary=\"REL1\"\r\n" +
+		"\r\n" +
+		"--REL1\r\n" +
+		"Content-Type: text/html; charset=utf-8\r\n" +
+		"\r\n" +
+		htmlA.String() + "\r\n" +
+		"--REL1\r\n" +
+		"Content-Type: image/png\r\n" +
+		"Content-ID: <logoA>\r\n" +
+		"Content-Transfer-Encoding: base64\r\n" +
+		"\r\n" +
+		b64(pngA) + "\r\n" +
+		"--REL1--\r\n" +
+		"--MIXED\r\n" +
+		"Content-Type: multipart/related; boundary=\"REL2\"\r\n" +
+		"\r\n" +
+		"--REL2\r\n" +
+		"Content-Type: text/html; charset=utf-8\r\n" +
+		"\r\n" +
+		"<html><body><img src=\"cid:logoB\"></body></html>\r\n" +
+		"--REL2\r\n" +
+		"Content-Type: image/png\r\n" +
+		"Content-ID: <logoB>\r\n" +
+		"Content-Transfer-Encoding: base64\r\n" +
+		"\r\n" +
+		b64(pngB) + "\r\n" +
+		"--REL2--\r\n" +
+		"--MIXED--\r\n"
+}
+
+// TestProcess_AggregateTokenBudgetExhausted_SubsequentContainerFailSafe
+// is Fixture 20 (ATR-307 security review, B1 blocker): the first
+// multipart/related group's html body alone carries more distinct
+// cid: tokens than the aggregate per-message token budget
+// (maxAggregateCIDTokens); collectHTMLCIDRefs discards ALL of that
+// part's tokens (never partially retains them) and marks it truncated,
+// so even that container's OWN asset (logoA, which really is among the
+// tokens) ends up fail-safe-protected-but-unverified rather than
+// confidently verified. A second, unrelated, cheap-to-scan group
+// (html+png logoB) is then left completely unscanned once the aggregate
+// token budget is spent (the top-of-loop budget check in
+// collectHTMLCIDRefs, not just the per-part byte cap). Both assets end
+// up protected (fail-safe direction — never break a message), and both
+// are honestly reported "inline_protected_unverified" in the audit
+// trail rather than silently mis-classified as confidently verified.
+func TestProcess_AggregateTokenBudgetExhausted_SubsequentContainerFailSafe(t *testing.T) {
+	pngA := pngPayload(t, 64)
+	pngB := pngPayload(t, 65)
+	msg := aggregateBudgetOverflowMessage(aggregateCIDTokenBudget+4000, pngA, pngB)
+
+	h := newTestHarness(t)
+	proc := newProcessor(t, h, replaceAllPolicy, false)
+
+	verdict, err := proc.Process(context.Background(), envelopeFor(msg))
+	if err != nil {
+		t.Fatalf("Process() error = %v, want nil", err)
+	}
+	if verdict.Action != pipeline.VerdictAccept {
+		t.Fatalf("verdict.Action = %v, want VerdictAccept (both pngs fail-safe protected, both html bodies downgraded)", verdict.Action)
+	}
+
+	got := collectEvents(t, h)
+	counts := countByType(got)
+	if counts[audit.TypeAttachmentStored] != 0 {
+		t.Errorf("TypeAttachmentStored count = %d, want 0 (both pngs protected, fail-safe direction)", counts[audit.TypeAttachmentStored])
+	}
+
+	protectedLists := inlineProtectedPartPaths(t, got)
+	if len(protectedLists) != 1 || len(protectedLists[0]) != 2 {
+		t.Fatalf("inline_protected lists = %v, want exactly one event with exactly two protected part paths (logoA and logoB)", protectedLists)
+	}
+
+	unverifiedLists := protectedPartPaths(t, got, "inline_protected_unverified")
+	if len(unverifiedLists) != 1 || len(unverifiedLists[0]) != 2 {
+		t.Fatalf("inline_protected_unverified lists = %v, want exactly one event with exactly two unverified part paths (both containers affected by the exhausted aggregate token budget)", unverifiedLists)
+	}
+}
+
+// TestProcess_NoInlineCandidate_CIDScanSkipped is Fixture 21 (ATR-307
+// security review, B2 companion): an ordinary message with a structural
+// text/html body only — no Content-ID part anywhere, hence no
+// InlineAsset candidate at all — must never pay for a cid: scan.
+// Process's hasInlineCandidate gate is asserted directly via its
+// Debug-level "skipped" log line (the html body's own spool is
+// internal to Process, so instrumenting it directly is not an option
+// from this external test package; the log line is the intended,
+// documented observability seam for this gate — see the Process doc
+// comment at the hasInlineCandidate call site).
+func TestProcess_NoInlineCandidate_CIDScanSkipped(t *testing.T) {
+	msg := "From: sender@example.com\r\n" +
+		"To: rcpt@example.com\r\n" +
+		"Subject: ordinary html body, no inline assets\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: text/html; charset=utf-8\r\n" +
+		"\r\n" +
+		"<html><body>Just a plain message, no images at all.</body></html>\r\n"
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	h := newTestHarness(t)
+	proc := newProcessorWithLogger(t, h, replaceAllPolicy, logger)
+
+	verdict, err := proc.Process(context.Background(), envelopeFor(msg))
+	if err != nil {
+		t.Fatalf("Process() error = %v, want nil", err)
+	}
+	// The lone text/html part is a structural body (protectStructuralBodies),
+	// so nothing is ever left to replace.
+	if verdict.Action != pipeline.VerdictAccept {
+		t.Fatalf("verdict.Action = %v, want VerdictAccept", verdict.Action)
+	}
+
+	if !strings.Contains(logBuf.String(), "cid scan: skipped") {
+		t.Errorf("log output = %q, want the B2 gate's skipped line (no InlineAsset candidate in this message)", logBuf.String())
+	}
+}
+
+// TestProcess_InlineCandidatePresent_CIDScanRuns is Fixture 22, the
+// negative companion to Fixture 21: a message that DOES contain an
+// InlineAsset candidate must NOT hit the B2 skip branch — the gate must
+// not over-trigger and accidentally skip a message that actually needs
+// verification.
+func TestProcess_InlineCandidatePresent_CIDScanRuns(t *testing.T) {
+	png := pngPayload(t, 64)
+	msg := "From: sender@example.com\r\n" +
+		"To: rcpt@example.com\r\n" +
+		"Subject: inline candidate present\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart/related; boundary=\"REL\"\r\n" +
+		"\r\n" +
+		"--REL\r\n" +
+		"Content-Type: text/html; charset=utf-8\r\n" +
+		"\r\n" +
+		"<html><body><img src=\"cid:logo123\"></body></html>\r\n" +
+		"--REL\r\n" +
+		"Content-Type: image/png\r\n" +
+		"Content-ID: <logo123>\r\n" +
+		"Content-Transfer-Encoding: base64\r\n" +
+		"\r\n" +
+		b64(png) + "\r\n" +
+		"--REL--\r\n"
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	h := newTestHarness(t)
+	proc := newProcessorWithLogger(t, h, replaceAllPolicy, logger)
+
+	verdict, err := proc.Process(context.Background(), envelopeFor(msg))
+	if err != nil {
+		t.Fatalf("Process() error = %v, want nil", err)
+	}
+	if verdict.Action != pipeline.VerdictAccept {
+		t.Fatalf("verdict.Action = %v, want VerdictAccept (referenced logo protected, html body downgraded)", verdict.Action)
+	}
+
+	if strings.Contains(logBuf.String(), "cid scan: skipped") {
+		t.Errorf("log output = %q, want no skipped line (this message has an InlineAsset candidate)", logBuf.String())
+	}
+
+	got := collectEvents(t, h)
+	if lists := inlineProtectedPartPaths(t, got); len(lists) != 1 || len(lists[0]) != 1 {
+		t.Errorf("inline_protected lists = %v, want exactly one event with exactly one protected part path", lists)
 	}
 }

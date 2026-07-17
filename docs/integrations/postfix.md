@@ -98,6 +98,100 @@ Keep Postfix's timeouts comfortably larger than
 own timeout fires first and produces a deliberate fail-open/fail-closed
 response, rather than Postfix unilaterally giving up first.
 
+## Archiving/journaling milter order
+
+If your environment also runs a compliance/journaling archiver (a
+separate milter, e.g. MailArchiva in its milter mode, or an
+`always_bcc`-style BCC copy), where you put it relative to Attachra in
+`smtpd_milters` decides **which version of the message it sees**:
+the original with the attachment still attached, or Attachra's
+rewritten version (attachment stripped, replacement block + download
+link inserted).
+
+Postfix invokes milters in `smtpd_milters` strictly in list order —
+each milter sees whatever the previous ones already changed. There is
+only one queue file per message, so an `always_bcc`/`sender_bcc_maps`/
+`recipient_bcc_maps` copy always reflects the state *after every
+milter in the chain has run*, regardless of where Attachra sits; to
+capture the message *before* Attachra rewrites it, the archiver must
+be a milter of its own, positioned earlier in the list.
+
+### Scenario A: archive before Attachra (archiver sees the original)
+
+```
+# main.cf
+smtpd_milters = inet:127.0.0.1:8092, inet:127.0.0.1:6785
+non_smtpd_milters = inet:127.0.0.1:8092, inet:127.0.0.1:6785
+```
+
+(`inet:127.0.0.1:8092` stands in for the archiving milter; adjust to
+its actual listen address.) The archive gets a complete, self-contained
+copy of the message with the attachment still present — it does not
+depend on Attachra's storage, retention, or revoke state staying
+available for as long as the archive is required to exist. The
+trade-off is storage: the attachment is now duplicated between the
+archive and Attachra's own storage, which is exactly the "attachments
+everywhere" problem Attachra otherwise avoids.
+
+### Scenario B: archive after Attachra (archiver sees the rewritten message)
+
+```
+# main.cf
+smtpd_milters = inet:127.0.0.1:6785, inet:127.0.0.1:8092
+non_smtpd_milters = inet:127.0.0.1:6785, inet:127.0.0.1:8092
+```
+
+Equivalently, a plain `always_bcc`/`*_bcc_maps` archiver (no milter of
+its own) always lands in this scenario, because it only ever sees the
+final queue file. The archive gets the replacement block and a link,
+not the file. This avoids duplicating storage, but makes the archive's
+completeness depend on Attachra's `storage.retention` policy covering
+the same (or longer) retention window the archive is legally required
+to meet, and requires that legal-hold-flagged messages have revoke
+blocked by policy — otherwise the archived "record" can outlive the
+file it points to.
+
+### Recommendation
+
+- **Environments with a WORM/immutable-archive or long-term
+  recordkeeping obligation** of their own: use **Scenario A**. This is the only option where the
+  archive's completeness does not depend on Attachra staying up,
+  correctly configured, and un-revoked for the archive's entire
+  retention window.
+- **Everything else** (the common self-hosted case, no archiver-specific
+  recordkeeping obligation): Scenario B is the reasonable default —
+  it keeps Attachra's "don't duplicate attachments" value proposition
+  intact — provided retention/legal-hold is configured per the note
+  above.
+- This is entirely an operator-side `smtpd_milters` decision — Attachra
+  has no visibility into whether an archiving milter exists or where it
+  sits in the chain, and cannot enforce either scenario. Whether your
+  archive needs to be self-contained (Scenario A) or can safely point
+  at Attachra's storage (Scenario B) usually comes down to a retention
+  or recordkeeping obligation specific to your organization/industry —
+  this document only covers the Postfix mechanics, not what any given
+  obligation requires; check with your own compliance/legal function for
+  that determination.
+
+This is a separate concern from [DKIM signing order](dkim.md) (which
+has one non-negotiable rule: Attachra before the signer, always) and
+from the [grommunio pilot's rspamd-then-Attachra
+order](../deploy/grommunio-debian.md#how-mail-flows-on-grommunio) (a
+spam/AV milter ordering decision, unrelated to archiving). rspamd (or
+whichever milter does spam/AV scanning) must still run before Attachra
+regardless of archiving order: Attachra uploads attachments to storage
+and hands out a public `/p/` download link, so scanning has to happen
+first — running rspamd after Attachra would mean an infected or
+spam-flagged attachment already left the mail system before it was
+scanned. A given `smtpd_milters` list typically has to satisfy all
+three orderings at once — e.g. `archiver, rspamd, attachra, opendkim`
+for Scenario A on a DKIM-signing host that also runs rspamd. In that
+combined example rspamd's `dkim_signing` module must be **disabled**
+(`enabled = false` in `local.d/dkim_signing.conf`) — opendkim is the
+signer and runs after Attachra; leaving `dkim_signing` enabled makes
+rspamd sign before Attachra rewrites the body, which breaks the
+signature. See [DKIM signing order](dkim.md).
+
 ## Verifying the integration
 
 1. Confirm Postfix can reach Attachra's listen address:

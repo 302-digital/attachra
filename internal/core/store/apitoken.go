@@ -60,7 +60,7 @@ func ParseRole(s string) (Role, error) {
 
 // APIToken is a single issued API credential (US-8.1/T-8.1.7, ATR-201).
 // TokenHash is the SHA-256 hash of the bearer secret; the raw secret is
-// never persisted (CLAUDE.md invariant #5, SR-130-2) — it is shown once
+// never persisted (the token-hygiene invariant, SR-130-2) — it is shown once
 // at creation time and cannot be recovered. RevokedAt is the zero
 // time.Time while the token is active; once set, the token can never
 // authenticate again (revocation is immediate, SR-130-2).
@@ -76,8 +76,8 @@ type APIToken struct {
 
 // NewAPITokenParams are the fields needed to create an APIToken row. The
 // caller supplies an already-computed TokenHash (via HashAPISecret),
-// never a raw secret: the raw secret never crosses this boundary
-// (CLAUDE.md invariant #5, mirroring NewLinkParams.TokenHash).
+// never a raw secret: the raw secret never crosses this boundary (the
+// token-hygiene invariant, mirroring NewLinkParams.TokenHash).
 type NewAPITokenParams struct {
 	ID        string
 	Name      string
@@ -111,7 +111,8 @@ type APITokenPage struct {
 //
 // All methods must be safe for concurrent use by multiple goroutines,
 // and no method ever receives or returns a raw bearer secret: only
-// pre-hashed TokenHash values cross this boundary (invariant #5).
+// pre-hashed TokenHash values cross this boundary (the token-hygiene
+// invariant).
 type APITokenStore interface {
 	// CreateAPIToken inserts a new, active (RevokedAt zero) APIToken row.
 	CreateAPIToken(ctx context.Context, p NewAPITokenParams) error
@@ -163,8 +164,8 @@ type APITokenStore interface {
 
 // MinAPISecretBytes is the minimum number of crypto/rand bytes an API
 // token secret is generated with: 32 bytes = 256 bits, the floor the
-// ATR-201 brief sets (well above CLAUDE.md invariant #5's 128-bit link-
-// token minimum, since an API token grants standing administrative
+// ATR-201 brief sets (well above the token-hygiene invariant's 128-bit
+// link-token minimum, since an API token grants standing administrative
 // access rather than a single one-shot download).
 const MinAPISecretBytes = 32
 
@@ -173,7 +174,7 @@ const MinAPISecretBytes = 32
 // together with its HashAPISecret hash. The raw secret is the only place
 // the credential ever exists in reversible form: the caller shows it to
 // the operator exactly once and persists only the returned hash
-// (CLAUDE.md invariant #5, SR-130-2). It is URL-safe base64 without
+// (the token-hygiene invariant, SR-130-2). It is URL-safe base64 without
 // padding so it travels cleanly in an Authorization header.
 func GenerateAPISecret(numBytes int) (secret, hash string, err error) {
 	if numBytes < MinAPISecretBytes {
@@ -209,7 +210,7 @@ func NewTokenID() (string, error) {
 
 // HashAPISecret returns the hex-encoded SHA-256 hash of secret, the only
 // form of an API token ever written to or compared against the store
-// (CLAUDE.md invariant #5, SR-130-2). A plain SHA-256 (rather than a
+// (the token-hygiene invariant, SR-130-2). A plain SHA-256 (rather than a
 // slow password KDF) is correct here because an API secret is a
 // full-entropy 256-bit random value, not a user-chosen password: there
 // is nothing to brute-force offline, so the cost of a KDF buys no

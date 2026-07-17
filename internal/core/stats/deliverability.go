@@ -13,7 +13,7 @@ import (
 // domainScanPageSize is the internal batch size ComputeDeliverability
 // requests from LinkSource.ListLinks while paging through a window's
 // links. It bounds this function's own memory use to one page of raw
-// Link rows at a time (CLAUDE.md invariant #4) — the per-domain
+// Link rows at a time (the streaming invariant) — the per-domain
 // running totals it accumulates across pages are bounded only by the
 // number of distinct recipient domains in the window (ATR-273:
 // "thousands of domains"), never by the number of links themselves. This is
@@ -86,7 +86,7 @@ type LinkSource interface {
 // statistics with a recipient-domain slice). It pages through src via
 // LinkSource.ListLinks internally (domainScanPageSize rows at a time),
 // so no more than one page of raw Link rows is held in memory at once
-// (CLAUDE.md invariant #4); the returned aggregate itself is bounded by
+// (the streaming invariant); the returned aggregate itself is bounded by
 // the number of distinct domains observed, not by the number of links.
 //
 // The result is sorted ascending by DownloadRate, ties broken by

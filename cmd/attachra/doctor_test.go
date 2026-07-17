@@ -222,7 +222,7 @@ default:
 //
 // Without this, any test asserting checkDirWritable's PASS path is at
 // the mercy of the uid the test binary itself runs as: CI's
-// build-test job runs `go test` as root inside the GitLab runner
+// build-test job runs `go test` as root inside the CI runner
 // container, so t.TempDir() is root-owned there, and the real
 // lookupOwnerUID's uid==0 branch (the DynamicUser root-owned-file
 // trap detector, see checkDirWritable) then WARNs exactly where a
@@ -316,28 +316,20 @@ func TestCheckDatabaseDir_UsesDirOfPath(t *testing.T) {
 	}
 }
 
-// TestCheckDatabaseDir_FailsWhileSqliteDoesNotAutoCreate pins today's
-// behavior for a missing database directory: FAIL, not WARN, because
-// internal/core/store/sqlite does not create its parent directory
-// (ATR-310, open as of this writing) the way the fs storage driver
-// creates storage.fs.base_dir (ATR-309). checkDatabaseDir's
-// autoCreated=false argument is exactly what makes this FAIL instead
-// of WARN.
-//
-// Whoever closes ATR-310 (making the sqlite store create its parent
-// directory) MUST flip checkDatabaseDir's autoCreated argument to true
-// in cmd/attachra/doctor.go in the same change, and update this test's
-// expectation to statusWarn (matching TestCheckStorageDir's/
-// TestCheckDirWritable_MissingAutoCreated_Warn's sibling behavior for
-// storage.fs.base_dir) - otherwise `attachra doctor` will keep FAILing
-// on a condition the service itself no longer treats as fatal. This
-// test exists specifically so that discrepancy cannot be missed.
-func TestCheckDatabaseDir_FailsWhileSqliteDoesNotAutoCreate(t *testing.T) {
+// TestCheckDatabaseDir_MissingDir_Warn pins today's behavior for a
+// missing database directory: WARN, not FAIL, because
+// internal/core/store/sqlite.Open creates its parent directory itself
+// (ATR-310) the way the fs storage driver creates storage.fs.base_dir
+// (ATR-309). checkDatabaseDir's autoCreated=true argument is exactly
+// what makes this WARN instead of FAIL - matching
+// TestCheckStorageDir's/TestCheckDirWritable_MissingAutoCreated_Warn's
+// sibling behavior for storage.fs.base_dir.
+func TestCheckDatabaseDir_MissingDir_Warn(t *testing.T) {
 	cfg := config.Default()
 	cfg.Database.Path = filepath.Join(t.TempDir(), "no-such-dir", "attachra.db")
 	results := checkDatabaseDir(cfg)
-	if len(results) != 1 || results[0].Status != statusFail {
-		t.Fatalf("results = %+v, want single FAIL (see this test's doc comment if ATR-310 has since been fixed)", results)
+	if len(results) != 1 || results[0].Status != statusWarn {
+		t.Fatalf("results = %+v, want single WARN", results)
 	}
 }
 
@@ -436,6 +428,60 @@ func TestCheckHTTPService_HealthyButNotReady_Warn(t *testing.T) {
 	ready := findResult(t, results, "readyz")
 	if ready.Status != statusWarn {
 		t.Errorf("readyz Status = %s, want WARN (detail=%s)", ready.Status, ready.Detail)
+	}
+}
+
+// TestCheckHTTPService_ReadyzTargetsAdminListen verifies /readyz is
+// probed against cfg.Admin.Listen, not cfg.HTTP.Listen (ATR-292: it
+// moved off the public download listener onto the admin one).
+func TestCheckHTTPService_ReadyzTargetsAdminListen(t *testing.T) {
+	cfg := config.Default()
+	cfg.HTTP.Listen = "127.0.0.1:18080"
+	cfg.Admin.Listen = "127.0.0.1:19090"
+	deps := noopDoctorDeps()
+
+	var readyzTarget string
+	deps.httpGet = func(_ context.Context, target string) (int, []byte, error) {
+		if strings.HasSuffix(target, "/healthz") {
+			return 200, []byte("ok"), nil
+		}
+		readyzTarget = target
+		return 200, []byte(`{"status":"ok","checks":[]}`), nil
+	}
+
+	checkHTTPService(context.Background(), cfg, deps)
+
+	want := "http://127.0.0.1:19090/readyz"
+	if readyzTarget != want {
+		t.Errorf("readyz target = %q, want %q (cfg.Admin.Listen, not cfg.HTTP.Listen)", readyzTarget, want)
+	}
+}
+
+// TestCheckHTTPService_ReadyzFallsBackToHTTPListenWhenAdminEmpty
+// verifies the ATR-292 opt-out: an empty cfg.Admin.Listen (the
+// explicit single-listener configuration) makes /readyz fall back onto
+// cfg.HTTP.Listen, matching where the running process actually serves
+// it in that mode.
+func TestCheckHTTPService_ReadyzFallsBackToHTTPListenWhenAdminEmpty(t *testing.T) {
+	cfg := config.Default()
+	cfg.HTTP.Listen = "127.0.0.1:18080"
+	cfg.Admin.Listen = ""
+	deps := noopDoctorDeps()
+
+	var readyzTarget string
+	deps.httpGet = func(_ context.Context, target string) (int, []byte, error) {
+		if strings.HasSuffix(target, "/healthz") {
+			return 200, []byte("ok"), nil
+		}
+		readyzTarget = target
+		return 200, []byte(`{"status":"ok","checks":[]}`), nil
+	}
+
+	checkHTTPService(context.Background(), cfg, deps)
+
+	want := "http://127.0.0.1:18080/readyz"
+	if readyzTarget != want {
+		t.Errorf("readyz target = %q, want %q (Admin.Listen empty falls back to HTTP.Listen)", readyzTarget, want)
 	}
 }
 

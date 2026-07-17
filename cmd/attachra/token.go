@@ -48,7 +48,7 @@ func runTokenCommand(args []string, tokens store.APITokenStore, sink audit.Audit
 // <role> --actor <actor>`: it mints a new API token directly against the
 // metadata store (no running server required) and prints the raw secret
 // to stdout exactly once. The secret is never persisted (only its hash
-// is — CLAUDE.md invariant #5, SR-130-2), so this single line of output
+// is — the token-hygiene invariant (SR-130-2), so this single line of output
 // is the operator's only chance to capture it.
 func runTokenCreate(args []string, tokens store.APITokenStore, sink audit.AuditSink, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("attachra token create", flag.ContinueOnError)
@@ -99,10 +99,11 @@ func runTokenCreate(args []string, tokens store.APITokenStore, sink audit.AuditS
 		return tokenError
 	}
 
-	// Recording is best-effort (CLAUDE.md invariant #3's spirit applied
-	// here too): the token is already minted and usable at this point, so
-	// a sink outage must not turn a successful bootstrap into an error
-	// exit code. Failure is only surfaced on stderr, mirroring how the
+	// Recording is best-effort (the mail-must-never-be-lost invariant's
+	// spirit applied here too): the token is already minted and usable
+	// at this point, so a sink outage must not turn a successful
+	// bootstrap into an error exit code. Failure is only surfaced on
+	// stderr, mirroring how the
 	// REST API's own create/revoke handlers log rather than fail the
 	// response (ATR-296, SR-128-2).
 	if sink == nil {

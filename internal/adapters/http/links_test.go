@@ -163,7 +163,7 @@ func TestLinksRoleEnforcement(t *testing.T) {
 }
 
 // TestLinksGetByID covers GET /links/{linkId}: a successful response
-// never carries a token_hash field (CLAUDE.md invariant #5), and an
+// never carries a token_hash field (the token-hygiene invariant), and an
 // unknown ID is 404.
 func TestLinksGetByID(t *testing.T) {
 	ts, st, _ := newAPITestServer(t)
@@ -180,7 +180,7 @@ func TestLinksGetByID(t *testing.T) {
 		t.Fatalf("read GET link body: %v", err)
 	}
 	if strings.Contains(string(bodyBytes), "token_hash") {
-		t.Errorf("GET link body contains token_hash, want it omitted entirely (CLAUDE.md invariant #5): %s", bodyBytes)
+		t.Errorf("GET link body contains token_hash, want it omitted entirely (the token-hygiene invariant): %s", bodyBytes)
 	}
 	var got linkWireDTO
 	if err := json.Unmarshal(bodyBytes, &got); err != nil {

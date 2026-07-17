@@ -16,7 +16,7 @@ import (
 // identifier that is never exposed outside the storage driver boundary
 // (SR-121-3) — mirroring linkDTO's own "deliberately excludes
 // token_hash" precedent for the equivalent invariant on links
-// (CLAUDE.md invariant #5). RetainUntil is a pointer so a legacy
+// (the token-hygiene invariant). RetainUntil is a pointer so a legacy
 // pre-ATR-178 row (the zero-time sentinel, store.Attachment.RetainUntil's
 // own doc comment) renders as JSON null rather than the zero time.
 type attachmentDTO struct {

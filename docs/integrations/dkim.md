@@ -22,6 +22,88 @@ antivirus, disclaimers/footers) — they must all run before the
 DKIM-signing milter. Attachra should be ordered alongside those, not
 after.
 
+## Verified live (T-3.2.4 spike, 2026-07-16)
+
+The rule above was originally written from Postfix/DKIM protocol
+documentation only (T-3.2.4), not exercised against a running
+mail path. The spike built a disposable Postfix + Attachra +
+rspamd/opendkim compose stack (not `deploy/dev/docker-compose.yml` —
+a separate throwaway stack, torn down after the spike) and drove real
+messages with an attachment through all four milter orderings below,
+verifying each resulting message's DKIM signature independently with
+`dkimpy` (a fake `dnsfunc` returned the spike's own test public key,
+so verification did not depend on real DNS).
+
+| # | Milter order (`smtpd_milters`) | Body actually rewritten? | DKIM result | How checked |
+|---|---|---|---|---|
+| A | `attachra, rspamd` (rspamd `dkim_signing`) | yes | **Valid** | live |
+| B | `rspamd, attachra` (rspamd `dkim_signing`) | yes | **Invalid** — `body hash mismatch` | live |
+| C | `attachra, opendkim` | yes | **Valid** | live |
+| D | `opendkim, attachra` | yes | **Invalid** — `body hash mismatch` | live |
+
+Orders A/C are the "Attachra before the signer" rule from this doc;
+B/D are the reverse. In every rewritten-body case, `dkimpy`'s
+`verify()` either returned `True` (A, C) or raised
+`ValidationError: body hash mismatch` with the expected vs. computed
+hash shown (B, D) — an unambiguous, reproducible confirmation of the
+rule, not a plausibility argument. The underlying Postfix mechanism
+this demonstrates — each milter's `eom` callback runs in
+`smtpd_milters` order and sees the **cumulative** effect of every
+milter that ran before it, including body/header rewrites — is
+generic to Postfix's milter protocol, not specific to rspamd or
+opendkim; having reproduced it with two independent signers (a
+built-in rspamd module and a standalone opendkim milter) rules out an
+implementation quirk of either one.
+
+**This directly implicates the mxbox pilot's documented milter order.**
+`docs/deploy/grommunio-debian.md` currently instructs operators to run
+`smtpd_milters = inet:localhost:11332, inet:127.0.0.1:6785` — **rspamd
+first, Attachra second** — matching failing order B above. On a host
+where rspamd's `dkim_signing` module is active, any outbound message
+that Attachra actually rewrites (attachment replaced with a link) will
+carry a **DKIM signature that fails verification** at the receiving
+end. See the warning in that guide and the tracked follow-up to audit/fix
+the live mxbox milter order) for the operational remediation; this
+document only fixes the guidance, not necessarily every already-
+running deployment.
+
+### A genuine ordering conflict: spam/AV scanning vs. DKIM signing
+
+`docs/deploy/grommunio-debian.md`'s current order was not arbitrary —
+it puts rspamd first so its spam/AV verdict (and reject decision) is
+settled, and so rspamd's antivirus integration sees the **original**
+attachment bytes, before Attachra uploads and removes them. That is a
+reasonable goal on its own, but a single rspamd milter instance does
+both spam/AV scoring **and** DKIM signing in the same `eom` callback —
+so with only one rspamd milter in the chain, "scan before Attachra"
+and "sign after Attachra" are mutually exclusive; simply moving
+Attachra ahead of rspamd (fixing DKIM) means rspamd's AV/attachment
+scanning now only ever sees Attachra's replacement-block text, never
+the original attachment bytes.
+
+There is no reordering of a *two*-milter chain that satisfies both
+goals. The standard resolution is to split the two rspamd
+responsibilities across the chain instead of reordering as a pair:
+
+1. Keep rspamd first for spam/AV scoring and reject/quarantine
+   decisions, but **disable its `dkim_signing` module**
+   (`sign_authenticated`/`sign_local`/`sign_networks` all `false`, or
+   remove the module's `domain { ... }` config) so it never signs.
+2. Run Attachra second, as usual.
+3. Add a **dedicated signer** last in the chain — either a standalone
+   `opendkim` instance (as verified live above) or a second rspamd
+   `rspamd_proxy` worker configured only for `dkim_signing` — so
+   signing happens strictly after Attachra's rewrite.
+
+This is the same three-stage shape already documented below (Attachra,
+then rspamd for spam scoring, then `opendkim` last); it was already
+correct guidance for the general case, it just wasn't cross-referenced
+from the grommunio guide's two-milter default. Operators who don't run
+outbound DKIM signing at all (mail relayed through an upstream
+smarthost that signs, or DKIM not in use) are unaffected by any of
+this — the conflict only exists when the same host does both
+attachment rewriting and DKIM signing.
+
 ## Postfix milter order
 
 Postfix invokes the milters listed in `smtpd_milters` /
@@ -95,10 +177,16 @@ checker) after configuring milter order:
 
 ## Summary
 
-| Milter order | DKIM result |
-|---|---|
-| Attachra → DKIM signer | Correct: signature covers final body |
-| DKIM signer → Attachra | Broken: signature covers a body that no longer exists |
+| Milter order | DKIM result | Live-verified (2026-07-16) |
+|---|---|---|
+| Attachra → rspamd (`dkim_signing`) | Correct: signature covers final body | yes |
+| rspamd (`dkim_signing`) → Attachra | Broken: signature covers a body that no longer exists | yes |
+| Attachra → opendkim | Correct: signature covers final body | yes |
+| opendkim → Attachra | Broken: signature covers a body that no longer exists | yes |
 
 Configure `smtpd_milters` (and `non_smtpd_milters`, if used) with
-Attachra listed before the milter that performs DKIM signing.
+Attachra listed before the milter that performs DKIM signing. If the
+same signer (e.g. rspamd) also does spam/AV scoring you want to run
+*before* Attachra, see "A genuine ordering conflict" above — split
+scoring and signing across two chain positions rather than reordering
+the pair.

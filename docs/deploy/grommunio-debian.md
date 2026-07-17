@@ -233,8 +233,25 @@ Quick health check while it's running:
 
 ```sh
 curl -s http://127.0.0.1:18080/healthz   # liveness — always 200 once the process is up
-curl -s http://127.0.0.1:18080/readyz    # readiness — checks DB/storage/policy
+curl -s http://127.0.0.1:18090/readyz    # readiness — checks DB/storage/policy (admin listener)
 ```
+
+`/readyz` moved off the `http.listen` port (`18080`) onto a separate
+admin listener (`admin.listen`, default `127.0.0.1:18090`) so it never
+shares a listener with anything that could end up internet-facing
+(`/p/`) — its response body names which dependency is failing, which is
+internal topology, not something to put on a public port. `/healthz`
+stays on `18080`: it is a static "ok" with no dependency detail, so
+there is nothing to protect there, and existing health-check tooling
+(this guide, `attachra doctor`, container/orchestrator probes) already
+targets that port for it. `attachra doctor` checks both `/healthz` and
+`/readyz` on their respective listeners automatically — see
+`admin.listen` in `attachra.yaml` (`man attachra.yaml`) if you need to
+change the admin address, e.g. because `18090` is already in use on
+your host. (The default is deliberately not `9090` — that is
+Prometheus's own default listen port, the most likely co-located
+neighbor, and binding it here would risk colliding with a local
+Prometheus server.)
 
 ## 4. Publish the download page through nginx
 
@@ -257,12 +274,16 @@ grommunio's. If a future grommunio release moves this include
 directory, `nginx -T | grep locations.d` shows you where it's actually
 being pulled in from on your host.
 
-**Do not** publish `/api/v1` or `/metrics` through this or any other
-public-facing proxy — both are meant to stay reachable only on
-`127.0.0.1:18080` directly. `/api/v1` is Bearer-token authenticated but
-still not something to expose publicly without a specific reason;
-`/metrics` has no authentication at all (by design, for a local
-Prometheus scraper) and must never be internet-facing.
+**Do not** publish `/api/v1` through this or any other public-facing
+proxy — it is meant to stay reachable only on `127.0.0.1:18080` directly.
+It is Bearer-token authenticated but still not something to expose
+publicly without a specific reason. `/metrics` and the
+dependency-detailed `/readyz` are not even reachable on
+`18080` by default — they live on the separate admin listener
+(`admin.listen`, default `127.0.0.1:18090`, no authentication at all by
+design, for a local Prometheus scraper) — so there is nothing to
+accidentally publish for them here either; do not add a location block
+for that address regardless.
 
 ### Trusting nginx's forwarded-IP headers
 
@@ -331,6 +352,26 @@ sudo postconf -e 'smtpd_milters = inet:localhost:11332, inet:127.0.0.1:6785'
 sudo postconf -e 'non_smtpd_milters = inet:localhost:11332, inet:127.0.0.1:6785'
 sudo systemctl reload postfix
 ```
+
+> **Warning — breaks DKIM if rspamd signs outbound mail.** This order
+> (rspamd, then Attachra) was live-tested against DKIM (T-3.2.4 spike): if
+> rspamd's `dkim_signing` module is active on this host, every outbound
+> message Attachra actually rewrites (attachment replaced with a link)
+> will carry a **DKIM signature that fails verification** at the
+> receiving end — rspamd signs the body *before* Attachra changes it.
+> See `docs/integrations/dkim.md` for the live-verified matrix and the
+> reason a straight reorder isn't enough here (rspamd does spam/AV
+> scoring and DKIM signing in the same pass, so this two-milter chain
+> can't get both "scan before Attachra" and "sign after Attachra" at
+> once). If this host signs outbound DKIM through rspamd, either
+> disable `dkim_signing` in rspamd and add a dedicated signer (e.g.
+> `opendkim`) **after** Attachra in the chain, or accept that rspamd's
+> AV/attachment scanning will only see Attachra's replacement text
+> (reorder to `inet:127.0.0.1:6785, inet:localhost:11332` instead).
+> Verify with a real DKIM/DMARC checker (see
+> `docs/integrations/dkim.md`'s "Verifying the fix in practice") after
+> whichever change you make — do not assume either default is correct
+> for your host's signing setup.
 
 `milter_default_action = accept` and `milter_protocol = 6` are already
 set correctly on a stock grommunio host (grommunio ships them for
@@ -532,9 +573,25 @@ file to confirm a directory is writable.
   chmod 0700 /var/lib/attachra/files
   systemctl restart attachra
   ```
+- **`journalctl -u attachra` repeatedly shows `SQLITE_CANTOPEN` and the
+  service crash-loops on a nested `database.path` (e.g.
+  `/var/lib/attachra/db/attachra.db`).** Same class of gap as the
+  `fs: base_dir` case above: `StateDirectory=attachra` only creates
+  `/var/lib/attachra` itself, not a subdirectory `database.path` points
+  at underneath it. The sqlite store now creates that directory itself
+  on start. If you still hit this, you're on an Attachra build older
+  than that fix — upgrade the package, or work around it in place
+  (matching `StateDirectory=attachra`'s own ownership, mode 0700):
+  ```sh
+  mkdir -p "$(dirname /var/lib/attachra/db/attachra.db)"
+  chown "$(stat -c '%u:%g' /var/lib/attachra)" "$(dirname /var/lib/attachra/db/attachra.db)"
+  chmod 0700 "$(dirname /var/lib/attachra/db/attachra.db)"
+  systemctl restart attachra
+  ```
 - **`GET /readyz` returns non-200.** It aggregates a database check
   and (if configured) a storage and policy check; the response body
-  names which one failed.
+  names which one failed. Query it on the admin listener
+  (`127.0.0.1:18090` by default, not `18080` — see step 3).
 - **Download link 404s.** Confirm the nginx include actually loaded
   (`nginx -T | grep -A3 'location /p/'`) and that `public_base_url` in
   `attachra.yaml` matches the hostname nginx is actually serving on.

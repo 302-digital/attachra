@@ -133,7 +133,7 @@ type Attachment struct {
 // (docs/architecture/package-page-decision.md §4.1 item 4): one row
 // per (message, attachment, recipient). TokenHash is the SHA-256 hash
 // of the bearer token handed to the recipient; the token itself is
-// never persisted (CLAUDE.md invariant #5, SR-124-2).
+// never persisted (the token-hygiene invariant, SR-124-2).
 //
 // Hold, HoldSetBy and HoldSetAt implement the legal-hold mechanism
 // required by docs/compliance/journaling-position.md §4: while Hold is

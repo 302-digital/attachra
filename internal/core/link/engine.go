@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/302-digital/attachra/internal/core/audit"
@@ -21,25 +24,50 @@ type Engine struct {
 	metadata store.MetadataStore
 	defaults Defaults
 	audit    audit.AuditSink
+	logger   *slog.Logger
+
+	// retentionClampWarned deduplicates the retention-clamp warning
+	// CreateLinks logs (ATR-294): keyed by retentionClampKey, so a
+	// permanently misconfigured policy or global config default — one
+	// whose rule/config combination clamps on every single matching
+	// message — logs the warning once per unique (ttl, requested
+	// retention) combination for this Engine's lifetime, not once per
+	// message. The zero value (an empty sync.Map) is ready to use, no
+	// initialization needed in NewEngine.
+	retentionClampWarned sync.Map
 
 	// now is overridable for deterministic tests; production code
 	// always uses the zero value, which falls back to time.Now.
 	now func() time.Time
 }
 
+// retentionClampKey identifies one distinct retention-clamp situation
+// for retentionClampWarned's dedup: the same (ttl, requestedRetention)
+// pair always produces the same clamp outcome regardless of which
+// message triggered it, so message_id is deliberately excluded from
+// the key — including it would defeat the dedup entirely, since every
+// message has a different ID.
+type retentionClampKey struct {
+	ttl                time.Duration
+	requestedRetention time.Duration
+}
+
 // NewEngine constructs an Engine backed by metadata, using d as the
 // fallback link parameters for any field a policy leaves unset
 // (T-6.1.2). It returns an error if d is invalid. sink receives an
 // audit.Event for every revoke this Engine performs (US-7.1, ATR-190);
-// a nil sink is treated as audit.NopSink{}.
-func NewEngine(metadata store.MetadataStore, d Defaults, sink audit.AuditSink) (*Engine, error) {
+// a nil sink is treated as audit.NopSink{}. logger receives structured
+// diagnostics, in particular the retention-clamp warning CreateLinks
+// emits (ATR-294); a nil logger discards them, mirroring
+// retention.Sweeper's own optional-logger contract.
+func NewEngine(metadata store.MetadataStore, d Defaults, sink audit.AuditSink, logger *slog.Logger) (*Engine, error) {
 	if err := d.Validate(); err != nil {
 		return nil, err
 	}
 	if sink == nil {
 		sink = audit.NopSink{}
 	}
-	return &Engine{metadata: metadata, defaults: d, audit: sink}, nil
+	return &Engine{metadata: metadata, defaults: d, audit: sink, logger: logger}, nil
 }
 
 func (e *Engine) clock() time.Time {
@@ -53,15 +81,26 @@ func (e *Engine) nowText() string {
 	return e.clock().UTC().Format(time.RFC3339Nano)
 }
 
+// log returns e.logger, falling back to a discarding logger so every
+// call site below can log unconditionally (matching
+// retention.Sweeper.log's identical nil-safety contract).
+func (e *Engine) log() *slog.Logger {
+	if e.logger != nil {
+		return e.logger
+	}
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
 // recordAudit appends ev via e.audit, logging failures nowhere itself
 // (Engine holds no logger) but never propagating them: a revoke that
 // already durably updated the store must still succeed even if the
-// audit trail could not be written (CLAUDE.md invariant #3's spirit
-// extended to the audit path — see recordAudit's counterparts in
-// pipeline and internal/adapters/http for the same contract). Callers
-// that need failure visibility should inspect the returned error from
-// a wrapping AuditSink implementation if they require it; Engine's own
-// callers (Revoke/RevokeMessage/RevokeSender) intentionally do not.
+// audit trail could not be written (the mail-must-never-be-lost
+// invariant's spirit extended to the audit path — see recordAudit's
+// counterparts in pipeline and internal/adapters/http for the same
+// contract). Callers that need failure visibility should inspect the
+// returned error from a wrapping AuditSink implementation if they
+// require it; Engine's own callers (Revoke/RevokeMessage/RevokeSender)
+// intentionally do not.
 func (e *Engine) recordAudit(ctx context.Context, ev audit.Event) {
 	_, _ = e.audit.Record(ctx, ev) //nolint:errcheck // best-effort: a revoke must not fail because the audit sink is unavailable.
 }
@@ -96,8 +135,8 @@ type AttachmentInput struct {
 // CreatedLink is one freshly minted link, returned to the caller so it
 // can build the rewritten message body. Token is the raw bearer
 // secret — it exists only in this return value and the recipient's
-// copy embedded in the download URL; it is never persisted (CLAUDE.md
-// invariant #5).
+// copy embedded in the download URL; it is never persisted (the
+// token-hygiene invariant).
 type CreatedLink struct {
 	AttachmentID string
 	Recipient    string
@@ -134,8 +173,8 @@ type CreateLinksParams struct {
 // calls (store.MetadataStore does not expose cross-aggregate
 // transactions to core); on a partial failure it returns an error
 // wrapping the underlying cause and the caller must treat the message
-// as failed (fail-open/fail-closed per CLAUDE.md invariant #3 is
-// decided by the milter adapter, not here).
+// as failed (fail-open/fail-closed per the mail-must-never-be-lost
+// invariant is decided by the milter adapter, not here).
 func (e *Engine) CreateLinks(ctx context.Context, p CreateLinksParams) ([]CreatedLink, error) {
 	if len(p.Attachments) == 0 {
 		return nil, errors.New("link: create links: at least one attachment is required")
@@ -145,6 +184,37 @@ func (e *Engine) CreateLinks(ctx context.Context, p CreateLinksParams) ([]Create
 	}
 
 	resolved := resolveParams(p.Params, e.defaults)
+	if resolved.retentionClamped {
+		// A policy override or the configured global default asked for
+		// a shorter retention than ttl; resolveParams already raised it
+		// to match ttl (a link must never outlive the object it points
+		// to, T-5.3.1/ATR-178), but that raise is otherwise invisible —
+		// an auditor reading the matched policy's `retention:` value
+		// would see a shorter number than what storage actually keeps
+		// (ATR-294, data-minimization/GDPR art. 5(1)(e) relevance). This
+		// is the one place both possible sources of the clamp (an
+		// explicit policy `retention` shorter than `ttl`, or the
+		// configured global Defaults.Retention floor) are already
+		// resolved into concrete durations, so it is logged here rather
+		// than duplicated per source.
+		//
+		// A permanently misconfigured policy/config combination clamps
+		// on every single matching message, which would otherwise flood
+		// the log at production mail volume; retentionClampWarned
+		// deduplicates by (ttl, requestedRetention) so each distinct
+		// clamp situation is only ever logged once for this Engine's
+		// lifetime, while still recording the first offending
+		// message_id as a concrete example to investigate.
+		key := retentionClampKey{ttl: resolved.ttl, requestedRetention: resolved.requestedRetention}
+		if _, alreadyWarned := e.retentionClampWarned.LoadOrStore(key, struct{}{}); !alreadyWarned {
+			e.log().Warn("link: retention raised to match ttl (retention must never be shorter than ttl)",
+				"message_id", p.Message.ID,
+				"requested_retention", resolved.requestedRetention.String(),
+				"effective_retention", resolved.retention.String(),
+				"ttl", resolved.ttl.String(),
+			)
+		}
+	}
 	expiresAt := e.clock().Add(resolved.ttl).UTC()
 	expiresAtText := expiresAt.Format(time.RFC3339Nano)
 
@@ -290,16 +360,41 @@ func (e *Engine) ResolvePackage(ctx context.Context, token string) (store.Messag
 	return ml, nil
 }
 
-// ListPackageFiles returns every Link belonging to messageID, for
-// rendering the package page's file list
+// ListPackageFiles returns every Link belonging to messageID and
+// addressed to recipient, for rendering the package page's file list
 // (docs/architecture/package-page-decision.md §4.1 item 4: "package on
-// the page = SELECT ... FROM link WHERE message_id = ?").
-func (e *Engine) ListPackageFiles(ctx context.Context, messageID string) ([]store.Link, error) {
+// the page = SELECT ... FROM link WHERE message_id = ?" + "a recipient
+// filter once per-recipient delivery exists").
+//
+// The recipient filter closes ATR-237: store.MetadataStore.
+// ListLinksByMessage itself is message-scoped only, returning every
+// Link created for the message across every recipient CreateLinks fanned
+// out to (the milter-MVP body carries a single package token — see
+// pipeline's packageURLFor — but CreateLinks still persists one Link
+// per (attachment, recipient) pair, ATR-237). Without this filter,
+// whichever recipient's package token ends up embedded in the shared
+// body would see, and via RegisterPackageDownload be able to drain the
+// download budget of, every other recipient's own Link rows for the
+// same message too — leaking the recipient list's size and letting one
+// recipient exhaust another's personal MaxDownloads. Filtering happens
+// here in the Engine rather than in store.MetadataStore, so no store
+// interface change is required; ListLinksByMessage's own contract (all
+// Links for a message) is unchanged and still used as-is by API/CLI
+// callers that are intentionally not recipient-scoped (e.g. audit,
+// admin listings).
+func (e *Engine) ListPackageFiles(ctx context.Context, messageID, recipient string) ([]store.Link, error) {
 	links, err := e.metadata.ListLinksByMessage(ctx, messageID)
 	if err != nil {
 		return nil, fmt.Errorf("link: list package files: %w", err)
 	}
-	return links, nil
+
+	scoped := make([]store.Link, 0, len(links))
+	for _, l := range links {
+		if l.Recipient == recipient {
+			scoped = append(scoped, l)
+		}
+	}
+	return scoped, nil
 }
 
 // isUsable reports whether l may still be resolved to bytes: active
@@ -343,20 +438,26 @@ func (e *Engine) RegisterDownload(ctx context.Context, token string) (store.Link
 // non-secret store row identifier that merely selects which file
 // within that already-authorized package to charge — it is never the
 // per-attachment bearer token, which is never persisted anywhere and
-// so cannot be presented again here (CLAUDE.md invariant #5).
+// so cannot be presented again here (the token-hygiene invariant).
 //
 // Every failure — unknown/expired/revoked package token, linkID
-// belonging to a different message, or the target link itself being
-// expired/revoked/exhausted — folds into a single wrapped ErrNotFound
-// (SR-125-5): callers must render one generic response for all of
-// them, exactly like Resolve/ResolvePackage.
+// belonging to a different message or a different recipient, or the
+// target link itself being expired/revoked/exhausted — folds into a
+// single wrapped ErrNotFound (SR-125-5): callers must render one
+// generic response for all of them, exactly like Resolve/ResolvePackage.
 //
-// The membership check (linkID belongs to the resolved message) is
-// performed against a plain read (GetLinkByID) purely for
-// authorization scoping; it is not itself the enforcement of
+// The membership check (linkID belongs to the resolved message *and*
+// recipient, ATR-237) is performed against a plain read (GetLinkByID)
+// purely for authorization scoping; it is not itself the enforcement of
 // MaxDownloads/expiry/status, which remains solely
 // RegisterDownloadByID's guarded atomic UPDATE (never read-then-write,
-// docs/architecture/adr-011-metadata-db.md).
+// docs/architecture/adr-011-metadata-db.md). The recipient half of the
+// check exists because CreateLinks persists one Link per (attachment,
+// recipient) pair even though the milter-MVP body only ever embeds one
+// recipient's package token (see ListPackageFiles' doc comment): without
+// it, that one embedded token's holder could pass another recipient's
+// linkID (learned by, pre-ATR-237, seeing it on the unfiltered package
+// page) and drain that other recipient's own download budget.
 func (e *Engine) RegisterPackageDownload(ctx context.Context, packageToken, linkID string) (store.Link, error) {
 	ml, err := e.ResolvePackage(ctx, packageToken)
 	if err != nil {
@@ -370,7 +471,7 @@ func (e *Engine) RegisterPackageDownload(ctx context.Context, packageToken, link
 		}
 		return store.Link{}, fmt.Errorf("link: register package download: %w", err)
 	}
-	if target.MessageID != ml.MessageID {
+	if target.MessageID != ml.MessageID || target.Recipient != ml.Recipient {
 		return store.Link{}, fmt.Errorf("link: register package download: %w", ErrNotFound)
 	}
 
@@ -516,6 +617,69 @@ func (e *Engine) recordRevokeAudit(ctx context.Context, actor, messageID, linkID
 		MessageID: messageID,
 		Details:   details,
 	})
+}
+
+// PurgeMessage permanently removes every Message/Attachment/Link/
+// MessageLink row CreateLinks wrote for messageID (ATR-239): the
+// pipeline's compensating rollback for the case where CreateLinks
+// already succeeded but a later step (e.g. rewrite.Rewrite) failed
+// before Process could return a Verdict. Since no token from those rows
+// was ever exposed to a recipient in that case (fail-open delivers the
+// original, untouched message; fail-closed temp-fails it — see
+// pipeline.AttachmentProcessor.Process's own doc comment), deleting
+// them outright is safe.
+//
+// PurgeMessage always records a single TypeCompensation audit event
+// attributed to actor, on both success and refusal, mirroring
+// Revoke/SetHold's own "record the outcome regardless" contract: a
+// compensating deletion (or its refusal) is itself worth an audit
+// trail entry, not just a log line.
+//
+// A wrapped ErrHeld return means store.MetadataStore.DeleteMessage
+// refused because a link belonging to messageID is under legal hold —
+// an exceedingly narrow race in practice (hold requires a separate,
+// deliberate operator action against a link that, from the operator's
+// point of view, was only just created moments earlier by the
+// still-in-flight Process call this method's caller is unwinding), left
+// as ordinary tech debt (documented on Process's own doc comment)
+// rather than assumed unreachable. A wrapped ErrNotFound return means
+// the message was already gone (a caller retry after a prior partial
+// run, or a duplicate compensation attempt); callers should treat that
+// the same as success. Either way, the caller (pipeline) is expected to
+// treat any PurgeMessage failure as best-effort: it must never change
+// the outcome Process already decided to return (the
+// mail-must-never-be-lost invariant), only be logged.
+func (e *Engine) PurgeMessage(ctx context.Context, actor, messageID string) error {
+	err := e.metadata.DeleteMessage(ctx, messageID)
+
+	ok := err == nil
+	reason := ""
+	switch {
+	case err == nil:
+	case errors.Is(err, store.ErrHeld):
+		reason = "message has a held link"
+	case errors.Is(err, store.ErrNotFound):
+		reason = "message already deleted"
+	default:
+		reason = err.Error()
+	}
+	e.recordAudit(ctx, audit.Event{
+		Type:      audit.TypeCompensation,
+		Actor:     actor,
+		MessageID: messageID,
+		Details:   map[string]any{"scope": "pipeline_rollback", "ok": ok, "reason": reason},
+	})
+
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, store.ErrHeld) {
+		return fmt.Errorf("link: purge message %q: %w", messageID, ErrHeld)
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		return fmt.Errorf("link: purge message %q: %w", messageID, ErrNotFound)
+	}
+	return fmt.Errorf("link: purge message %q: %w", messageID, err)
 }
 
 // SetHold sets (hold=true) or clears (hold=false) the legal-hold flag

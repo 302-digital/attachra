@@ -172,7 +172,7 @@ func TestAuditChainConsistency(t *testing.T) {
 // goroutines at once and asserts every assigned Seq is unique and forms
 // a contiguous 1..N range: the single-writer serialization ADR-011
 // mandates must make concurrent seq assignment race-free (run with
-// -race per CLAUDE.md invariant on critical counters).
+// -race; critical counters must be race-safe).
 func TestAuditRecordConcurrentSeqIsStrictlyOrdered(t *testing.T) {
 	st := openTestStore(t)
 	ctx := context.Background()

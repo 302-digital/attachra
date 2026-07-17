@@ -3,13 +3,9 @@ package message
 import (
 	"bytes"
 	"net/http"
-)
 
-// sniffLen is the number of leading bytes inspected for signature
-// matching. It matches the window http.DetectContentType itself
-// considers (at most 512 bytes per the WHATWG MIME Sniffing spec), so
-// callers never need to buffer more than this to call DetectType.
-const sniffLen = 512
+	"github.com/302-digital/attachra/internal/core/spoolutil"
+)
 
 // signature is one entry in the magic-byte lookup table: a byte
 // pattern to match at a given offset from the start of the content,
@@ -97,15 +93,16 @@ var officeZipMarkers = []struct {
 // common office, archive and executable formats that
 // http.DetectContentType does not distinguish.
 //
-// Detection never inspects more than the leading sniffLen bytes and
-// never decompresses or opens archive members: a ZIP-based office
-// document is identified by the file name of its first ZIP entry as
-// present verbatim in the raw sniffed bytes, not by extracting it.
-// Callers should pass at least sniffLen bytes when available; fewer
-// bytes are accepted and simply reduce detection accuracy.
+// Detection never inspects more than the leading spoolutil.SniffLen
+// bytes and never decompresses or opens archive members: a ZIP-based
+// office document is identified by the file name of its first ZIP
+// entry as present verbatim in the raw sniffed bytes, not by
+// extracting it. Callers should pass at least spoolutil.SniffLen bytes
+// when available; fewer bytes are accepted and simply reduce detection
+// accuracy.
 func DetectType(data []byte) string {
-	if len(data) > sniffLen {
-		data = data[:sniffLen]
+	if len(data) > spoolutil.SniffLen {
+		data = data[:spoolutil.SniffLen]
 	}
 
 	for _, sig := range signatures {
